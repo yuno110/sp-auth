@@ -1,0 +1,16 @@
+# 비밀 값 — AU-01 이전에 먼저 넣는다
+# 개인키는 이 저장소에 두지 않는다 (sp-docs/security.md §3).
+# 아래는 실수로 들어왔을 때의 2차 방어선이다.
+private.pem
+*.pem
+!jwt-public.pem
+*.p8
+*.key
+*.env
+
+# 템플릿은 application-local.yml.example 를 본다
+src/main/resources/application-local.yml
+
+# 빌드 산출물 — AU-01 에서 확장한다
+build/
+.gradle/

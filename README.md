@@ -86,7 +86,7 @@ CREATE DATABASE sp_auth DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci
 
 | 환경변수 | 필수 | 설명 |
 | --- | --- | --- |
-| `JWT_PRIVATE_KEY` | O | RSA 개인키 (PKCS#8 PEM). **기본값 없음** |
+| `JWT_PRIVATE_KEY` | O | RSA 개인키 (PKCS#8 PEM). **기본값 없음.** 로컬은 `jwt.private-key-location`으로 경로를 준다 |
 | `DB_URL` | | 기본값 `jdbc:mysql://localhost:3306/sp_auth` |
 | `DB_USERNAME` / `DB_PASSWORD` | O (비밀번호) | |
 
@@ -101,7 +101,7 @@ RSA 키 페어 생성은 `sp-docs/tech-stack.md` §4.2에 있다.
 
 | 키 | 어디에 | 커밋 |
 | --- | --- | --- |
-| `private.pem` | **이 저장소에만.** `application-local.yml`로 경로를 준다 | **절대 금지** |
+| `private.pem` | **저장소 밖.** 현재 `~/keys/sp/private.pem`. `application-local.yml`로 경로를 준다 | **절대 금지** |
 | `public.pem` | `sp-member`·`sp-board`의 `src/main/resources/jwt-public.pem` | 가능 |
 
 **공개키 배포 지점이 두 곳이다.** 두 사본이 같은 키인지는 통합 검증 I-01에서 확인한다.

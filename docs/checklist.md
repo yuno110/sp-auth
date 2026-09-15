@@ -55,11 +55,12 @@
 
 AU-01을 시작하기 전에 아래가 준비되어야 한다. 준비되지 않았으면 `blocked`로 두고 보고한다.
 
-- [ ] **`D-01`(정본 개정)이 `done`이다** (`sp-docs/docs/checklist.md`)
+- [x] **`D-01`(정본 개정)이 `done`이다** (`sp-docs/docs/checklist.md`)
 - [x] MySQL 8.0 로컬 설치, `SET PERSIST time_zone='+09:00'` (`sp-docs/tech-stack.md` §4.1)
-- [ ] `sp_auth` 스키마 생성 (`sp-docs/tech-stack.md` §4.1)
-- [ ] `application-local.yml` 생성하고 MySQL 비밀번호·개인키 경로 기입 (`sp-docs/tech-stack.md` §4.3.1)
-- [ ] RSA 키 페어 생성, `private.pem`을 이 저장소가 읽을 수 있는 위치에 배치 (`sp-docs/tech-stack.md` §4.2)
+- [x] `sp_auth` 스키마 생성 (`sp-docs/tech-stack.md` §4.1)
+- [x] `application-local.yml` 생성하고 MySQL 비밀번호·개인키 경로 기입 (`sp-docs/tech-stack.md` §4.3.1)
+- [x] RSA 키 페어 생성, `private.pem`을 `~/keys/sp/`에 배치 (`sp-docs/tech-stack.md` §4.2)
+- [x] `.gitignore`에 비밀 값 항목 등록 — AU-01에서 빌드 산출물을 추가한다
 - [x] 문서 저장소 클론 (`../sp-docs`)
 
 **`private.pem`을 저장소 안에 두지 않는다.** `.gitignore`에 넣더라도 실수 한 번이면 이력에 남는다.
