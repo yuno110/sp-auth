@@ -1,0 +1,11 @@
+# 테스트는 H2(MySQL 호환 모드)를 쓴다 (sp-docs/tech-stack.md §1)
+spring:
+  datasource:
+    url: jdbc:h2:mem:sp_auth;MODE=MySQL;DATABASE_TO_LOWER=TRUE;CASE_INSENSITIVE_IDENTIFIERS=TRUE
+    username: sa
+    password: ""
+    driver-class-name: org.h2.Driver
+  jpa:
+    hibernate:
+      # 스키마 출처를 Flyway 하나로 고정한다 (sp-docs/tech-stack.md §5.1)
+      ddl-auto: validate

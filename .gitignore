@@ -11,6 +11,43 @@ private.pem
 # 템플릿은 application-local.yml.example 를 본다
 src/main/resources/application-local.yml
 
-# 빌드 산출물 — AU-01 에서 확장한다
+### Gradle ###
 build/
 .gradle/
+!gradle/wrapper/gradle-wrapper.jar
+!**/src/main/**/build/
+!**/src/test/**/build/
+
+### QueryDSL 생성 경로 (sp-docs/tech-stack.md §3.2) ###
+build/generated/sources/annotationProcessor/
+
+### STS ###
+.apt_generated
+.classpath
+.factorypath
+.project
+.settings
+.springBeans
+.sts4-cache
+bin/
+!**/src/main/**/bin/
+!**/src/test/**/bin/
+
+### IntelliJ IDEA ###
+.idea
+*.iws
+*.iml
+*.ipr
+out/
+!**/src/main/**/out/
+!**/src/test/**/out/
+
+### NetBeans ###
+/nbproject/private/
+/nbbuild/
+/dist/
+/nbdist/
+/.nb-gradle/
+
+### VS Code ###
+.vscode/
