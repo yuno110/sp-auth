@@ -1,0 +1,21 @@
+# 이 파일을 application-local.yml 로 복사한 뒤 실제 값을 채운다.
+#   cp application-local.yml.example application-local.yml
+# application-local.yml 은 .gitignore 에 있어 커밋되지 않는다.
+
+spring:
+  datasource:
+    password: 여기에_MySQL_root_비밀번호
+
+  jpa:
+    show-sql: true
+    properties:
+      hibernate:
+        format_sql: true
+
+# 개인키는 저장소 밖에 둔다. RSA 키 페어 생성은 sp-docs/tech-stack.md §4.2.
+jwt:
+  private-key-location: file:${user.home}/keys/sp/private.pem
+
+logging:
+  level:
+    org.hibernate.orm.jdbc.bind: trace
