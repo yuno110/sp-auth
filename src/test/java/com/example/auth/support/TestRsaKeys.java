@@ -24,7 +24,7 @@ import org.springframework.test.context.DynamicPropertyRegistry;
  *
  * <p>{@code @SpringBootTest} 로 전체 컨텍스트를 올리는 테스트는 {@link
  * #registerPrivateKeyLocation(DynamicPropertyRegistry)} 를 {@code @DynamicPropertySource} 에서
- * 호출한다. 호출하지 않으면 {@code application.yml} 의 {@code ${JWT_PRIVATE_KEY}} 가 해석되지
+ * 호출한다. 호출하지 않으면 {@code application.yml} 의 {@code ${JWT_PRIVATE_KEY_LOCATION}} 가 해석되지
  * 않아 기동이 실패한다 — 그것이 의도된 동작이다.
  */
 public final class TestRsaKeys {

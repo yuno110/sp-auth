@@ -33,7 +33,7 @@ management:
 # 만료 시간은 sp-docs/security.md §1 이 고정한다 — Access 30분(1800초),
 # Refresh 14일(1209600초). 환경값이 아니므로 placeholder 를 두지 않는다
 jwt:
-  private-key-location: ${JWT_PRIVATE_KEY}
+  private-key-location: ${JWT_PRIVATE_KEY_LOCATION}
   access-token-validity: PT30M
   refresh-token-validity: P14D
 
