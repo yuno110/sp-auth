@@ -86,7 +86,8 @@ CREATE DATABASE sp_auth DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci
 
 | 환경변수 | 필수 | 설명 |
 | --- | --- | --- |
-| `JWT_PRIVATE_KEY` | O | RSA 개인키 (PKCS#8 PEM). **기본값 없음.** 로컬은 `jwt.private-key-location`으로 경로를 준다 |
+| `JWT_PRIVATE_KEY_LOCATION` | O | 개인키 **경로** (`file:`·`classpath:`). **기본값 없음** — 없으면 기동 실패 |
+| `CORS_ALLOWED_ORIGINS` | O | 허용 오리진 목록. **기본값 없음.** 비었거나 `*`가 섞이면 기동 실패 |
 | `DB_URL` | | 기본값 `jdbc:mysql://localhost:3306/sp_auth` |
 | `DB_USERNAME` / `DB_PASSWORD` | O (비밀번호) | |
 
