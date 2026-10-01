@@ -18,8 +18,30 @@ spring:
 server:
   port: 8083
 
+# health 만 노출한다. 그 밖의 actuator 경로는 노출 자체를 막는다
+# (sp-docs/security.md §5.1.1). 인가 쪽 차단은 SecurityConfig 가 한다
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+
 # 토큰 서명용 개인키. 이 서비스만 갖는다 (sp-docs/security.md §2).
 # 비밀 값이므로 기본값을 두지 않는다. 로컬에서는 application-local.yml 이 덮는다
 # (sp-docs/tech-stack.md §4.3.1).
+#
+# 만료 시간은 sp-docs/security.md §1 이 고정한다 — Access 30분(1800초),
+# Refresh 14일(1209600초). 환경값이 아니므로 placeholder 를 두지 않는다
 jwt:
   private-key-location: ${JWT_PRIVATE_KEY}
+  access-token-validity: PT30M
+  refresh-token-validity: P14D
+
+# CORS 허용 오리진 화이트리스트.
+#
+# 정본(sp-docs/security.md §1)은 "서비스별 화이트리스트로 관리, * 금지"만 정하고 목록 자체를
+# 정하지 않았다. 그래서 값을 코드·커밋되는 설정에 박지 않고 환경에서 주입받는다.
+# 기본값을 두지 않으므로 값이 없으면 기동이 실패한다 — 임의의 기본값을 두면 그 값이 정책인지
+# 임시값인지 나중에 구분할 수 없다. 로컬 값은 application-local.yml 이 준다
+cors:
+  allowed-origins: ${CORS_ALLOWED_ORIGINS}

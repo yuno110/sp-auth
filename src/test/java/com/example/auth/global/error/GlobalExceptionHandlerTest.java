@@ -100,6 +100,28 @@ class GlobalExceptionHandlerTest {
 				.doesNotContain("s3cr3t-raw-password");
 	}
 
+	/**
+	 * AU-04 에서 고친 것이다. 이 핸들러가 없으면 {@code HttpMessageNotReadableException} 이
+	 * 마지막 그물에 걸려 <b>500 {@code C005}</b> 가 됐다 — 클라이언트가 보낸 깨진 본문을 서버
+	 * 장애로 보고하는 셈이다.
+	 */
+	@Test
+	@DisplayName("깨진 JSON 본문은 400 C001 이고 본문이 응답에 되돌아오지 않는다")
+	void 깨진_본문은_C001() throws Exception {
+		MvcResult result = mockMvc.perform(post("/test/valid")
+						.contentType(MediaType.APPLICATION_JSON)
+						.content("{\"email\": \"a@example.com\", \"password\": \"s3cr3t-raw-password\""))
+				.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.success").value(false))
+				.andExpect(jsonPath("$.error.code").value("C001"))
+				.andExpect(jsonPath("$.error.message").value("잘못된 입력값입니다."))
+				.andReturn();
+
+		assertThat(result.getResponse().getContentAsString())
+				.as("파싱 실패 메시지에는 본문 일부가 들어 있다. 그대로 내보내면 비밀번호가 실린다")
+				.doesNotContain("s3cr3t-raw-password");
+	}
+
 	@Test
 	@DisplayName("성공 응답은 success = true 이고 error 가 null 이다")
 	void 성공_응답() throws Exception {

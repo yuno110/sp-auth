@@ -5,26 +5,35 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.redirectedUrl;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
+import com.example.auth.support.TestRsaKeys;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
 
 /**
  * springdoc 이 OpenAPI 문서를 생성하는지 본다 (AU-02 완료 기준).
  *
- * <p>{@code /swagger-ui.html} 이 <b>인증 없이</b> 열리는 것은 이 항목의 기준이 아니다.
- * 경로를 {@code permitAll} 로 여는 SecurityConfig 는 AU-04 의 산출물이고, 그때까지는 Boot
- * 기본 필터 체인이 전 경로를 401 로 막는다 (sp-docs/security.md §5.1.1). 그래서
- * {@code addFilters = false} 로 필터를 걷고 MVC 계층만 본다.
+ * <p>{@code /swagger-ui.html} 이 <b>인증 없이</b> 열리는 것은 이 항목의 기준이 아니다. 경로를
+ * {@code permitAll} 로 여는 SecurityConfig 는 AU-04 의 산출물이므로, 여기서는
+ * {@code addFilters = false} 로 필터를 걷고 MVC 계층만 본다. 필터를 포함한 인가 확인은
+ * {@code SecurityConfigTest} 가 한다 (sp-docs/security.md §5.1.1).
  */
 @SpringBootTest
 @AutoConfigureMockMvc(addFilters = false)
 @ActiveProfiles("test")
 class SwaggerConfigTest {
+
+	/** AU-04 부터 컨텍스트가 개인키를 요구한다. {@code AuthApplicationTest} 와 같은 이유다. */
+	@DynamicPropertySource
+	static void jwtPrivateKey(DynamicPropertyRegistry registry) {
+		TestRsaKeys.registerPrivateKeyLocation(registry);
+	}
 
 	@Autowired
 	private MockMvc mockMvc;

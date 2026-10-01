@@ -16,6 +16,11 @@ spring:
 jwt:
   private-key-location: file:${user.home}/keys/sp/private.pem
 
+# CORS 허용 오리진. 정본(sp-docs/security.md §1)이 목록을 정하지 않았으므로 환경이 준다.
+# * 는 쓸 수 없다 — 기동이 실패한다. 여러 개는 쉼표로 구분한다
+cors:
+  allowed-origins: http://localhost:3000
+
 logging:
   level:
     org.hibernate.orm.jdbc.bind: trace
