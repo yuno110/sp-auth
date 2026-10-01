@@ -2,6 +2,7 @@ package com.example.auth;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import com.example.auth.support.TestRsaKeys;
 import java.io.File;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.DisplayName;
@@ -10,10 +11,21 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
 
 @SpringBootTest
 @ActiveProfiles("test")
 class AuthApplicationTest {
+
+	/**
+	 * AU-04 부터 개인키를 실제로 바인딩하므로 컨텍스트가 키 없이는 뜨지 않는다
+	 * (sp-docs/security.md §3). 개인키를 저장소에 두지 않기 위해 테스트가 임시 키를 만들어 준다.
+	 */
+	@DynamicPropertySource
+	static void jwtPrivateKey(DynamicPropertyRegistry registry) {
+		TestRsaKeys.registerPrivateKeyLocation(registry);
+	}
 
 	@Test
 	@DisplayName("애플리케이션 컨텍스트가 예외 없이 로딩된다")

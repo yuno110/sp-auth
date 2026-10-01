@@ -6,6 +6,7 @@ import java.util.List;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.web.HttpRequestMethodNotSupportedException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
@@ -44,6 +45,19 @@ public class GlobalExceptionHandler {
 				.toList();
 		log.warn("validation failed: {} field(s)", fieldErrors.size());
 		return toResponse(ErrorCode.INVALID_INPUT_VALUE, fieldErrors);
+	}
+
+	/**
+	 * 본문을 읽을 수 없을 때 — 깨진 JSON, 빈 본문, 타입이 맞지 않는 필드.
+	 *
+	 * <p><b>클라이언트 오류이므로 400 이다.</b> 이 핸들러가 없으면 마지막 그물에 걸려
+	 * 500 {@code C005} 가 되고, 클라이언트가 보낸 잘못된 본문이 서버 장애로 보고된다.
+	 */
+	@ExceptionHandler(HttpMessageNotReadableException.class)
+	public ResponseEntity<ApiResponse<Void>> handleHttpMessageNotReadable(HttpMessageNotReadableException e) {
+		// 예외 메시지에 본문 일부(비밀번호일 수 있다)가 들어 있으므로 로그에도 남기지 않는다
+		log.warn("request body not readable");
+		return toResponse(ErrorCode.INVALID_INPUT_VALUE);
 	}
 
 	@ExceptionHandler(MethodArgumentTypeMismatchException.class)

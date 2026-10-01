@@ -16,3 +16,12 @@ spring:
     hibernate:
       # 스키마 출처를 Flyway 하나로 고정한다 (sp-docs/tech-stack.md §5.1)
       ddl-auto: validate
+
+# 테스트 전용 값이다. 정책값이 아니다 — 정본(sp-docs/security.md §1)은 "* 금지"만 정하고
+# 허용 오리진 목록을 정하지 않았다. 운영·로컬 값은 환경이 준다 (application.yml 주석 참조)
+cors:
+  allowed-origins: http://localhost:3000
+
+# jwt.private-key-location 은 여기에 두지 않는다. 개인키를 저장소에 넣지 않기 위해
+# 테스트가 실행 시점에 임시 키 페어를 만들어 경로를 주입한다
+# (com.example.auth.support.TestRsaKeys)
