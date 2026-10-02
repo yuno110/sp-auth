@@ -41,7 +41,9 @@ import org.springframework.test.context.ActiveProfiles;
 @ActiveProfiles("test")
 class AccountRepositoryTest {
 
-	private static final String RAW_ENCODED_PASSWORD = "$2a$10$abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQ";
+	// 해시가 아니다. 커밋되는 파일에 BCrypt 모양 문자열을 두지 않는다
+	// (sp-docs/requirements/member.md §10.2). 이 테스트는 비밀번호를 맞추지 않고 저장·조회만 본다
+	private static final String RAW_ENCODED_PASSWORD = "test-not-a-hash-encoded-password";
 
 	@Autowired
 	private TestEntityManager em;
@@ -75,7 +77,8 @@ class AccountRepositoryTest {
 	@DisplayName("role 이 문자열(USER/ADMIN)로 저장된다")
 	void role_이_문자열로_저장된다() {
 		Long id = accountRepository.saveAndFlush(Account.builder()
-				.email("admin@example.com")
+				// admin@example.com 은 V3 seed 가 쓴다 (sp-docs/requirements/member.md §10.1)
+				.email("role@example.com")
 				.password(RAW_ENCODED_PASSWORD)
 				.role(Role.ADMIN)
 				.build()).getId();
@@ -141,7 +144,7 @@ class AccountRepositoryTest {
 				.role(Role.ADMIN)
 				.build()).getId();
 		em.clear();
-		String newEncoded = "$2a$10$ZYXWVUTSRQPONMLKJIHGFEDCBA9876543210zyxwvutsrqponmlkj";
+		String newEncoded = "test-not-a-hash-changed-password";
 
 		accountRepository.findById(id).orElseThrow().changePassword(newEncoded);
 		em.flush();
