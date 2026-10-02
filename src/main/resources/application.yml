@@ -14,6 +14,13 @@ spring:
           time_zone: Asia/Seoul
   jackson:
     time-zone: Asia/Seoul
+  flyway:
+    placeholders:
+      # ADMIN seed 의 BCrypt 해시. 비밀 값이므로 기본값을 두지 않는다 — 없으면
+      # 마이그레이션이 "No value provided for placeholder" 로 실패한다
+      # (sp-docs/requirements/member.md §10.2, sp-docs/tech-stack.md §4.3).
+      # 해시 생성: ./gradlew bcrypt -Ppassword=...
+      adminPasswordHash: ${ADMIN_PASSWORD_HASH}
 
 server:
   port: 8083

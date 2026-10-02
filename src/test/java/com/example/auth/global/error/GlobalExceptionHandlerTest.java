@@ -40,8 +40,13 @@ import org.springframework.web.bind.annotation.RestController;
  * <p>{@code addFilters = false} — SecurityConfig 는 AU-04 의 산출물이므로 지금은 Boot 의
  * 기본 필터 체인이 모든 요청에 인증을 요구한다. 여기서 검증하는 것은 예외 변환이고
  * 경로별 인가는 AU-04 의 {@code SecurityConfigTest} 가 본다.
+ *
+ * <p><b>{@code controllers} 로 슬라이스를 이 테스트의 컨트롤러 하나로 좁힌다.</b> 인자 없는
+ * {@code @WebMvcTest} 는 업무 컨트롤러를 <i>전부</i> 올리면서 그 의존(서비스)은 올리지 않으므로,
+ * AU-05 이후 컨트롤러가 생길 때마다 이 컨텍스트가 기동에 실패한다. 검증 대상은 예외 변환이고
+ * 업무 컨트롤러는 그 대상이 아니다.
  */
-@WebMvcTest
+@WebMvcTest(controllers = GlobalExceptionHandlerTest.ExceptionTestController.class)
 @Import(GlobalExceptionHandlerTest.ExceptionTestController.class)
 @AutoConfigureMockMvc(addFilters = false)
 @ActiveProfiles("test")

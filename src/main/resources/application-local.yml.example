@@ -6,6 +6,14 @@ spring:
   datasource:
     password: 여기에_MySQL_root_비밀번호
 
+  # ADMIN seed 의 BCrypt 해시 (sp-docs/requirements/member.md §10.2).
+  # 없으면 마이그레이션이 "No value provided for placeholder" 로 실패한다.
+  #   ./gradlew bcrypt -Ppassword=<로컬에서_쓸_관리자_비밀번호>
+  # 출력된 한 줄을 아래에 붙인다. 운영 해시는 이 값과 달라야 한다.
+  flyway:
+    placeholders:
+      adminPasswordHash: 여기에_bcrypt_태스크_출력
+
   jpa:
     show-sql: true
     properties:

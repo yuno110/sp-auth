@@ -9,8 +9,10 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.web.HttpRequestMethodNotSupportedException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.MissingServletRequestParameterException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.method.annotation.HandlerMethodValidationException;
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 import org.springframework.web.servlet.resource.NoResourceFoundException;
 
@@ -57,6 +59,39 @@ public class GlobalExceptionHandler {
 	public ResponseEntity<ApiResponse<Void>> handleHttpMessageNotReadable(HttpMessageNotReadableException e) {
 		// 예외 메시지에 본문 일부(비밀번호일 수 있다)가 들어 있으므로 로그에도 남기지 않는다
 		log.warn("request body not readable");
+		return toResponse(ErrorCode.INVALID_INPUT_VALUE);
+	}
+
+	/**
+	 * 메서드 파라미터 검증 실패 — {@code @RequestParam} 에 걸린 제약이 깨졌다
+	 * ({@code GET /accounts/check-email} 의 {@code email} 형식·길이).
+	 *
+	 * <p><b>클라이언트 오류이므로 400 이다.</b> 이 핸들러가 없으면 마지막 그물에 걸려
+	 * 500 {@code C005} 가 된다. 본문 검증({@link MethodArgumentNotValidException})과 같은
+	 * 형태로 {@code fieldErrors} 를 채운다.
+	 */
+	@ExceptionHandler(HandlerMethodValidationException.class)
+	public ResponseEntity<ApiResponse<Void>> handleHandlerMethodValidation(HandlerMethodValidationException e) {
+		// 여기도 rejectedValue 를 담지 않는다 (sp-docs/api-contract.md §7)
+		List<ErrorResponse.FieldError> fieldErrors = e.getParameterValidationResults().stream()
+				.flatMap(result -> result.getResolvableErrors().stream()
+						.map(error -> new ErrorResponse.FieldError(
+								result.getMethodParameter().getParameterName(), error.getDefaultMessage())))
+				.toList();
+		log.warn("parameter validation failed: {} field(s)", fieldErrors.size());
+		return toResponse(ErrorCode.INVALID_INPUT_VALUE, fieldErrors);
+	}
+
+	/**
+	 * 필수 쿼리 파라미터가 빠진 경우 — {@code GET /accounts/check-email} 에 {@code email} 이 없다.
+	 *
+	 * <p><b>클라이언트 오류이므로 400 이다.</b> 이 핸들러가 없으면 마지막 그물에 걸려
+	 * 500 {@code C005} 가 된다. {@code @RequestParam} 을 쓰는 첫 경로가 AU-05 에서 생겼다.
+	 */
+	@ExceptionHandler(MissingServletRequestParameterException.class)
+	public ResponseEntity<ApiResponse<Void>> handleMissingServletRequestParameter(
+			MissingServletRequestParameterException e) {
+		log.warn("missing request parameter: {}", e.getParameterName());
 		return toResponse(ErrorCode.INVALID_INPUT_VALUE);
 	}
 

@@ -63,3 +63,29 @@ tasks.named('test') {
 	// (sp-docs/tech-stack.md §5.1)
 	systemProperty 'spring.profiles.active', 'test'
 }
+
+// ADMIN seed 의 BCrypt 해시를 만든다 (sp-docs/tech-stack.md §4.2.1).
+// 해시는 커밋하지 않는다 — V3 는 Flyway placeholder 를 쓰고, 로컬 값은
+// application-local.yml 에 넣는다 (sp-docs/requirements/member.md §10.2).
+//
+// 표준출력에 해시 한 줄만 낸다. 평문은 출력하지 않는다.
+//
+// Gradle 9 에서 doLast 안의 project.javaexec 가 제거됐고, 별도 main 클래스를 운영 코드에
+// 넣고 싶지도 않다. 그래서 런타임 클래스패스를 격리된 로더로 올려 인코더만 꺼내 쓴다.
+tasks.register('bcrypt') {
+	group = 'help'
+	description = 'ADMIN seed 용 BCrypt 해시를 출력한다. ./gradlew bcrypt -Ppassword=...'
+	dependsOn configurations.runtimeClasspath
+	doLast {
+		if (!project.hasProperty('password')) {
+			throw new GradleException('비밀번호를 준다: ./gradlew bcrypt -Ppassword=...')
+		}
+		URL[] urls = configurations.runtimeClasspath.files.collect { it.toURI().toURL() } as URL[]
+		new URLClassLoader(urls, (ClassLoader) null).withCloseable { loader ->
+			// strength 10 (sp-docs/security.md §1). SecurityConfig 의 PasswordEncoder 와 같다
+			def encoderType = loader.loadClass('org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder')
+			def encoder = encoderType.getConstructor(int.class).newInstance(10)
+			println encoderType.getMethod('encode', CharSequence).invoke(encoder, project.property('password').toString())
+		}
+	}
+}

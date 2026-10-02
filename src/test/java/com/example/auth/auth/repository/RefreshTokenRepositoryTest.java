@@ -156,7 +156,7 @@ class RefreshTokenRepositoryTest {
 	private Long persistAccount(String email) {
 		return em.persistAndFlush(Account.builder()
 				.email(email)
-				.password("$2a$10$abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQ")
+				.password("test-not-a-hash-encoded-password")
 				.build()).getId();
 	}
 
