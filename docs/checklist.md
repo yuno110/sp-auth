@@ -39,16 +39,7 @@
 기반 산출물을 읽기만 하고 자기 파일을 만든다. 기반 경로의 파일을 고쳐야 하면 BLOCKED로 보고한다.
 
 - [x] AU-05 계정 생성과 이메일 중복 확인 · 상태 done · 리뷰 3라운드
-- [ ] AU-06 로그인 · 상태 blocked · 커밋 - · 사유: 완료 기준 여덟 중 둘(비밀번호 불일치·없는
-  이메일을 같은 401 AU003 로 비구분, 탈퇴 계정 거부)만 충족. **로그인 성공 경로가 DB 에서 막혀**
-  나머지 여섯이 미충족 — 이 서비스가 발급하는 Refresh Token(RS256 + RFC7638 kid, api-contract.md
-  §6 claim 집합)은 **최소 541자**인데 `refresh_token.token` 이 VARCHAR(512)다. 길이의 정본은
-  domain-model.md §2.2 이고 AU-03 의 V2 마이그레이션·RefreshToken 엔티티가 그대로 반영했다.
-  INSERT 가 `Value too long for column "token CHARACTER VARYING(512)"` 으로 터져 로그인이 500 이
-  된다. 토큰을 줄일 여지가 없다(kid·claim·2048비트가 모두 정본 고정). 진행에는 정본 개정(token
-  길이) + AU-03 산출물 2건 변경 + 새 마이그레이션 번호 배정이 필요하다. 구현(LoginRequest·
-  AuthService·AuthController)과 테스트(AuthServiceTest·AuthControllerTest)는 스테이징되어 있고
-  `./gradlew test` 실패 7건이 전부 이 한 원인이다 (135개 중 128개 통과)
+- [x] AU-06 로그인 · 상태 done
 - [ ] AU-07 토큰 재발급과 로그아웃 · 상태 todo
 - [ ] AU-08 비밀번호 변경 · 상태 todo
 - [ ] AU-09 계정 탈퇴 · 상태 todo
