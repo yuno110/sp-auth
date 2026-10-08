@@ -26,13 +26,16 @@ import org.springframework.stereotype.Component;
  *
  * <table>
  * <tr><th>상황</th><th>코드</th></tr>
- * <tr><td>인증 없이 인증 필요 경로</td><td>401 {@code A001}</td></tr>
+ * <tr><td>토큰 없이 인증 필요 경로</td><td>401 {@code A001}</td></tr>
+ * <tr><td>서명·형식이 잘못된 토큰</td><td>401 {@code A002}</td></tr>
+ * <tr><td>만료된 토큰</td><td>401 {@code A003}</td></tr>
  * <tr><td>인증했으나 권한 없음</td><td>403 {@code A004}</td></tr>
  * </table>
  *
- * <p><b>{@code A002}(유효하지 않은 토큰)·{@code A003}(만료된 토큰) 의 구분은 AU-04 의 완료
- * 기준이 아니다.</b> 둘을 가르려면 디코더 실패 원인을 들여다봐야 하는데, 그 분기는 토큰을
- * 다루는 항목(AU-06·AU-07)의 몫이다. 여기서 문자열 매칭으로 추측하지 않는다.
+ * <p><b>{@code A002}·{@code A003} 의 구분은 AU-07 이 넣었다.</b> AU-04 는 필터 단계의 모든
+ * 인증 실패를 {@code A001} 로 냈고, 둘을 가르는 것은 토큰을 다루는 항목에 배정되어 있다
+ * (sp-docs/plan/phase1.md §2.5, §4 AU-07). 판정은 {@link JwtTokenProvider#failureCode} 하나이며
+ * 재발급 경로(본문의 Refresh Token)와 같은 것을 쓴다 — <b>문자열 매칭으로 추측하지 않는다.</b>
  */
 @Component
 @RequiredArgsConstructor
@@ -40,12 +43,19 @@ public class SecurityErrorResponder implements AuthenticationEntryPoint, AccessD
 
 	private final ObjectMapper objectMapper;
 
+	/**
+	 * 인증 실패. <b>토큰 없음({@code A001})·유효하지 않음({@code A002})·만료({@code A003}) 를
+	 * 가른다</b> (sp-docs/api-contract.md §8.1, sp-docs/plan/phase1.md §4 AU-07).
+	 *
+	 * <p>Access Token 은 헤더로 오므로 필터 체인이 검증하고 실패가 여기로 온다. 본문으로 오는
+	 * Refresh Token 은 {@code AuthService} 가 같은 판정으로 처리한다.
+	 */
 	@Override
 	public void commence(
 			HttpServletRequest request,
 			HttpServletResponse response,
 			AuthenticationException authException) throws IOException {
-		write(response, ErrorCode.UNAUTHORIZED);
+		write(response, JwtTokenProvider.failureCode(authException));
 	}
 
 	@Override

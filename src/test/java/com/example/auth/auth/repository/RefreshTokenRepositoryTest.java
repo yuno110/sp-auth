@@ -11,6 +11,7 @@ import com.example.auth.global.config.JwtConfig;
 import com.example.auth.global.security.JwtTokenProvider;
 import com.example.auth.support.TestRsaKeys;
 import jakarta.persistence.Column;
+import java.nio.charset.StandardCharsets;
 import java.time.LocalDateTime;
 import java.util.List;
 import org.junit.jupiter.api.DisplayName;
@@ -20,6 +21,7 @@ import org.springframework.boot.test.autoconfigure.jdbc.AutoConfigureTestDatabas
 import org.springframework.boot.test.autoconfigure.orm.jpa.DataJpaTest;
 import org.springframework.boot.test.autoconfigure.orm.jpa.TestEntityManager;
 import org.springframework.context.annotation.Import;
+import org.springframework.core.io.ClassPathResource;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
@@ -266,6 +268,59 @@ class RefreshTokenRepositoryTest {
 		RefreshToken found = refreshTokenRepository.findByAccountId(accountId).orElseThrow();
 		assertThat(found.getToken()).isEqualTo(OLD_TOKEN);
 		assertThat(found.getExpiresAt()).isEqualTo(OLD_EXPIRES_AT);
+	}
+
+	/**
+	 * sp-docs/plan/phase1.md §4 AU-07 검증표의 "값이 같은 토큰으로 회전" 행이다.
+	 *
+	 * <p><b>이것이 실제로 일어난다.</b> Claim 에 {@code jti} 가 없고 {@code iat} 가 초 단위이므로
+	 * 같은 계정이 같은 초에 두 번 발급받으면 토큰 문자열이 완전히 같다
+	 * (sp-docs/requirements/member.md §6.2). 그때 재발급은 <b>저장값과 같은 값으로</b> 회전한다.
+	 *
+	 * <p><b>"0행이면 실패" 판정이 드라이버가 found rows 를 돌려주는 데 의존한다</b> (정본 §6.1 의
+	 * 측정표). MySQL(Connector/J 기본)과 H2 는 값이 바뀌지 않아도 1을 돌려주므로 정당한 재발급이
+	 * 통과한다. {@code useAffectedRows=true} 를 JDBC URL 에 넣으면 <b>변경된</b> 행을 돌려주므로
+	 * 0행이 되어 이 재발급이 거부된다 — 그래서 그 플래그를 쓰지 않는다.
+	 *
+	 * <p>{@code expires_at} 까지 같은 값으로 쓴다. <b>어느 컬럼도 바뀌지 않는 회전</b>이 found
+	 * rows 의존을 드러내는 가장 엄격한 형태다 — 실제 재발급은 토큰이 같아도 {@code expires_at}
+	 * 이 밀리초만큼 움직이므로 이보다 느슨하다.
+	 */
+	@Test
+	@DisplayName("값이 같은 토큰으로 회전해도 1행이다 — found rows 에 의존하는 판정이다")
+	void 값이_같은_회전도_1행이다() {
+		Long accountId = persistAccount("same-value@example.com");
+		refreshTokenRepository.saveAndFlush(refreshToken(accountId, OLD_TOKEN, OLD_EXPIRES_AT));
+		em.clear();
+
+		int affected = refreshTokenRepository.rotate(accountId, OLD_TOKEN, OLD_TOKEN, OLD_EXPIRES_AT);
+
+		assertThat(affected)
+				.as("0행이면 JDBC URL 에 useAffectedRows=true 가 들어온 것이다 "
+						+ "(sp-docs/requirements/member.md §6.1)")
+				.isOne();
+		RefreshToken found = refreshTokenRepository.findByAccountId(accountId).orElseThrow();
+		assertThat(found.getToken()).isEqualTo(OLD_TOKEN);
+		assertThat(found.getExpiresAt()).isEqualTo(OLD_EXPIRES_AT);
+	}
+
+	/**
+	 * 위 테스트의 전제를 설정 쪽에서 고정한다 (sp-docs/plan/phase1.md §4 AU-07 완료 기준).
+	 *
+	 * <p><b>테스트는 H2 로 도므로 이 플래그가 들어와도 깨지지 않는다</b> — MySQL 전용 설정이다.
+	 * 그래서 동작이 아니라 커밋되는 설정 파일을 직접 본다. 운영·로컬은 {@code DB_URL} 로 덮을 수
+	 * 있으므로 여기서 보는 것은 저장소에 들어 있는 기본값이다.
+	 */
+	@Test
+	@DisplayName("application.yml 의 JDBC URL 에 useAffectedRows 가 없다")
+	void 기본_JDBC_URL_에_useAffectedRows_가_없다() throws Exception {
+		String applicationYml = new ClassPathResource("application.yml")
+				.getContentAsString(StandardCharsets.UTF_8);
+
+		assertThat(applicationYml)
+				.as("useAffectedRows=true 는 변경된 행을 돌려주므로 값이 같은 회전이 0행이 되어 "
+						+ "정당한 재발급이 거부된다 (sp-docs/requirements/member.md §6.1)")
+				.doesNotContain("useAffectedRows");
 	}
 
 	@Test
