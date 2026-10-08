@@ -39,7 +39,14 @@ public class RefreshToken {
 	@Column(name = "account_id", nullable = false, unique = true)
 	private Long accountId;
 
-	@Column(nullable = false, length = 512, unique = true)
+	/**
+	 * 발급된 JWT 원문. <b>길이 1024 는 측정값이다</b> — 이 서비스가 발급하는 토큰이 541~557자라
+	 * 512 로는 들어가지 않는다 (sp-docs/domain-model.md §2.2 의 측정표, AU-03R).
+	 *
+	 * <p>문자셋(ascii)은 JPA 로 선언할 수 없고 마이그레이션이 정한다
+	 * ({@code V4__widen_refresh_token.sql}). 스키마의 출처는 Flyway 하나다.
+	 */
+	@Column(nullable = false, length = 1024, unique = true)
 	private String token;
 
 	@Column(name = "expires_at", nullable = false)

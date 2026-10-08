@@ -29,6 +29,9 @@
 - [x] AU-01 프로젝트 스캐폴딩 · 상태 done
 - [x] AU-02 공통 기반 · 상태 done
 - [x] AU-03 도메인 기반 · 상태 done
+- [x] AU-03R 토큰 컬럼 폭 정정 · 상태 done
+
+> **AU-03R이 왜 있나** — AU-03은 `done`이지만 `refresh_token.token`이 `VARCHAR(512)`인데 이 서비스가 발급하는 토큰은 541~557자다. AU-06에서 로그인이 막혀 드러났다. `phase1.md` §2.6 #2에 해당하므로 AU-03을 고치지 않고 후속 항목으로 처리한다. **`V2`를 수정하지 않는다** — 이미 적용되어 Flyway 체크섬이 깨진다.
 - [x] AU-04 보안 기반 · 상태 done
 
 ## 기능 단계
@@ -36,7 +39,16 @@
 기반 산출물을 읽기만 하고 자기 파일을 만든다. 기반 경로의 파일을 고쳐야 하면 BLOCKED로 보고한다.
 
 - [x] AU-05 계정 생성과 이메일 중복 확인 · 상태 done · 리뷰 3라운드
-- [ ] AU-06 로그인 · 상태 todo
+- [ ] AU-06 로그인 · 상태 blocked · 커밋 - · 사유: 완료 기준 여덟 중 둘(비밀번호 불일치·없는
+  이메일을 같은 401 AU003 로 비구분, 탈퇴 계정 거부)만 충족. **로그인 성공 경로가 DB 에서 막혀**
+  나머지 여섯이 미충족 — 이 서비스가 발급하는 Refresh Token(RS256 + RFC7638 kid, api-contract.md
+  §6 claim 집합)은 **최소 541자**인데 `refresh_token.token` 이 VARCHAR(512)다. 길이의 정본은
+  domain-model.md §2.2 이고 AU-03 의 V2 마이그레이션·RefreshToken 엔티티가 그대로 반영했다.
+  INSERT 가 `Value too long for column "token CHARACTER VARYING(512)"` 으로 터져 로그인이 500 이
+  된다. 토큰을 줄일 여지가 없다(kid·claim·2048비트가 모두 정본 고정). 진행에는 정본 개정(token
+  길이) + AU-03 산출물 2건 변경 + 새 마이그레이션 번호 배정이 필요하다. 구현(LoginRequest·
+  AuthService·AuthController)과 테스트(AuthServiceTest·AuthControllerTest)는 스테이징되어 있고
+  `./gradlew test` 실패 7건이 전부 이 한 원인이다 (135개 중 128개 통과)
 - [ ] AU-07 토큰 재발급과 로그아웃 · 상태 todo
 - [ ] AU-08 비밀번호 변경 · 상태 todo
 - [ ] AU-09 계정 탈퇴 · 상태 todo
