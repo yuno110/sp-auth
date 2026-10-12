@@ -1,6 +1,7 @@
 package com.example.auth.account.controller;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.patch;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
@@ -67,7 +68,7 @@ class AccountControllerTest {
 
 	/**
 	 * {@code currentPassword} 누락의 {@code fieldErrors} 메시지
-	 * (sp-docs/api-contract.md §2.2 v10). <b>존재 메시지이고 정책 메시지가 아니다.</b>
+	 * (sp-docs/api-contract.md §2.2). <b>존재 메시지이고 정책 메시지가 아니다.</b>
 	 *
 	 * <p>{@code PasswordChangeRequest} 의 상수를 참조하지 않는다 — 그쪽은 package-private 이고
 	 * 이 테스트는 다른 패키지다. 위의 두 메시지 상수와 같은 방식이다.
@@ -448,7 +449,7 @@ class AccountControllerTest {
 	}
 
 	/**
-	 * <b>누락은 {@code AU004} 가 아니라 {@code C001} 이다</b> (sp-docs/api-contract.md §2.2 v10).
+	 * <b>누락은 {@code AU004} 가 아니라 {@code C001} 이다</b> (sp-docs/api-contract.md §2.2).
 	 * 금지되는 것은 형식 검증({@code @Pattern})이고 빈 값 검사({@code @NotBlank})는 요구된다 —
 	 * 빈 값은 어떤 정책에서도 올바른 비밀번호가 아니므로 정책 변경으로 잠길 사용자가 없다.
 	 *
@@ -486,7 +487,7 @@ class AccountControllerTest {
 	}
 
 	/**
-	 * <b>존재 메시지이고 정책 메시지가 아니다</b> (sp-docs/api-contract.md §2.2 v10).
+	 * <b>존재 메시지이고 정책 메시지가 아니다</b> (sp-docs/api-contract.md §2.2).
 	 * {@code newPassword} 쪽과 메시지가 갈리는 것이 요점이다 — 정책 설명("8~20자의 영문,
 	 * 숫자, 특수문자 조합")을 돌려주면 사용자가 자기 비밀번호의 형식이 틀렸다고 읽는다.
 	 */
@@ -506,7 +507,7 @@ class AccountControllerTest {
 	}
 
 	/**
-	 * <b>둘 다 틀리면 {@code C001} 이다</b> (sp-docs/api-contract.md §2.2 v10) — Bean Validation
+	 * <b>둘 다 틀리면 {@code C001} 이다</b> (sp-docs/api-contract.md §2.2) — Bean Validation
 	 * 이 컨트롤러 앞에서 돌기 때문이고, 그 순서는 현재 비밀번호에 대해 아무것도 알려주지 않으므로
 	 * 그대로 둔다.
 	 */
@@ -523,16 +524,15 @@ class AccountControllerTest {
 
 	/**
 	 * <b>탈퇴한 계정의 토큰으로는 바꿀 수 없다 — 404 {@code AU001}</b>
-	 * (sp-docs/api-contract.md §2.2 v10). Access Token 이 탈퇴 후에도 만료까지 통과하므로
+	 * (sp-docs/api-contract.md §2.2). Access Token 이 탈퇴 후에도 만료까지 통과하므로
 	 * (sp-docs/security.md §5.3) 실제로 도달 가능한 경로다.
 	 *
 	 * <p><b>{@code updated_at} 까지 단언하는 것이 이 검사의 실질이다.</b> 권한 상승을 막는 것이
 	 * 아니라(탈퇴 계정은 새 세션을 만들 수 없다) 닫힌 행의 자격증명이 덮이는 것과 <b>탈퇴 시점의
 	 * 유일한 흔적이 지워지는 것</b>을 막는다 — {@code account} 에 {@code deleted_at} 컬럼이 없다.
 	 *
-	 * <p>AU-09 가 아직 없으므로 탈퇴는 엔티티로 직접 만든다. AU-09 이후에는
-	 * {@code DELETE /accounts/me} 가 같은 상태를 만든다 — <b>그쪽은 멱등이라 204 이고 여기만
-	 * 404 다.</b>
+	 * <p>탈퇴는 엔티티로 직접 만든다 — {@code DELETE /accounts/me} 로 만들지 않는 이유는
+	 * {@link #탈퇴시킨다(String)} 에 적었다. <b>그쪽은 멱등이라 204 이고 여기만 404 다.</b>
 	 */
 	@Test
 	@DisplayName("탈퇴한 계정의 토큰으로 변경하면 404 AU001 이고 password·updated_at 이 그대로다")
@@ -652,6 +652,189 @@ class AccountControllerTest {
 				.isEmpty();
 	}
 
+	// --- 계정 탈퇴 (sp-docs/api-contract.md §2.2, sp-docs/plan/phase1.md §4 AU-09) ---
+
+	/**
+	 * <b>204 와 빈 본문</b>이고 <b>행은 남는다</b> (sp-docs/api-contract.md §2.2).
+	 * {@code Account.withdraw()} 의 Soft Delete 이므로 {@code uk_account_email} 이 탈퇴한
+	 * 이메일의 재사용을 계속 막는다 (sp-docs/requirements/member.md §3 규칙 1).
+	 */
+	@Test
+	@DisplayName("탈퇴는 204 와 빈 본문을 반환하고 deleted = true, 행 존재, 토큰 삭제다")
+	void 정상_탈퇴() throws Exception {
+		IssuedTokens 세션 = 계정과_세션을_만든다("withdraw@example.com");
+		assertThat(this.refreshTokenRepository.findAll()).hasSize(1);
+
+		String body = this.mockMvc.perform(withdraw(세션.accessToken(), 탈퇴_본문(RAW_PASSWORD)))
+				.andExpect(status().isNoContent())
+				.andReturn().getResponse().getContentAsString(StandardCharsets.UTF_8);
+
+		assertThat(body).as("204 에는 본문을 담지 않는다").isEmpty();
+		assertThat(this.accountRepository.findByEmail("withdraw@example.com").orElseThrow().isDeleted())
+				.as("행 삭제가 아니다 (sp-docs/plan/phase1.md §4 AU-09 완료 기준)")
+				.isTrue();
+		assertThat(테스트가_만든_계정_수()).isEqualTo(1);
+		assertThat(this.refreshTokenRepository.findAll())
+				.as("탈퇴 시 Refresh Token 을 삭제한다 (sp-docs/requirements/member.md §3 규칙 4)")
+				.isEmpty();
+	}
+
+	/**
+	 * <b>누락은 {@code AU004} 가 아니라 {@code C001} 이다</b> (sp-docs/api-contract.md §2.2).
+	 * 금지되는 것은 형식 검증({@code @Pattern})이고 빈 값 검사({@code @NotBlank})는 요구된다.
+	 * {@code AU004} 의 메시지는 <b>아무것도 보내지 않은 요청에는 거짓이다</b> —
+	 * {@code PATCH /me/password} 와 같은 성질의 필드를 같은 코드로 처리한다 (§2.2).
+	 *
+	 * <p>네 입력을 함께 보는 것이 요점이다. 넷이 같은 코드로 수렴하는지는 하나씩 보면
+	 * 드러나지 않는다.
+	 */
+	@ParameterizedTest(name = "{0}")
+	@ValueSource(strings = {
+			"{}",
+			"{\"password\": null}",
+			"{\"password\": \"\"}",
+			"{\"password\": \"   \"}"
+	})
+	@DisplayName("탈퇴 요청에 password 가 없으면 400 C001 이고 fieldErrors 에 password 다")
+	void 탈퇴_비밀번호_누락(String json) throws Exception {
+		IssuedTokens 세션 = 계정과_세션을_만든다("absent-withdraw@example.com");
+
+		this.mockMvc.perform(withdraw(세션.accessToken(), json))
+				.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.success").value(false))
+				.andExpect(jsonPath("$.error.code").value("C001"))
+				.andExpect(jsonPath("$.error.fieldErrors.length()").value(1))
+				.andExpect(jsonPath("$.error.fieldErrors[0].field").value("password"))
+				.andExpect(jsonPath("$.error.fieldErrors[0].message").value(CURRENT_PASSWORD_MESSAGE));
+
+		assertThat(탈퇴_여부("absent-withdraw@example.com"))
+				.as("검증 실패는 컨트롤러 앞에서 끝난다 — 계정을 닫지 않는다")
+				.isFalse();
+		assertThat(this.refreshTokenRepository.findAll()).hasSize(1);
+	}
+
+	/**
+	 * <b>400 이다. 401 이 아니다</b> (sp-docs/api-contract.md §2.2) — 요청자는 이미 인증되어
+	 * 있고 틀린 것은 본문의 값이다. <b>{@code deleted} 는 그대로 {@code false} 다.</b>
+	 */
+	@Test
+	@DisplayName("탈퇴 요청의 비밀번호가 틀리면 400 AU004 이고 deleted 가 그대로 false 다")
+	void 탈퇴_비밀번호_불일치() throws Exception {
+		IssuedTokens 세션 = 계정과_세션을_만든다("wrongpw@example.com");
+
+		String body = this.mockMvc.perform(withdraw(세션.accessToken(), 탈퇴_본문("Other1!pw")))
+				.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.success").value(false))
+				.andExpect(jsonPath("$.data").isEmpty())
+				.andExpect(jsonPath("$.error.code").value("AU004"))
+				.andExpect(jsonPath("$.error.message").value(PASSWORD_MISMATCH_MESSAGE))
+				.andExpect(jsonPath("$.error.fieldErrors").isEmpty())
+				.andReturn().getResponse().getContentAsString(StandardCharsets.UTF_8);
+
+		assertThat(body)
+				.as("비밀번호는 어떤 응답에도 넣지 않는다 (sp-docs/requirements/member.md §3 규칙 2)")
+				.doesNotContain("Other1!pw");
+
+		assertThat(탈퇴_여부("wrongpw@example.com")).isFalse();
+		assertThat(this.refreshTokenRepository.findAll())
+				.as("거부된 탈퇴는 Refresh Token 을 지우지 않는다")
+				.hasSize(1);
+		this.mockMvc.perform(loginRequest("wrongpw@example.com", RAW_PASSWORD))
+				.andExpect(status().isOk());
+	}
+
+	/** 로그인이 {@code deleted} 를 검사한다 (sp-docs/requirements/member.md §3 규칙 5). */
+	@Test
+	@DisplayName("탈퇴 후 로그인하면 401 AU003 이다")
+	void 탈퇴_후_로그인() throws Exception {
+		IssuedTokens 세션 = 계정과_세션을_만든다("relogin-withdraw@example.com");
+
+		this.mockMvc.perform(withdraw(세션.accessToken(), 탈퇴_본문(RAW_PASSWORD)))
+				.andExpect(status().isNoContent());
+
+		this.mockMvc.perform(loginRequest("relogin-withdraw@example.com", RAW_PASSWORD))
+				.andExpect(status().isUnauthorized())
+				.andExpect(jsonPath("$.error.code").value("AU003"));
+	}
+
+	/**
+	 * 저장값이 삭제됐으므로 재발급은 실패한다. 거부는 {@code A002} 다 — 사유를 구분해
+	 * 내보내지 않는다 (sp-docs/api-contract.md §8.5, AU-07).
+	 */
+	@Test
+	@DisplayName("탈퇴 후 기존 Refresh Token 으로 재발급하면 401 A002 다")
+	void 탈퇴_후_재발급() throws Exception {
+		IssuedTokens 세션 = 계정과_세션을_만든다("reissue-withdraw@example.com");
+
+		this.mockMvc.perform(withdraw(세션.accessToken(), 탈퇴_본문(RAW_PASSWORD)))
+				.andExpect(status().isNoContent());
+
+		this.mockMvc.perform(post("/api/v1/auth/reissue")
+						.contentType(MediaType.APPLICATION_JSON)
+						.characterEncoding(StandardCharsets.UTF_8)
+						.content("{\"refreshToken\": \"" + 세션.refreshToken() + "\"}"))
+				.andExpect(status().isUnauthorized())
+				.andExpect(jsonPath("$.error.code").value("A002"));
+
+		assertThat(this.refreshTokenRepository.findAll())
+				.as("거부된 재발급이 행을 다시 만들지 않는다")
+				.isEmpty();
+	}
+
+	/**
+	 * <b>멱등이다 — 이미 탈퇴했으면 204 이고 아무것도 바꾸지 않는다</b>
+	 * (MR-10, sp-docs/api-contract.md §2.2). 두 번째 호출이 같은 Access Token 으로 가는
+	 * 것이 정상 경로다 — 그 토큰은 탈퇴 후에도 만료까지 통과한다 (sp-docs/security.md §5.3).
+	 *
+	 * <p><b>{@code updated_at} 까지 단언하는 것이 이 멱등의 실질이다.</b> 닫힌 행에 쓰기가
+	 * 닿으면 탈퇴 시점의 유일한 흔적이 지워진다 — {@code account} 에 {@code deleted_at}
+	 * 컬럼이 없다 (sp-docs/domain-model.md §2.1).
+	 */
+	@Test
+	@DisplayName("이미 탈퇴한 계정에 다시 탈퇴하면 204 이고 updated_at 이 그대로다")
+	void 이미_탈퇴한_계정_재호출() throws Exception {
+		IssuedTokens 세션 = 계정과_세션을_만든다("idempotent@example.com");
+
+		this.mockMvc.perform(withdraw(세션.accessToken(), 탈퇴_본문(RAW_PASSWORD)))
+				.andExpect(status().isNoContent());
+
+		Long id = this.accountRepository.findByEmail("idempotent@example.com").orElseThrow().getId();
+		String updatedAt = 컬럼(id, "updated_at");
+
+		this.mockMvc.perform(withdraw(세션.accessToken(), 탈퇴_본문(RAW_PASSWORD)))
+				.andExpect(status().isNoContent());
+
+		assertThat(컬럼(id, "updated_at"))
+				.as("아무것도 바꾸지 않는다 (sp-docs/api-contract.md §2.2)")
+				.isEqualTo(updatedAt);
+		assertThat(탈퇴_여부("idempotent@example.com")).isTrue();
+	}
+
+	/**
+	 * <b>{@code deleted} 검사가 비밀번호 비교보다 먼저다</b> (sp-docs/api-contract.md §2.2).
+	 * {@code PATCH /me/password} 와 <b>같은 순서이고 결론만 반대다</b> — 그쪽은 404 로 거부하고
+	 * ({@link #탈퇴한_계정()}) 이쪽은 204 로 통과한다. 재확인이 요구되는 것(MR-10)은 <b>계정을
+	 * 닫는 행위</b>에 대한 것이고, 이미 닫힌 계정에는 보호할 상태가 없다.
+	 */
+	@Test
+	@DisplayName("이미 탈퇴한 계정은 비밀번호가 틀려도 204 다")
+	void 이미_탈퇴한_계정_재호출_비밀번호_틀림() throws Exception {
+		IssuedTokens 세션 = 계정과_세션을_만든다("idem-wrongpw@example.com");
+
+		this.mockMvc.perform(withdraw(세션.accessToken(), 탈퇴_본문(RAW_PASSWORD)))
+				.andExpect(status().isNoContent());
+
+		Long id = this.accountRepository.findByEmail("idem-wrongpw@example.com").orElseThrow().getId();
+		String updatedAt = 컬럼(id, "updated_at");
+
+		String body = this.mockMvc.perform(withdraw(세션.accessToken(), 탈퇴_본문("Other1!pw")))
+				.andExpect(status().isNoContent())
+				.andReturn().getResponse().getContentAsString(StandardCharsets.UTF_8);
+
+		assertThat(body).as("AU004 가 아니다 — 검사가 비교보다 먼저다").isEmpty();
+		assertThat(컬럼(id, "updated_at")).isEqualTo(updatedAt);
+	}
+
 	private ResultActions checkEmail(String email) throws Exception {
 		return this.mockMvc.perform(get("/api/v1/accounts/check-email").param("email", email));
 	}
@@ -694,7 +877,37 @@ class AccountControllerTest {
 				+ "\"newPassword\": \"" + newPassword + "\"}";
 	}
 
-	/** 이미 있는 계정을 탈퇴 상태로 만든다. AU-09 가 없으므로 엔티티로 직접 바꾼다. */
+	/**
+	 * 탈퇴 요청. <b>본문이 있는 {@code DELETE} 다</b> — 비밀번호 재확인이 요구되고(MR-10),
+	 * member 는 비밀번호를 갖지 않으므로 이 검증은 여기에만 있을 수 있다
+	 * (sp-docs/requirements/member.md §8).
+	 */
+	private static MockHttpServletRequestBuilder withdraw(String accessToken, String json) {
+		return delete("/api/v1/accounts/me")
+				.header(HttpHeaders.AUTHORIZATION, "Bearer " + accessToken)
+				.contentType(MediaType.APPLICATION_JSON)
+				.characterEncoding(StandardCharsets.UTF_8)
+				.content(json);
+	}
+
+	/** 필드 이름은 {@code password} 다. {@code currentPassword} 가 아니다 (§2.2). */
+	private static String 탈퇴_본문(String password) {
+		return "{\"password\": \"" + password + "\"}";
+	}
+
+	/** 커밋된 {@code deleted}. {@code 컬럼} 은 {@code String} 으로 읽어 불리언에 쓰지 않는다. */
+	private boolean 탈퇴_여부(String email) {
+		return this.accountRepository.findByEmail(email).orElseThrow().isDeleted();
+	}
+
+	/**
+	 * 이미 있는 계정을 탈퇴 상태로 엔티티로 직접 바꾼다. <b>{@code DELETE /accounts/me} 로
+	 * 바꾸지 않는 것이 의도다</b> — 유일한 사용처인 {@link #탈퇴한_계정()} 은 AU-08 의 검사이고,
+	 * 그 선행 상태를 AU-09 의 엔드포인트로 만들면 AU-08 의 회귀 테스트가 AU-09 의 동작에
+	 * 의존하게 된다. 그쪽은 같은 트랜잭션에서 Refresh Token 행까지 지우므로 "탈퇴했는데 토큰
+	 * 행이 남아 있는" 상태를 만들 수도 없다 — 그 상태를 요구하는 쪽은
+	 * {@code AccountServiceTest} 의 같은 헬퍼다.
+	 */
 	private Long 탈퇴시킨다(String email) {
 		Account account = this.accountRepository.findByEmail(email).orElseThrow();
 		account.withdraw();

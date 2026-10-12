@@ -4,6 +4,7 @@ import com.example.auth.account.dto.AccountCreateRequest;
 import com.example.auth.account.dto.AccountResponse;
 import com.example.auth.account.dto.CheckResponse;
 import com.example.auth.account.dto.PasswordChangeRequest;
+import com.example.auth.account.dto.WithdrawRequest;
 import com.example.auth.account.service.AccountService;
 import com.example.auth.global.common.ApiResponse;
 import com.example.auth.global.security.CurrentAccount;
@@ -14,6 +15,7 @@ import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Size;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.HttpStatus;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -89,6 +91,32 @@ public class AccountController {
 			@Valid @RequestBody PasswordChangeRequest request) {
 
 		this.accountService.changePassword(loginAccount.accountId(), request);
+	}
+
+	/**
+	 * MR-10 1단계 — 계정 탈퇴. <b>204, 본문 없음</b> (sp-docs/api-contract.md §2.2).
+	 *
+	 * <p><b>본문에 현재 비밀번호를 받아 재확인한다</b> — 필드는 {@code password} 다
+	 * ({@link WithdrawRequest}). 탈퇴 대상은 검증된 Access Token 의 {@code sub} 가 정한다
+	 * (sp-docs/security.md §4). 경로 인가는 AU-04 의 {@code SecurityConfig} 가
+	 * {@code /api/v1/accounts/me} 로 선반영했다.
+	 *
+	 * <p>누락·{@code null}·빈 값은 400 {@code C001} 이고 {@code fieldErrors} 에
+	 * {@code password} 가 담긴다 ({@code GlobalExceptionHandler}), 값 불일치는 400
+	 * {@code AU004} 다. <b>이미 탈퇴한 계정은 비밀번호를 검증하지 않고 204 다</b> — 멱등이
+	 * 요구사항이다 (MR-10, sp-docs/api-contract.md §2.2).
+	 *
+	 * <p><b>2단계(프로필 삭제)를 여기서 호출하지 않는다.</b> 클라이언트가
+	 * {@code DELETE /api/v1/members/me} 를 이어서 호출한다 — auth 는 다른 서비스를 호출하지
+	 * 않는다 (sp-docs/architecture.md §5).
+	 */
+	@DeleteMapping("/me")
+	@ResponseStatus(HttpStatus.NO_CONTENT)
+	public void withdraw(
+			@CurrentAccount LoginAccount loginAccount,
+			@Valid @RequestBody WithdrawRequest request) {
+
+		this.accountService.withdraw(loginAccount.accountId(), request);
 	}
 
 }

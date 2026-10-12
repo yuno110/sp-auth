@@ -4,7 +4,7 @@ import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Pattern;
 
 /**
- * 비밀번호 변경 요청. 정본: sp-docs/api-contract.md §2.2 (v10), 검증 규칙은
+ * 비밀번호 변경 요청. 정본: sp-docs/api-contract.md §2.2, 검증 규칙은
  * sp-docs/requirements/member.md §2.
  *
  * <p><b>필드는 {@code currentPassword}·{@code newPassword} 둘이다</b> (§2.2).
@@ -21,7 +21,7 @@ import jakarta.validation.constraints.Pattern;
  * 위반은 400 {@code C001}</td></tr>
  * </table>
  *
- * <p><b>자격증명 필드에서 금지되는 것은 형식 검증이고, 빈 값 검사는 아니다</b> (§2.2 v10).
+ * <p><b>자격증명 필드에서 금지되는 것은 형식 검증이고, 빈 값 검사는 아니다</b> (§2.2).
  * 둘이 갈리는 이유가 다르다.
  *
  * <ul>
@@ -53,7 +53,7 @@ public record PasswordChangeRequest(
 		String newPassword) {
 
 	/**
-	 * <b>존재 메시지다. 정책 메시지가 아니다</b> (sp-docs/api-contract.md §2.2 v10).
+	 * <b>존재 메시지다. 정책 메시지가 아니다</b> (sp-docs/api-contract.md §2.2).
 	 *
 	 * <p>{@link AccountCreateRequest} 의 비밀번호 메시지를 쓰지 않는다 — 그것은 "8~20자의
 	 * 영문, 숫자, 특수문자 조합"이라는 <b>정책 설명</b>이고, 여기서 실패한 것은 정책이 아니라
