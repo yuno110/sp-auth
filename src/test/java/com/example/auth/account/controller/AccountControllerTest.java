@@ -2,6 +2,7 @@ package com.example.auth.account.controller;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.patch;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
@@ -9,7 +10,9 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import com.example.auth.account.entity.Account;
 import com.example.auth.account.entity.Role;
 import com.example.auth.account.repository.AccountRepository;
+import com.example.auth.auth.repository.RefreshTokenRepository;
 import com.example.auth.support.TestRsaKeys;
+import com.jayway.jsonpath.JsonPath;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
@@ -21,6 +24,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.ActiveProfiles;
@@ -31,12 +35,14 @@ import org.springframework.test.web.servlet.ResultActions;
 import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder;
 
 /**
- * sp-docs/plan/phase1.md §4 AU-05 의 "검증" 표 중 HTTP 쪽을 테스트로 옮긴 것이다.
+ * sp-docs/plan/phase1.md §4 AU-05·AU-08 의 "검증" 표 중 HTTP 쪽을 테스트로 옮긴 것이다.
  * 정본은 sp-docs/api-contract.md §2.2 §2.3 §9.1, 검증 규칙은
  * sp-docs/requirements/member.md §2 §2.1 이다.
  *
  * <p>인가 필터를 포함한 전 구간을 지난다 — {@code POST /api/v1/accounts} 와
- * {@code GET /accounts/check-email} 은 무인증이다 (sp-docs/security.md §5.1).
+ * {@code GET /accounts/check-email} 은 무인증이고
+ * {@code PATCH /accounts/me/password} 는 인증이다 (sp-docs/security.md §5.1).
+ * 토큰 없는 접근이 401 {@code A001} 인 것은 {@code SecurityConfigTest} 가 본다.
  */
 @SpringBootTest
 @AutoConfigureMockMvc
@@ -45,6 +51,9 @@ class AccountControllerTest {
 
 	private static final String RAW_PASSWORD = "Passw0rd!";
 
+	/** AU-08. sp-docs/api-contract.md §2.2 의 예시 본문이 쓰는 값이다. */
+	private static final String NEW_PASSWORD = "NewPassw0rd!";
+
 	/** V3 seed 의 계정 (sp-docs/requirements/member.md §10.1). 테스트가 만든 것이 아니다. */
 	private static final String ADMIN_EMAIL = "admin@example.com";
 
@@ -52,6 +61,18 @@ class AccountControllerTest {
 
 	private static final String PASSWORD_MESSAGE =
 			"비밀번호는 8~20자의 영문, 숫자, 특수문자 조합이어야 합니다.";
+
+	/** sp-docs/api-contract.md §8.4 {@code AU004}. */
+	private static final String PASSWORD_MISMATCH_MESSAGE = "현재 비밀번호가 일치하지 않습니다.";
+
+	/**
+	 * {@code currentPassword} 누락의 {@code fieldErrors} 메시지
+	 * (sp-docs/api-contract.md §2.2 v10). <b>존재 메시지이고 정책 메시지가 아니다.</b>
+	 *
+	 * <p>{@code PasswordChangeRequest} 의 상수를 참조하지 않는다 — 그쪽은 package-private 이고
+	 * 이 테스트는 다른 패키지다. 위의 두 메시지 상수와 같은 방식이다.
+	 */
+	private static final String CURRENT_PASSWORD_MESSAGE = "현재 비밀번호를 입력해주세요.";
 
 	@DynamicPropertySource
 	static void jwtPrivateKey(DynamicPropertyRegistry registry) {
@@ -64,6 +85,10 @@ class AccountControllerTest {
 	@Autowired
 	private AccountRepository accountRepository;
 
+	/** AU-08 — 비밀번호 변경이 지우는 대상 (sp-docs/requirements/member.md §3 규칙 4). */
+	@Autowired
+	private RefreshTokenRepository refreshTokenRepository;
+
 	@Autowired
 	private JdbcTemplate jdbcTemplate;
 
@@ -71,9 +96,14 @@ class AccountControllerTest {
 	 * <b>seed 행은 남긴다.</b> H2 는 테스트 클래스 사이에 공유되므로
 	 * ({@code DB_CLOSE_DELAY=-1}, sp-docs/tech-stack.md §5.3) 여기서 지우면
 	 * {@code AdminSeedTest} 가 자기와 무관한 이유로 깨진다.
+	 *
+	 * <p>{@code fk_refresh_token_account} 가 있으므로 토큰을 먼저 지운다 — AU-08 의 테스트가
+	 * 로그인으로 {@code refresh_token} 행을 만든다.
 	 */
 	@AfterEach
 	void 정리() {
+		this.refreshTokenRepository.deleteAll();
+		this.refreshTokenRepository.flush();
 		this.accountRepository.deleteAll(this.accountRepository.findAll().stream()
 				.filter(account -> !ADMIN_EMAIL.equals(account.getEmail()))
 				.toList());
@@ -322,8 +352,359 @@ class AccountControllerTest {
 				.andExpect(jsonPath("$.data").doesNotExist());
 	}
 
+	// --- 비밀번호 변경 (sp-docs/api-contract.md §2.2, sp-docs/plan/phase1.md §4 AU-08) ---
+
+	@Test
+	@DisplayName("비밀번호 변경은 204 와 빈 본문을 반환하고 refresh_token 행을 지운다")
+	void 정상_변경() throws Exception {
+		IssuedTokens 세션 = 계정과_세션을_만든다("change@example.com");
+		assertThat(this.refreshTokenRepository.findAll()).hasSize(1);
+
+		String body = this.mockMvc
+				.perform(changePassword(세션.accessToken(), 변경_본문(RAW_PASSWORD, NEW_PASSWORD)))
+				.andExpect(status().isNoContent())
+				.andReturn().getResponse().getContentAsString(StandardCharsets.UTF_8);
+
+		assertThat(body).as("204 에는 본문을 담지 않는다").isEmpty();
+		assertThat(this.refreshTokenRepository.findAll())
+				.as("비밀번호 변경 시 Refresh Token 을 삭제한다 (sp-docs/security.md §7)")
+				.isEmpty();
+	}
+
+	@Test
+	@DisplayName("변경 후 새 비밀번호로 로그인되고 옛 비밀번호는 401 AU003 이다")
+	void 변경_후_로그인() throws Exception {
+		IssuedTokens 세션 = 계정과_세션을_만든다("relogin@example.com");
+
+		this.mockMvc.perform(changePassword(세션.accessToken(), 변경_본문(RAW_PASSWORD, NEW_PASSWORD)))
+				.andExpect(status().isNoContent());
+
+		this.mockMvc.perform(loginRequest("relogin@example.com", NEW_PASSWORD))
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.data.accessToken").isNotEmpty());
+
+		this.mockMvc.perform(loginRequest("relogin@example.com", RAW_PASSWORD))
+				.andExpect(status().isUnauthorized())
+				.andExpect(jsonPath("$.error.code").value("AU003"));
+	}
+
+	/**
+	 * <b>400 이다. 401 이 아니다</b> (sp-docs/api-contract.md §2.2) — 요청자는 이미 인증되어
+	 * 있고, 틀린 것은 본문의 값이다.
+	 */
+	@Test
+	@DisplayName("현재 비밀번호가 틀리면 400 AU004 다")
+	void 현재_비밀번호_불일치() throws Exception {
+		IssuedTokens 세션 = 계정과_세션을_만든다("mismatch@example.com");
+
+		String body = this.mockMvc
+				.perform(changePassword(세션.accessToken(), 변경_본문("Other1!pw", NEW_PASSWORD)))
+				.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.success").value(false))
+				.andExpect(jsonPath("$.data").isEmpty())
+				.andExpect(jsonPath("$.error.code").value("AU004"))
+				.andExpect(jsonPath("$.error.message").value(PASSWORD_MISMATCH_MESSAGE))
+				.andExpect(jsonPath("$.error.fieldErrors").isEmpty())
+				.andReturn().getResponse().getContentAsString(StandardCharsets.UTF_8);
+
+		assertThat(body)
+				.as("비밀번호는 어떤 응답에도 넣지 않는다 (sp-docs/requirements/member.md §3 규칙 2)")
+				.doesNotContain("Other1!pw")
+				.doesNotContain(NEW_PASSWORD);
+
+		assertThat(this.refreshTokenRepository.findAll())
+				.as("거부된 변경은 Refresh Token 을 지우지 않는다")
+				.hasSize(1);
+		this.mockMvc.perform(loginRequest("mismatch@example.com", RAW_PASSWORD))
+				.andExpect(status().isOk());
+	}
+
+	/**
+	 * <b>검증표의 핵심 한 줄이다</b> — "{@code currentPassword} 가 형식 위반이고 값도 틀림 →
+	 * 400 {@code AU004}. {@code C001} 이 아니다. 형식으로 가르지 않는다"
+	 * (sp-docs/plan/phase1.md §4 AU-08).
+	 *
+	 * <p>{@code currentPassword} 에 비밀번호 규칙을 걸면 틀린 형식은 {@code C001},
+	 * 형식은 맞지만 틀린 값은 {@code AU004} 가 되어 <b>응답이 갈린다</b>
+	 * (sp-docs/api-contract.md §2.2).
+	 */
+	@ParameterizedTest(name = "currentPassword = \"{0}\"")
+	@ValueSource(strings = {
+			"short",        // 8자 미만, 숫자·특수문자 없음
+			"비밀번호1234",   // 허용 집합 밖의 문자
+			"Passw0rd 1"    // 공백 포함. §2.1 은 공백을 금지한다
+	})
+	@DisplayName("currentPassword 가 형식 위반이고 값도 틀리면 400 AU004 다")
+	void currentPassword_는_형식으로_가르지_않는다(String currentPassword) throws Exception {
+		IssuedTokens 세션 = 계정과_세션을_만든다("format@example.com");
+
+		this.mockMvc.perform(changePassword(세션.accessToken(), 변경_본문(currentPassword, NEW_PASSWORD)))
+				.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.error.code").value("AU004"))
+				.andExpect(jsonPath("$.error.message").value(PASSWORD_MISMATCH_MESSAGE));
+
+		this.mockMvc.perform(loginRequest("format@example.com", RAW_PASSWORD))
+				.andExpect(status().isOk());
+	}
+
+	/**
+	 * <b>누락은 {@code AU004} 가 아니라 {@code C001} 이다</b> (sp-docs/api-contract.md §2.2 v10).
+	 * 금지되는 것은 형식 검증({@code @Pattern})이고 빈 값 검사({@code @NotBlank})는 요구된다 —
+	 * 빈 값은 어떤 정책에서도 올바른 비밀번호가 아니므로 정책 변경으로 잠길 사용자가 없다.
+	 *
+	 * <p>{@code AU004} 의 메시지("현재 비밀번호가 일치하지 않습니다")는 <b>아무것도 보내지 않은
+	 * 요청에는 거짓이다.</b> {@code DELETE /accounts/me} 도 같은 코드를 쓴다
+	 * (sp-docs/plan/phase1.md §4 AU-09).
+	 *
+	 * <p>네 입력을 함께 보는 것이 요점이다 — 넷이 같은 코드로 수렴하는지는 하나씩 보면
+	 * 드러나지 않는다.
+	 */
+	@ParameterizedTest(name = "{0}")
+	@ValueSource(strings = {
+			"{\"newPassword\": \"" + NEW_PASSWORD + "\"}",
+			"{\"currentPassword\": null, \"newPassword\": \"" + NEW_PASSWORD + "\"}",
+			"{\"currentPassword\": \"\", \"newPassword\": \"" + NEW_PASSWORD + "\"}",
+			"{\"currentPassword\": \"   \", \"newPassword\": \"" + NEW_PASSWORD + "\"}"
+	})
+	@DisplayName("currentPassword 누락·null·빈 값은 400 C001 이고 fieldErrors 에 currentPassword 다")
+	void currentPassword_누락(String json) throws Exception {
+		IssuedTokens 세션 = 계정과_세션을_만든다("absent@example.com");
+
+		this.mockMvc.perform(changePassword(세션.accessToken(), json))
+				.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.error.code").value("C001"))
+				.andExpect(jsonPath("$.error.fieldErrors.length()").value(1))
+				.andExpect(jsonPath("$.error.fieldErrors[0].field").value("currentPassword"))
+				.andExpect(jsonPath("$.error.fieldErrors[0].message")
+						.value(CURRENT_PASSWORD_MESSAGE));
+
+		assertThat(this.refreshTokenRepository.findAll())
+				.as("검증 실패는 컨트롤러 앞에서 끝난다 — 토큰을 지우지 않는다")
+				.hasSize(1);
+		this.mockMvc.perform(loginRequest("absent@example.com", RAW_PASSWORD))
+				.andExpect(status().isOk());
+	}
+
+	/**
+	 * <b>존재 메시지이고 정책 메시지가 아니다</b> (sp-docs/api-contract.md §2.2 v10).
+	 * {@code newPassword} 쪽과 메시지가 갈리는 것이 요점이다 — 정책 설명("8~20자의 영문,
+	 * 숫자, 특수문자 조합")을 돌려주면 사용자가 자기 비밀번호의 형식이 틀렸다고 읽는다.
+	 */
+	@Test
+	@DisplayName("currentPassword 누락과 newPassword 형식 오류의 메시지가 다르다")
+	void 두_필드의_메시지가_갈린다() throws Exception {
+		IssuedTokens 세션 = 계정과_세션을_만든다("messages@example.com");
+
+		this.mockMvc.perform(changePassword(세션.accessToken(),
+						"{\"newPassword\": \"" + NEW_PASSWORD + "\"}"))
+				.andExpect(jsonPath("$.error.fieldErrors[0].message").value(CURRENT_PASSWORD_MESSAGE));
+
+		this.mockMvc.perform(changePassword(세션.accessToken(), 변경_본문(RAW_PASSWORD, "short")))
+				.andExpect(jsonPath("$.error.fieldErrors[0].message").value(PASSWORD_MESSAGE));
+
+		assertThat(CURRENT_PASSWORD_MESSAGE).isNotEqualTo(PASSWORD_MESSAGE);
+	}
+
+	/**
+	 * <b>둘 다 틀리면 {@code C001} 이다</b> (sp-docs/api-contract.md §2.2 v10) — Bean Validation
+	 * 이 컨트롤러 앞에서 돌기 때문이고, 그 순서는 현재 비밀번호에 대해 아무것도 알려주지 않으므로
+	 * 그대로 둔다.
+	 */
+	@Test
+	@DisplayName("새 비밀번호 형식 오류와 현재 비밀번호 불일치가 동시면 400 C001 이다")
+	void 둘_다_틀리면_C001() throws Exception {
+		IssuedTokens 세션 = 계정과_세션을_만든다("both@example.com");
+
+		this.mockMvc.perform(changePassword(세션.accessToken(), 변경_본문("Other1!pw", "short")))
+				.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.error.code").value("C001"))
+				.andExpect(jsonPath("$.error.fieldErrors[0].field").value("newPassword"));
+	}
+
+	/**
+	 * <b>탈퇴한 계정의 토큰으로는 바꿀 수 없다 — 404 {@code AU001}</b>
+	 * (sp-docs/api-contract.md §2.2 v10). Access Token 이 탈퇴 후에도 만료까지 통과하므로
+	 * (sp-docs/security.md §5.3) 실제로 도달 가능한 경로다.
+	 *
+	 * <p><b>{@code updated_at} 까지 단언하는 것이 이 검사의 실질이다.</b> 권한 상승을 막는 것이
+	 * 아니라(탈퇴 계정은 새 세션을 만들 수 없다) 닫힌 행의 자격증명이 덮이는 것과 <b>탈퇴 시점의
+	 * 유일한 흔적이 지워지는 것</b>을 막는다 — {@code account} 에 {@code deleted_at} 컬럼이 없다.
+	 *
+	 * <p>AU-09 가 아직 없으므로 탈퇴는 엔티티로 직접 만든다. AU-09 이후에는
+	 * {@code DELETE /accounts/me} 가 같은 상태를 만든다 — <b>그쪽은 멱등이라 204 이고 여기만
+	 * 404 다.</b>
+	 */
+	@Test
+	@DisplayName("탈퇴한 계정의 토큰으로 변경하면 404 AU001 이고 password·updated_at 이 그대로다")
+	void 탈퇴한_계정() throws Exception {
+		IssuedTokens 세션 = 계정과_세션을_만든다("withdrawn@example.com");
+		Long id = 탈퇴시킨다("withdrawn@example.com");
+
+		// 탈퇴 자체가 updated_at 을 갱신하므로 탈퇴 "후"의 값을 기준으로 잡는다
+		String password = 컬럼(id, "password");
+		String updatedAt = 컬럼(id, "updated_at");
+
+		this.mockMvc.perform(changePassword(세션.accessToken(), 변경_본문(RAW_PASSWORD, NEW_PASSWORD)))
+				.andExpect(status().isNotFound())
+				.andExpect(jsonPath("$.success").value(false))
+				.andExpect(jsonPath("$.error.code").value("AU001"))
+				.andExpect(jsonPath("$.error.message").value("계정을 찾을 수 없습니다."));
+
+		assertThat(컬럼(id, "password"))
+				.as("닫힌 행의 자격증명이 덮이지 않는다")
+				.isEqualTo(password);
+		assertThat(컬럼(id, "updated_at"))
+				.as("탈퇴 시점의 유일한 흔적이 지워지지 않는다 (deleted_at 컬럼이 없다)")
+				.isEqualTo(updatedAt);
+	}
+
+	@ParameterizedTest(name = "newPassword = \"{0}\"")
+	@ValueSource(strings = {
+			"Pw1!abc",      // 7자
+			"Password1",    // 특수문자 없음
+			"password!",    // 숫자 없음
+			"비밀번호1234",   // 한글은 특수문자가 아니다 (§2.1)
+			"Passw0rd 1"    // 공백 금지 (§2.1)
+	})
+	@DisplayName("새 비밀번호 형식 오류는 400 C001 이고 fieldErrors 에 newPassword 가 담긴다")
+	void 새_비밀번호_검증(String newPassword) throws Exception {
+		IssuedTokens 세션 = 계정과_세션을_만든다("newpw@example.com");
+
+		String body = this.mockMvc
+				.perform(changePassword(세션.accessToken(), 변경_본문(RAW_PASSWORD, newPassword)))
+				.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.error.code").value("C001"))
+				.andExpect(jsonPath("$.error.fieldErrors[0].field").value("newPassword"))
+				.andExpect(jsonPath("$.error.fieldErrors[0].message").value(PASSWORD_MESSAGE))
+				.andReturn().getResponse().getContentAsString(StandardCharsets.UTF_8);
+
+		assertThat(body)
+				.as("rejectedValue 를 담지 않는다 (sp-docs/api-contract.md §7)")
+				.doesNotContain(newPassword)
+				.doesNotContain(RAW_PASSWORD);
+
+		assertThat(this.refreshTokenRepository.findAll())
+				.as("검증 실패는 컨트롤러 앞에서 끝난다 — 토큰을 지우지 않는다")
+				.hasSize(1);
+	}
+
+	/**
+	 * <b>새 비밀번호가 현재와 같아도 거부하지 않는다</b> (sp-docs/api-contract.md §2.2).
+	 * 비교에 BCrypt 가 한 번 더 들고, RefreshToken 은 어차피 삭제되어 세션이 끊긴다.
+	 */
+	@Test
+	@DisplayName("새 비밀번호가 현재와 같아도 204 다")
+	void 현재와_같은_새_비밀번호() throws Exception {
+		IssuedTokens 세션 = 계정과_세션을_만든다("same@example.com");
+
+		this.mockMvc.perform(changePassword(세션.accessToken(), 변경_본문(RAW_PASSWORD, RAW_PASSWORD)))
+				.andExpect(status().isNoContent());
+
+		assertThat(this.refreshTokenRepository.findAll()).isEmpty();
+		this.mockMvc.perform(loginRequest("same@example.com", RAW_PASSWORD))
+				.andExpect(status().isOk());
+	}
+
+	/**
+	 * <b>변경 전에 발급된 Access Token 이 만료까지 계속 통과한다</b>
+	 * (sp-docs/security.md §5.3). RefreshToken 을 지워 새 세션은 막지만 이미 발급된 Access
+	 * Token 에는 서버 상태가 없다 — "비밀번호를 바꿨으니 안전하다"는 <b>최대 31분 뒤부터 참</b>이다.
+	 *
+	 * <p>즉시 차단은 1차 범위 밖이고 탈퇴·권한 회수와 같은 포기 목록에 있다. <b>이 테스트가
+	 * 그 창을 문서화한다</b> — 나중에 블랙리스트를 넣으면 여기서 깨지고, 그때 정본이 함께 바뀐다.
+	 *
+	 * <p>보호 경로는 변경 엔드포인트 자신을 쓴다. 옛 토큰으로 한 번 더 바꿀 수 있다는 것이
+	 * 곧 "통과한다"다.
+	 */
+	@Test
+	@DisplayName("변경 후에도 기존 Access Token 으로 보호 경로를 통과한다")
+	void 변경_후_기존_Access_Token() throws Exception {
+		IssuedTokens 세션 = 계정과_세션을_만든다("window@example.com");
+
+		this.mockMvc.perform(changePassword(세션.accessToken(), 변경_본문(RAW_PASSWORD, NEW_PASSWORD)))
+				.andExpect(status().isNoContent());
+
+		this.mockMvc.perform(changePassword(세션.accessToken(), 변경_본문(NEW_PASSWORD, "Third1!pw")))
+				.andExpect(status().isNoContent());
+
+		this.mockMvc.perform(loginRequest("window@example.com", "Third1!pw"))
+				.andExpect(status().isOk());
+	}
+
+	/** 저장값이 삭제됐으므로 재발급은 실패한다 (sp-docs/security.md §5.3). */
+	@Test
+	@DisplayName("변경 후 기존 Refresh Token 으로 재발급하면 401 A002 다")
+	void 변경_후_기존_Refresh_Token() throws Exception {
+		IssuedTokens 세션 = 계정과_세션을_만든다("reissue@example.com");
+
+		this.mockMvc.perform(changePassword(세션.accessToken(), 변경_본문(RAW_PASSWORD, NEW_PASSWORD)))
+				.andExpect(status().isNoContent());
+
+		this.mockMvc.perform(post("/api/v1/auth/reissue")
+						.contentType(MediaType.APPLICATION_JSON)
+						.characterEncoding(StandardCharsets.UTF_8)
+						.content("{\"refreshToken\": \"" + 세션.refreshToken() + "\"}"))
+				.andExpect(status().isUnauthorized())
+				.andExpect(jsonPath("$.error.code").value("A002"));
+
+		assertThat(this.refreshTokenRepository.findAll())
+				.as("거부된 재발급이 행을 다시 만들지 않는다")
+				.isEmpty();
+	}
+
 	private ResultActions checkEmail(String email) throws Exception {
 		return this.mockMvc.perform(get("/api/v1/accounts/check-email").param("email", email));
+	}
+
+	/** 계정을 만들고 로그인한다. 둘 다 실제 엔드포인트를 지나므로 픽스처에 해시를 적지 않는다. */
+	private IssuedTokens 계정과_세션을_만든다(String email) throws Exception {
+		this.mockMvc.perform(createRequest(
+						"{\"email\": \"" + email + "\", \"password\": \"" + RAW_PASSWORD + "\"}"))
+				.andExpect(status().isCreated());
+
+		String body = this.mockMvc.perform(loginRequest(email, RAW_PASSWORD))
+				.andExpect(status().isOk())
+				.andReturn().getResponse().getContentAsString(StandardCharsets.UTF_8);
+
+		return new IssuedTokens(
+				JsonPath.read(body, "$.data.accessToken"),
+				JsonPath.read(body, "$.data.refreshToken"));
+	}
+
+	/** 로그인 응답에서 꺼낸 두 토큰. */
+	private record IssuedTokens(String accessToken, String refreshToken) { }
+
+	private static MockHttpServletRequestBuilder loginRequest(String email, String password) {
+		return post("/api/v1/auth/login")
+				.contentType(MediaType.APPLICATION_JSON)
+				.characterEncoding(StandardCharsets.UTF_8)
+				.content("{\"email\": \"" + email + "\", \"password\": \"" + password + "\"}");
+	}
+
+	private static MockHttpServletRequestBuilder changePassword(String accessToken, String json) {
+		return patch("/api/v1/accounts/me/password")
+				.header(HttpHeaders.AUTHORIZATION, "Bearer " + accessToken)
+				.contentType(MediaType.APPLICATION_JSON)
+				.characterEncoding(StandardCharsets.UTF_8)
+				.content(json);
+	}
+
+	private static String 변경_본문(String currentPassword, String newPassword) {
+		return "{\"currentPassword\": \"" + currentPassword + "\", "
+				+ "\"newPassword\": \"" + newPassword + "\"}";
+	}
+
+	/** 이미 있는 계정을 탈퇴 상태로 만든다. AU-09 가 없으므로 엔티티로 직접 바꾼다. */
+	private Long 탈퇴시킨다(String email) {
+		Account account = this.accountRepository.findByEmail(email).orElseThrow();
+		account.withdraw();
+		return this.accountRepository.saveAndFlush(account).getId();
+	}
+
+	/** 커밋된 행의 한 컬럼. JPA 를 거치지 않는다 — 영속성 컨텍스트가 아니라 DB 를 봐야 한다. */
+	private String 컬럼(Long accountId, String column) {
+		return this.jdbcTemplate.queryForObject(
+				"select " + column + " from account where id = ?", String.class, accountId);
 	}
 
 	private void 탈퇴한_계정을_만든다(String email) {

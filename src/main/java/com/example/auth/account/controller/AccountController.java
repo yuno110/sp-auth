@@ -3,8 +3,11 @@ package com.example.auth.account.controller;
 import com.example.auth.account.dto.AccountCreateRequest;
 import com.example.auth.account.dto.AccountResponse;
 import com.example.auth.account.dto.CheckResponse;
+import com.example.auth.account.dto.PasswordChangeRequest;
 import com.example.auth.account.service.AccountService;
 import com.example.auth.global.common.ApiResponse;
+import com.example.auth.global.security.CurrentAccount;
+import com.example.auth.global.security.LoginAccount;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.Email;
 import jakarta.validation.constraints.NotBlank;
@@ -12,6 +15,7 @@ import jakarta.validation.constraints.Size;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.HttpStatus;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -62,6 +66,29 @@ public class AccountController {
 			String email) {
 
 		return ApiResponse.success(this.accountService.checkEmail(email));
+	}
+
+	/**
+	 * MR-09 — 비밀번호 변경. <b>204, 본문 없음</b> (sp-docs/api-contract.md §2.2).
+	 *
+	 * <p><b>인증이 필요하다.</b> 바꿀 대상은 검증된 Access Token 의 {@code sub} 가 정한다 —
+	 * 본문의 식별자를 신뢰하지 않는다 (sp-docs/security.md §4). 경로 인가는 AU-04 의
+	 * {@code SecurityConfig} 가 {@code /api/v1/accounts/me/**} 로 선반영했다.
+	 *
+	 * <p>{@code @Valid} 가 보는 것은 {@code newPassword} 뿐이다 — {@code currentPassword} 에
+	 * 제약을 걸지 않는 이유는 {@link PasswordChangeRequest} 에 있다. {@code newPassword} 위반은
+	 * 400 {@code C001} 이고 {@code fieldErrors} 에 {@code newPassword} 가 담긴다
+	 * ({@code GlobalExceptionHandler}), 현재 비밀번호 불일치는 400 {@code AU004} 다
+	 * (sp-docs/api-contract.md §2.2 — <b>401 이 아니다.</b> 요청자는 이미 인증되어 있고 틀린 것은
+	 * 본문의 값이다).
+	 */
+	@PatchMapping("/me/password")
+	@ResponseStatus(HttpStatus.NO_CONTENT)
+	public void changePassword(
+			@CurrentAccount LoginAccount loginAccount,
+			@Valid @RequestBody PasswordChangeRequest request) {
+
+		this.accountService.changePassword(loginAccount.accountId(), request);
 	}
 
 }
