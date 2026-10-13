@@ -7,7 +7,8 @@ import org.springframework.context.annotation.Configuration;
 
 // Swagger UI 는 /swagger-ui.html 에 있다 (sp-docs/tech-stack.md §4.4, sp-docs/nfr.md).
 // /swagger-ui/** 와 /v3/api-docs/** 를 permitAll 로 여는 것은 AU-04 의 SecurityConfig 이고,
-// prod 프로파일에서 springdoc 자체를 끄는 것은 AU-11 이다 (sp-docs/security.md §5.1.1).
+// prod 프로파일에서는 springdoc 자체가 꺼져 경로가 사라진다 — application-prod.yml
+// (sp-docs/security.md §5.1.1).
 @Configuration
 public class SwaggerConfig {
 

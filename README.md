@@ -2,8 +2,6 @@
 
 계정과 인증을 담당하는 마이크로서비스. **JWT를 발급하는 유일한 주체다.**
 
-> 상태: **스캐폴딩 전** — 작업 항목 AU-01부터 시작한다.
-
 | 항목 | 값 |
 | --- | --- |
 | 포트 | 8083 |
@@ -72,37 +70,102 @@ AI 워커는 [`CLAUDE.md`](CLAUDE.md)를 먼저 읽는다.
 - JWT 처리는 Spring Security 표준(`NimbusJwtEncoder`)을 쓴다. 서명 로직을 직접 만들지 않는다
 - 시간대는 실행 환경이 정한다. 코드나 `build.gradle`에서 설정하지 않는다 (`sp-docs/adr/0011`)
 
-## 실행 (스캐폴딩 이후)
+## 로컬 실행
 
-**1차는 Docker를 사용하지 않는다.** MySQL은 로컬에 직접 설치한다.
+**1차는 Docker를 사용하지 않는다.** MySQL은 로컬에 직접 설치하고 `gradlew bootRun`으로 띄운다 (`sp-docs/tech-stack.md` §4).
+
+### 1. MySQL — 최초 1회
 
 ```sql
 CREATE DATABASE sp_auth DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
+SET PERSIST time_zone = '+09:00';
 ```
+
+시간대를 `SET PERSIST`로 두는 이유와 확인 쿼리는 `sp-docs/tech-stack.md` §4.1에 있다. 스키마는 Flyway가 만든다 — `src/main/resources/db/migration`이 유일한 출처이므로 테이블을 손으로 만들지 않는다.
+
+### 2. RSA 키 페어 — 최초 1회
+
+아래 "개인키 배치"를 먼저 끝낸다. **키가 없으면 기동이 실패한다.**
+
+### 3. ADMIN seed 해시 — 최초 1회
+
+`V3`가 ADMIN 계정을 넣을 때 쓸 BCrypt 해시를 만든다. 해시는 Flyway placeholder로 주입하며 저장소에 두지 않는다 (`sp-docs/requirements/member.md` §10.2).
+
+```bash
+./gradlew bcrypt -Ppassword=<로컬에서_쓸_관리자_비밀번호>
+```
+
+출력된 한 줄을 `application-local.yml`의 `adminPasswordHash`에 넣는다. **운영 해시는 이 값과 달라야 한다.**
+
+### 4. `application-local.yml` — 최초 1회
+
+로컬에서는 환경변수 대신 파일로 준다. 이 파일은 `.gitignore`에 있어 **평문으로 적어도 커밋되지 않는다** (`sp-docs/tech-stack.md` §4.3.1).
+
+```bash
+cp src/main/resources/application-local.yml.example src/main/resources/application-local.yml
+# 파일을 열어 MySQL 비밀번호 · adminPasswordHash · 개인키 경로를 채운다
+```
+
+### 5. 실행
 
 ```bash
 ./gradlew bootRun --args='--spring.profiles.active=local'
+./gradlew test    # 프로파일은 build.gradle 이 test 로 고정한다. 로컬 설정·실제 키를 쓰지 않는다
 ```
 
-| 환경변수 | 필수 | 설명 |
+- API 문서: http://localhost:8083/swagger-ui.html (**`prod` 프로파일에서는 404다**)
+- 헬스체크: http://localhost:8083/actuator/health — `/actuator`에서 노출되는 것은 이것뿐이다
+
+### 환경변수
+
+`local` 프로파일은 아래를 `application-local.yml`에서 읽는다. 배포 환경에서는 그 파일을 두지 않고 환경변수로 주입한다 (`sp-docs/tech-stack.md` §4.3).
+
+| 환경변수 | 기본값 | 설명 |
 | --- | --- | --- |
-| `JWT_PRIVATE_KEY_LOCATION` | O | 개인키 **경로** (`file:`·`classpath:`). **기본값 없음** — 없으면 기동 실패 |
-| `CORS_ALLOWED_ORIGINS` | O | 허용 오리진 목록. **기본값 없음.** 비었거나 `*`가 섞이면 기동 실패 |
-| `DB_URL` | | 기본값 `jdbc:mysql://localhost:3306/sp_auth` |
-| `DB_USERNAME` / `DB_PASSWORD` | O (비밀번호) | |
+| `DB_PASSWORD` | **없음** | MySQL 비밀번호. 없으면 `Access denied ... (using password: YES)`로 기동 실패 — 비밀번호가 틀린 것이 아니라 값이 없는 것이다 |
+| `JWT_PRIVATE_KEY_LOCATION` | **없음** | 개인키 **경로** (`file:`·`classpath:`). PEM 본문이 아니다 |
+| `ADMIN_PASSWORD_HASH` | **없음** | ADMIN seed의 BCrypt 해시. 없으면 마이그레이션 전에 기동이 실패한다 |
+| `CORS_ALLOWED_ORIGINS` | **없음** | 허용 오리진 목록(쉼표 구분). 비었거나 `*`가 섞이면 기동 실패 |
+| `DB_URL` | `jdbc:mysql://localhost:3306/sp_auth?serverTimezone=Asia/Seoul&characterEncoding=UTF-8` | |
+| `DB_USERNAME` | `root` | |
 
-로컬에서는 환경변수 대신 `src/main/resources/application-local.yml`에 넣는다 (`.gitignore` 대상). 절차는 `sp-docs/tech-stack.md` §4.3.1에 있다.
+**비밀값과 정책값에는 기본값을 두지 않는다.** 임의 기본값을 두면 그 값이 정해진 정책인지 임시값인지 구분할 수 없고 운영에 그대로 나간다. 없으면 기동이 실패하는 것이 의도된 동작이다.
 
-- API 문서: http://localhost:8083/swagger-ui.html
-- 헬스체크: http://localhost:8083/actuator/health
+시간대는 실행 환경이 정한다. 환경변수로 넘길 것은 없고, JVM이 KST가 아니어도 DB 경계는 고정된다 (`sp-docs/tech-stack.md` §6.2).
 
-## 키 배치
+## 개인키 배치
 
-RSA 키 페어 생성은 `sp-docs/tech-stack.md` §4.2에 있다.
+**이 저장소에 개인키를 두지 않는다.** `.gitignore`에 넣더라도 실수 한 번이면 이력에 남는다. 키 관리 규칙은 `sp-docs/security.md` §3이 정본이다.
+
+1. 키 페어를 만든다 (`sp-docs/tech-stack.md` §4.2). 생성 디렉터리는 저장소 밖이어야 한다
+
+   ```bash
+   openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out private.pem
+   openssl rsa -in private.pem -pubout -out public.pem
+   ```
+
+2. 개인키를 저장소 밖에 둔다. 현재 쓰는 위치는 `~/keys/sp/private.pem`이다
+
+   ```bash
+   mkdir -p ~/keys/sp && mv private.pem ~/keys/sp/
+   ```
+
+3. 경로를 `application-local.yml`에 적는다. **키 본문이 아니라 경로다**
+
+   ```yaml
+   jwt:
+     private-key-location: file:${user.home}/keys/sp/private.pem
+   ```
+
+4. 공개키를 `sp-member`·`sp-board`의 `src/main/resources/jwt-public.pem`에 복사한다. 공개키는 커밋해도 된다 — 유출돼도 토큰을 위조할 수 없다
+
+5. 기동해서 확인한다. 경로가 비었거나 파일이 없으면 `IllegalStateException`으로 **기동이 실패한다.** 조용히 넘어가지 않는 것이 의도다
 
 | 키 | 어디에 | 커밋 |
 | --- | --- | --- |
-| `private.pem` | **저장소 밖.** 현재 `~/keys/sp/private.pem`. `application-local.yml`로 경로를 준다 | **절대 금지** |
+| `private.pem` | **저장소 밖.** auth만 갖는다. 경로만 주입한다 | **절대 금지** |
 | `public.pem` | `sp-member`·`sp-board`의 `src/main/resources/jwt-public.pem` | 가능 |
 
-**공개키 배포 지점이 두 곳이다.** 두 사본이 같은 키인지는 통합 검증 I-01에서 확인한다.
+**운영 키는 개발 키와 분리한다.** 운영 개인키는 시크릿 저장소에서 파일로 마운트하고 그 경로를 준다.
+
+**공개키 배포 지점이 member·board 두 곳이다.** 두 사본이 같은 키인지는 통합 검증 I-01에서 확인한다. 키를 다시 만들면 기존 토큰이 전부 무효가 되어 재로그인이 필요하다.

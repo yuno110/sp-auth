@@ -9,12 +9,17 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import com.example.auth.global.common.ApiResponse;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.Email;
 import jakarta.validation.constraints.NotBlank;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
@@ -176,6 +181,88 @@ class GlobalExceptionHandlerTest {
 				.andExpect(status().isNotFound())
 				.andExpect(jsonPath("$.error.code").value("C004"))
 				.andExpect(jsonPath("$.error.message").value("요청한 리소스를 찾을 수 없습니다."));
+	}
+
+	/**
+	 * 본문이 있는데 {@code Content-Type} 이 없다 — {@code HttpMediaTypeNotSupportedException}.
+	 *
+	 * <p><b>클라이언트 오류이므로 415 다</b> (sp-docs/api-contract.md §8.1). 이 핸들러가 없으면
+	 * 마지막 그물에 걸려 <b>500 {@code C005}</b> 가 됐다 (실측).
+	 */
+	@Test
+	@DisplayName("본문이 있는데 Content-Type 이 없으면 415 C006 이다")
+	void content_type_없음은_C006() throws Exception {
+		mockMvc.perform(post("/test/valid")
+						.content("{\"email\": \"a@example.com\", \"password\": \"pw-1234\"}"))
+				.andExpect(status().isUnsupportedMediaType())
+				.andExpect(jsonPath("$.success").value(false))
+				.andExpect(jsonPath("$.data").doesNotExist())
+				.andExpect(jsonPath("$.error.code").value("C006"))
+				.andExpect(jsonPath("$.error.message").value("지원하지 않는 미디어 타입입니다."))
+				.andExpect(jsonPath("$.error.fieldErrors", hasSize(0)));
+	}
+
+	@Test
+	@DisplayName("JSON 이 아닌 Content-Type 도 415 C006 이다")
+	void json_이_아닌_content_type_은_C006() throws Exception {
+		mockMvc.perform(post("/test/valid")
+						.contentType(MediaType.TEXT_PLAIN)
+						.content("{\"email\": \"a@example.com\", \"password\": \"pw-1234\"}"))
+				.andExpect(status().isUnsupportedMediaType())
+				.andExpect(jsonPath("$.error.code").value("C006"))
+				.andExpect(jsonPath("$.error.message").value("지원하지 않는 미디어 타입입니다."));
+	}
+
+	/**
+	 * {@code Accept} 로 JSON 을 받을 수 없다 — {@code HttpMediaTypeNotAcceptableException}.
+	 *
+	 * <p><b>응답 본문은 JSON 으로 내보낸다.</b> 요청이 받아 주지 않는 형식이지만, 협상에 맡기면
+	 * 본문을 쓸 수 없어 이 핸들러의 응답 자체가 다시 실패한다. 공통 형식
+	 * (sp-docs/api-contract.md §7)으로 코드를 알려 주는 쪽이 빈 406 보다 쓸모 있다.
+	 */
+	@Test
+	@DisplayName("Accept 로 JSON 을 받을 수 없으면 406 C007 이다")
+	void 받을_수_없는_accept_는_C007() throws Exception {
+		mockMvc.perform(get("/test/success").accept(MediaType.APPLICATION_XML))
+				.andExpect(status().isNotAcceptable())
+				.andExpect(jsonPath("$.success").value(false))
+				.andExpect(jsonPath("$.error.code").value("C007"))
+				.andExpect(jsonPath("$.error.message").value("응답할 수 있는 형식이 없습니다."));
+	}
+
+	/**
+	 * <b>상태 코드보다 로그가 더 문제다</b> (sp-docs/api-contract.md §8.1). 마지막 그물은
+	 * {@code log.error} 로 스택트레이스를 남기므로, 미디어 타입 예외가 거기로 떨어지면 흔한
+	 * 클라이언트 실수가 ERROR 경보를 만들고 원인이 서버에 있는 500 과 구별되지 않는다.
+	 *
+	 * <p>상태 코드는 위 두 테스트가 본다. 여기서는 로그 수준만 본다.
+	 */
+	@Test
+	@DisplayName("미디어 타입 예외 둘은 ERROR 로그를 남기지 않는다")
+	void 미디어_타입_예외는_ERROR_로그를_남기지_않는다() throws Exception {
+		Logger handlerLogger = (Logger) LoggerFactory.getLogger(GlobalExceptionHandler.class);
+		ListAppender<ILoggingEvent> appender = new ListAppender<>();
+		appender.start();
+		Level original = handlerLogger.getLevel();
+		// 수집 결과가 주변 설정에 좌우되지 않게 수준을 이 테스트 안에서 정한다
+		handlerLogger.setLevel(Level.TRACE);
+		handlerLogger.addAppender(appender);
+		try {
+			mockMvc.perform(post("/test/valid").content("{}"));
+			mockMvc.perform(get("/test/success").accept(MediaType.APPLICATION_XML));
+		} finally {
+			handlerLogger.detachAppender(appender);
+			handlerLogger.setLevel(original);
+			appender.stop();
+		}
+
+		assertThat(appender.list)
+				.as("둘 다 핸들러에 걸려야 한다. 비어 있으면 로그 수집이 안 된 것이다")
+				.hasSize(2);
+		assertThat(appender.list)
+				.extracting(ILoggingEvent::getLevel)
+				.as("클라이언트 실수가 ERROR 경보를 만들면 안 된다")
+				.doesNotContain(Level.ERROR);
 	}
 
 	@RestController

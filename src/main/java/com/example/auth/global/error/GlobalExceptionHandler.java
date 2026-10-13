@@ -5,8 +5,11 @@ import com.example.auth.global.common.ErrorResponse;
 import java.util.List;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
+import org.springframework.web.HttpMediaTypeNotAcceptableException;
+import org.springframework.web.HttpMediaTypeNotSupportedException;
 import org.springframework.web.HttpRequestMethodNotSupportedException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.MissingServletRequestParameterException;
@@ -112,6 +115,41 @@ public class GlobalExceptionHandler {
 	public ResponseEntity<ApiResponse<Void>> handleNoResourceFound(NoResourceFoundException e) {
 		log.warn("no handler for: {}", e.getResourcePath());
 		return toResponse(ErrorCode.RESOURCE_NOT_FOUND);
+	}
+
+	/**
+	 * 요청 본문의 미디어 타입을 읽을 수 없다 — {@code Content-Type} 이 없거나 JSON 이 아니다.
+	 *
+	 * <p><b>클라이언트 오류이므로 415 다</b> (sp-docs/api-contract.md §8.1). 이 핸들러가 없으면
+	 * 마지막 그물에 걸려 <b>500 {@code C005}</b> 가 된다 (실측). 상태 코드보다 로그가 더
+	 * 문제다 — 마지막 그물은 {@code log.error} 로 스택트레이스를 남기므로 흔한 클라이언트
+	 * 실수가 ERROR 경보를 만들고, 원인이 서버에 있는 500 과 구별되지 않는다.
+	 */
+	@ExceptionHandler(HttpMediaTypeNotSupportedException.class)
+	public ResponseEntity<ApiResponse<Void>> handleHttpMediaTypeNotSupported(HttpMediaTypeNotSupportedException e) {
+		log.warn("unsupported media type: {}", e.getContentType());
+		return toResponse(ErrorCode.UNSUPPORTED_MEDIA_TYPE);
+	}
+
+	/**
+	 * {@code Accept} 로 JSON 을 받을 수 없다.
+	 *
+	 * <p><b>클라이언트 오류이므로 406 이다</b> (sp-docs/api-contract.md §8.1). 위와 같은 이유로
+	 * {@code log.error} 를 쓰지 않는다.
+	 *
+	 * <p><b>응답 본문의 {@code Content-Type} 을 JSON 으로 못박는다.</b> 그러지 않으면 이 응답
+	 * 자체가 같은 협상에 걸려 본문 없이 나간다 — 핸들러를 넣기 전의 실측이 그랬다(406, 빈 본문).
+	 * {@code Content-Type} 이 정해져 있으면 Spring 이 협상을 건너뛰므로 공통 형식
+	 * (sp-docs/api-contract.md §7)으로 코드를 알려 줄 수 있다.
+	 */
+	@ExceptionHandler(HttpMediaTypeNotAcceptableException.class)
+	public ResponseEntity<ApiResponse<Void>> handleHttpMediaTypeNotAcceptable(HttpMediaTypeNotAcceptableException e) {
+		log.warn("not acceptable: supported {}", e.getSupportedMediaTypes());
+		ErrorCode errorCode = ErrorCode.NOT_ACCEPTABLE;
+		ErrorResponse error = new ErrorResponse(errorCode.getCode(), errorCode.getMessage(), List.of());
+		return ResponseEntity.status(errorCode.getStatus())
+				.contentType(MediaType.APPLICATION_JSON)
+				.body(ApiResponse.failure(error));
 	}
 
 	/** 마지막 그물. 여기까지 온 것은 예상하지 못한 예외이므로 서버 로그에만 원인을 남긴다. */

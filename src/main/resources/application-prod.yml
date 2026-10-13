@@ -1,0 +1,38 @@
+# 운영 프로파일. application.yml 과 달라야 하는 것만 적는다.
+#
+# 비밀 값을 이 파일에 적지 않는다. DB 비밀번호·개인키 경로·ADMIN seed 해시·CORS 오리진은
+# application.yml 이 환경변수로 받고 기본값을 두지 않으므로, 없으면 기동이 실패한다
+# (sp-docs/tech-stack.md §4.3). 이 파일은 커밋되므로 값을 적으면 이력에 남는다.
+#
+# /actuator 는 application.yml 이 health 만 노출하도록 두었고 인가 차단은 SecurityConfig 가
+# 한다. 프로파일에 따라 달라지지 않으므로 여기서 다시 적지 않는다.
+
+spring:
+  jpa:
+    # SQL 로그는 로컬 프로파일에서만 켠다 (sp-docs/nfr.md §5)
+    show-sql: false
+    properties:
+      hibernate:
+        format_sql: false
+
+# API 문서는 운영에서 비활성화한다 (sp-docs/nfr.md §8, sp-docs/security.md §5.1.1).
+#
+# 둘을 함께 끈다 — swagger-ui 만 끄면 /v3/api-docs 가 스키마를 그대로 내보내므로
+# UI 없이 전체 엔드포인트 목록을 얻을 수 있다. SecurityConfig 는 두 경로를 permitAll 로
+# 두므로(경로별 인가는 프로파일을 모른다) 끄는 지점은 여기다.
+springdoc:
+  api-docs:
+    enabled: false
+  swagger-ui:
+    enabled: false
+
+# 바인드 파라미터 로그에는 비밀번호가 그대로 실린다 (sp-docs/nfr.md §5,
+# sp-docs/conventions.md §8). 루트 수준이 올라가도 (LOGGING_LEVEL_ROOT=DEBUG) 이 둘을 warn 에
+# 고정한다 — 평문이 샐 수 있는 순간이 그때다.
+#
+# application-local.yml 은 바인드 파라미터 로거를 trace 로 올리고, SQL 로그는 logging.level 이
+# 아니라 spring.jpa.show-sql 로 올린다
+logging:
+  level:
+    org.hibernate.SQL: warn
+    org.hibernate.orm.jdbc.bind: warn

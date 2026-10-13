@@ -58,7 +58,8 @@ public class SecurityConfig {
 
 				.authorizeHttpRequests(auth -> auth
 						// --- 인프라 경로 (sp-docs/security.md §5.1.1) ---
-						// prod 프로파일에서 springdoc 자체를 끄는 것은 AU-11 이다
+						// prod 프로파일에서는 springdoc 자체가 꺼져 경로가 사라진다 —
+						// application-prod.yml (sp-docs/security.md §5.1.1)
 						.requestMatchers("/swagger-ui.html", "/swagger-ui/**").permitAll()
 						.requestMatchers("/v3/api-docs", "/v3/api-docs/**").permitAll()
 						.requestMatchers("/actuator/health").permitAll()
