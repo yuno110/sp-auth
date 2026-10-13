@@ -75,7 +75,10 @@ public class Account extends BaseTimeEntity {
 		this.deleted = true;
 	}
 
-	/** 로그인·재발급이 검사한다 (sp-docs/requirements/member.md §3 규칙 5). */
+	/**
+	 * {@code deleted} 의 반대를 읽는다. <b>검사 여부와 결론은 기능별로 다르다</b>
+	 * (sp-docs/requirements/member.md §3 규칙 5).
+	 */
 	public boolean isActive() {
 		return !this.deleted;
 	}

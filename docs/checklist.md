@@ -43,7 +43,7 @@
 - [x] AU-07 토큰 재발급과 로그아웃 · 상태 done
 - [x] AU-08 비밀번호 변경 · 상태 done · 리뷰 2라운드
 - [x] AU-09 계정 탈퇴 · 상태 done
-- [ ] AU-10 내 계정 조회 · 상태 todo
+- [x] AU-10 내 계정 조회 · 상태 done
 - [ ] AU-11 마무리 · 상태 todo
 
 `AU-05`·`AU-08`·`AU-09`·`AU-10`이 `AccountService`·`AccountController`를 공유하고, `AU-06`·`AU-07`이 `AuthService`·`AuthController`를 공유한다. 저장소에 워커가 하나이므로 순차로 진행한다.

@@ -12,9 +12,11 @@ import com.example.auth.account.entity.Account;
 import com.example.auth.account.entity.Role;
 import com.example.auth.account.repository.AccountRepository;
 import com.example.auth.auth.repository.RefreshTokenRepository;
+import com.example.auth.global.security.JwtTokenProvider;
 import com.example.auth.support.TestRsaKeys;
 import com.jayway.jsonpath.JsonPath;
 import java.nio.charset.StandardCharsets;
+import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.AfterEach;
@@ -36,14 +38,16 @@ import org.springframework.test.web.servlet.ResultActions;
 import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder;
 
 /**
- * sp-docs/plan/phase1.md §4 AU-05·AU-08 의 "검증" 표 중 HTTP 쪽을 테스트로 옮긴 것이다.
- * 정본은 sp-docs/api-contract.md §2.2 §2.3 §9.1, 검증 규칙은
+ * sp-docs/plan/phase1.md §4 AU-05·AU-08·AU-09·AU-10 의 "검증" 표 중 HTTP 쪽을 테스트로 옮긴
+ * 것이다. 정본은 sp-docs/api-contract.md §2.2 §2.3 §9.1, 검증 규칙은
  * sp-docs/requirements/member.md §2 §2.1 이다.
  *
  * <p>인가 필터를 포함한 전 구간을 지난다 — {@code POST /api/v1/accounts} 와
- * {@code GET /accounts/check-email} 은 무인증이고
- * {@code PATCH /accounts/me/password} 는 인증이다 (sp-docs/security.md §5.1).
- * 토큰 없는 접근이 401 {@code A001} 인 것은 {@code SecurityConfigTest} 가 본다.
+ * {@code GET /accounts/check-email} 은 무인증이고 {@code /accounts/me*} 는 인증이다
+ * (sp-docs/api-contract.md §2.2 의 "인증" 열).
+ *
+ * <p><b>경로별 인가 행렬은 {@code SecurityConfigTest} 가 본다.</b> 여기서 토큰 없는 접근을
+ * 보는 것은 엔드포인트의 응답 본문까지 단언하는 경우뿐이다.
  */
 @SpringBootTest
 @AutoConfigureMockMvc
@@ -89,6 +93,13 @@ class AccountControllerTest {
 	/** AU-08 — 비밀번호 변경이 지우는 대상 (sp-docs/requirements/member.md §3 규칙 4). */
 	@Autowired
 	private RefreshTokenRepository refreshTokenRepository;
+
+	/**
+	 * AU-10 — {@code sub} 가 가리키는 행이 없는 토큰을 만들기 위해서다. 발급은 계정 행을 보지
+	 * 않으므로 로그인으로는 그 상태를 만들 수 없다.
+	 */
+	@Autowired
+	private JwtTokenProvider jwtTokenProvider;
 
 	@Autowired
 	private JdbcTemplate jdbcTemplate;
@@ -532,7 +543,9 @@ class AccountControllerTest {
 	 * 유일한 흔적이 지워지는 것</b>을 막는다 — {@code account} 에 {@code deleted_at} 컬럼이 없다.
 	 *
 	 * <p>탈퇴는 엔티티로 직접 만든다 — {@code DELETE /accounts/me} 로 만들지 않는 이유는
-	 * {@link #탈퇴시킨다(String)} 에 적었다. <b>그쪽은 멱등이라 204 이고 여기만 404 다.</b>
+	 * {@link #탈퇴시킨다(String)} 에 적었다. <b>탈퇴한 계정에 대한 결론은 엔드포인트마다
+	 * 다르다</b> — 그쪽은 멱등이라 204 다. 어느 엔드포인트가 무엇으로 끝나는지는
+	 * sp-docs/api-contract.md §2.2 의 표가 정한다.
 	 */
 	@Test
 	@DisplayName("탈퇴한 계정의 토큰으로 변경하면 404 AU001 이고 password·updated_at 이 그대로다")
@@ -835,6 +848,189 @@ class AccountControllerTest {
 		assertThat(컬럼(id, "updated_at")).isEqualTo(updatedAt);
 	}
 
+	// --- AU-10 내 계정 조회 (sp-docs/plan/phase1.md §4 AU-10) ---
+
+	/**
+	 * MR-07 이 두 서비스로 갈라진 절반이다 (sp-docs/requirements/member.md §5). 닉네임 쪽은
+	 * member 의 {@code GET /api/v1/members/me} 이고, 둘 다 필요한 화면은 클라이언트가 두 번
+	 * 호출한다.
+	 */
+	@Test
+	@DisplayName("내 계정 조회는 200 과 {email, createdAt} 을 반환한다")
+	void 내_계정_조회() throws Exception {
+		IssuedTokens 세션 = 계정과_세션을_만든다("me@example.com");
+		LocalDateTime 가입일 =
+				this.accountRepository.findByEmail("me@example.com").orElseThrow().getCreatedAt();
+
+		String body = this.mockMvc.perform(getMe(세션.accessToken()))
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.success").value(true))
+				.andExpect(jsonPath("$.error").isEmpty())
+				.andExpect(jsonPath("$.data.email").value("me@example.com"))
+				.andExpect(jsonPath("$.data.createdAt").exists())
+				.andReturn().getResponse().getContentAsString(StandardCharsets.UTF_8);
+
+		String createdAt = JsonPath.read(body, "$.data.createdAt");
+		assertThat(LocalDateTime.parse(createdAt))
+				.as("가입일은 account.created_at 이다 (sp-docs/api-contract.md §2.2)")
+				.isEqualTo(가입일);
+	}
+
+	/**
+	 * <b>키 집합 자체를 고정한다.</b> {@code password}·{@code nickname} 이 없다는 단언만으로는
+	 * 부족하다 — 다른 필드를 더해도 통과하기 때문이다. {@code accountId} 도 넣지 않는다
+	 * (sp-docs/api-contract.md §2.2).
+	 *
+	 * <p>필드가 늘면 여기서 깨지고, 그때 정본이 함께 바뀐다. <b>더하는 것은 호환되고 빼는 것은
+	 * 아니므로</b> 늘릴 요구가 생기면 정본을 먼저 고친다.
+	 */
+	@Test
+	@DisplayName("응답 data 의 키 집합이 email·createdAt 으로 고정된다")
+	void 조회_응답_키_집합() throws Exception {
+		IssuedTokens 세션 = 계정과_세션을_만든다("keys@example.com");
+
+		String body = this.mockMvc.perform(getMe(세션.accessToken()))
+				.andExpect(status().isOk())
+				.andReturn().getResponse().getContentAsString(StandardCharsets.UTF_8);
+
+		Map<String, Object> data = JsonPath.read(body, "$.data");
+		assertThat(data)
+				.as("accountId 도 없다 (sp-docs/api-contract.md §2.2)")
+				.containsOnlyKeys("email", "createdAt");
+	}
+
+	/** 평문도 해시도 어떤 응답에 넣지 않는다 (sp-docs/requirements/member.md §3 규칙 2). */
+	@Test
+	@DisplayName("조회 응답에 password·nickname 키가 없고 해시도 실리지 않는다")
+	void 조회_응답_본문() throws Exception {
+		IssuedTokens 세션 = 계정과_세션을_만든다("body-me@example.com");
+		Long id = this.accountRepository.findByEmail("body-me@example.com").orElseThrow().getId();
+		String 저장된_해시 = 컬럼(id, "password");
+
+		String body = this.mockMvc.perform(getMe(세션.accessToken()))
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.data.password").doesNotExist())
+				.andExpect(jsonPath("$.data.nickname").doesNotExist())
+				.andReturn().getResponse().getContentAsString(StandardCharsets.UTF_8);
+
+		assertThat(body)
+				.doesNotContain(RAW_PASSWORD)
+				.doesNotContain(저장된_해시)
+				.doesNotContain("password")
+				.doesNotContain("nickname");
+	}
+
+	/**
+	 * 토큰 없는 접근은 401 {@code A001} 이다. 경로별 인가 행렬은 {@code SecurityConfigTest} 가
+	 * 보고, 여기서는 <b>이 엔드포인트가 인증 없이 계정 데이터를 내보내지 않는지</b>를 본다 —
+	 * 둘은 깨지는 이유가 다르다.
+	 */
+	@Test
+	@DisplayName("토큰 없이 조회하면 401 A001 이고 본문에 계정 데이터가 없다")
+	void 토큰_없이_조회() throws Exception {
+		계정과_세션을_만든다("noauth@example.com");
+
+		String body = this.mockMvc.perform(get("/api/v1/accounts/me"))
+				.andExpect(status().isUnauthorized())
+				.andExpect(jsonPath("$.success").value(false))
+				.andExpect(jsonPath("$.data").isEmpty())
+				.andExpect(jsonPath("$.error.code").value("A001"))
+				.andReturn().getResponse().getContentAsString(StandardCharsets.UTF_8);
+
+		assertThat(body).doesNotContain("noauth@example.com");
+	}
+
+	/**
+	 * 조회 대상은 검증된 토큰의 {@code sub} 가 정한다 (sp-docs/security.md §4). 파라미터·본문의
+	 * 식별자를 읽는 지점이 없으므로 타인의 {@code accountId} 는 무시된다.
+	 *
+	 * <p>남의 계정으로 seed 행을 쓴다 — 실재하는 다른 행이어야 "무시됐다"가 반증 가능해진다.
+	 * 파라미터를 신뢰하면 그 계정의 이메일이 돌아온다.
+	 */
+	@Test
+	@DisplayName("타인의 accountId 를 파라미터·본문으로 보내도 자기 정보만 반환한다")
+	void 타인의_accountId_는_무시된다() throws Exception {
+		IssuedTokens 세션 = 계정과_세션을_만든다("mine@example.com");
+		Long 남의_id = this.accountRepository.findByEmail(ADMIN_EMAIL).orElseThrow().getId();
+
+		this.mockMvc.perform(get("/api/v1/accounts/me")
+						.header(HttpHeaders.AUTHORIZATION, "Bearer " + 세션.accessToken())
+						.param("accountId", String.valueOf(남의_id))
+						.contentType(MediaType.APPLICATION_JSON)
+						.characterEncoding(StandardCharsets.UTF_8)
+						.content("{\"accountId\": " + 남의_id
+								+ ", \"email\": \"" + ADMIN_EMAIL + "\"}"))
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.data.email").value("mine@example.com"));
+	}
+
+	/**
+	 * <b>탈퇴한 계정은 API 관점에서 없는 계정이다</b> (sp-docs/api-contract.md §2.2 의 표).
+	 * Access Token 은 탈퇴 후에도 만료까지 통과하므로(sp-docs/security.md §5.3) 도달 가능한
+	 * 경로다. {@code DELETE /accounts/me} 만 그 경우에 204 이고(멱등이 요구사항이다) 조회는
+	 * 404 다.
+	 *
+	 * <p>탈퇴는 엔티티로 직접 만든다 — 이유는 {@link #탈퇴시킨다(String)} 에 적었다.
+	 */
+	@Test
+	@DisplayName("탈퇴한 계정의 토큰으로 조회하면 404 AU001 이다")
+	void 탈퇴한_계정의_토큰으로_조회() throws Exception {
+		IssuedTokens 세션 = 계정과_세션을_만든다("gone@example.com");
+		탈퇴시킨다("gone@example.com");
+
+		String body = this.mockMvc.perform(getMe(세션.accessToken()))
+				.andExpect(status().isNotFound())
+				.andExpect(jsonPath("$.success").value(false))
+				.andExpect(jsonPath("$.error.code").value("AU001"))
+				.andExpect(jsonPath("$.error.message").value("계정을 찾을 수 없습니다."))
+				.andReturn().getResponse().getContentAsString(StandardCharsets.UTF_8);
+
+		assertThat(body)
+				.as("거부된 조회는 계정 데이터를 내보내지 않는다")
+				.doesNotContain("gone@example.com");
+	}
+
+	/**
+	 * {@code sub} 가 가리키는 행이 없을 때도 404 {@code AU001} 이다 — <b>탈퇴와 같은 코드다</b>
+	 * (sp-docs/api-contract.md §2.2 의 표). 서명·만료는 유효하므로 요청이 컨트롤러에 닿는다.
+	 *
+	 * <p>토큰은 실제 발급 경로로 만든다 (sp-docs/conventions.md §9.2). 그 경로는 계정 행을 보지
+	 * 않으므로 없는 {@code sub} 로도 서명할 수 있고, 만료 폭을 픽스처에 적을 필요가 없다.
+	 */
+	@Test
+	@DisplayName("sub 가 가리키는 행이 없으면 404 AU001 이다")
+	void 행이_없는_sub로_조회() throws Exception {
+		String accessToken = this.jwtTokenProvider.issue(999_999L, Role.USER).accessToken();
+
+		this.mockMvc.perform(getMe(accessToken))
+				.andExpect(status().isNotFound())
+				.andExpect(jsonPath("$.error.code").value("AU001"));
+	}
+
+	/**
+	 * <b>오프셋을 표기하지 않는다</b> (sp-docs/api-contract.md §2.2, sp-docs/tech-stack.md §6).
+	 * 타입을 {@code OffsetDateTime} 으로 바꾸거나 오프셋을 포함한 포맷을 지정하면 끝에 표기가
+	 * 붙어 여기서 잡힌다.
+	 *
+	 * <p><b>초 미만 자리는 실행 환경이 정한다.</b> MySQL {@code DATETIME} 은 초 단위이고
+	 * (sp-docs/domain-model.md §1.1) 테스트의 H2 는 소수부를 보존한다. 정본이 고정한 것은
+	 * 오프셋 미표기이므로 소수부는 선택으로 둔다.
+	 */
+	@Test
+	@DisplayName("createdAt 에 오프셋 표기가 없다")
+	void createdAt_형식() throws Exception {
+		IssuedTokens 세션 = 계정과_세션을_만든다("iso@example.com");
+
+		String body = this.mockMvc.perform(getMe(세션.accessToken()))
+				.andExpect(status().isOk())
+				.andReturn().getResponse().getContentAsString(StandardCharsets.UTF_8);
+
+		String createdAt = JsonPath.read(body, "$.data.createdAt");
+		assertThat(createdAt)
+				.as("Z 도 +09:00 도 붙지 않는다 (sp-docs/tech-stack.md §6)")
+				.matches("\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?");
+	}
+
 	private ResultActions checkEmail(String email) throws Exception {
 		return this.mockMvc.perform(get("/api/v1/accounts/check-email").param("email", email));
 	}
@@ -862,6 +1058,12 @@ class AccountControllerTest {
 				.contentType(MediaType.APPLICATION_JSON)
 				.characterEncoding(StandardCharsets.UTF_8)
 				.content("{\"email\": \"" + email + "\", \"password\": \"" + password + "\"}");
+	}
+
+	/** 내 계정 조회 요청. 본문도 파라미터도 없다 — 대상은 토큰의 {@code sub} 가 정한다. */
+	private static MockHttpServletRequestBuilder getMe(String accessToken) {
+		return get("/api/v1/accounts/me")
+				.header(HttpHeaders.AUTHORIZATION, "Bearer " + accessToken);
 	}
 
 	private static MockHttpServletRequestBuilder changePassword(String accessToken, String json) {
@@ -902,10 +1104,10 @@ class AccountControllerTest {
 
 	/**
 	 * 이미 있는 계정을 탈퇴 상태로 엔티티로 직접 바꾼다. <b>{@code DELETE /accounts/me} 로
-	 * 바꾸지 않는 것이 의도다</b> — 유일한 사용처인 {@link #탈퇴한_계정()} 은 AU-08 의 검사이고,
-	 * 그 선행 상태를 AU-09 의 엔드포인트로 만들면 AU-08 의 회귀 테스트가 AU-09 의 동작에
-	 * 의존하게 된다. 그쪽은 같은 트랜잭션에서 Refresh Token 행까지 지우므로 "탈퇴했는데 토큰
-	 * 행이 남아 있는" 상태를 만들 수도 없다 — 그 상태를 요구하는 쪽은
+	 * 바꾸지 않는 것이 의도다</b> — 이 헬퍼를 쓰는 쪽은 탈퇴를 <b>선행 상태로만</b> 전제하고
+	 * 탈퇴 자체를 검사하지 않는다. 선행 상태를 {@code DELETE /accounts/me} 로 만들면 그 테스트가
+	 * 탈퇴 엔드포인트의 동작에 의존하게 된다. 그쪽은 같은 트랜잭션에서 Refresh Token 행까지
+	 * 지우므로 "탈퇴했는데 토큰 행이 남아 있는" 상태를 만들 수도 없다 — 그 상태를 요구하는 쪽은
 	 * {@code AccountServiceTest} 의 같은 헬퍼다.
 	 */
 	private Long 탈퇴시킨다(String email) {

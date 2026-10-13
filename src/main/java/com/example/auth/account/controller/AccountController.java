@@ -1,6 +1,7 @@
 package com.example.auth.account.controller;
 
 import com.example.auth.account.dto.AccountCreateRequest;
+import com.example.auth.account.dto.AccountMeResponse;
 import com.example.auth.account.dto.AccountResponse;
 import com.example.auth.account.dto.CheckResponse;
 import com.example.auth.account.dto.PasswordChangeRequest;
@@ -68,6 +69,25 @@ public class AccountController {
 			String email) {
 
 		return ApiResponse.success(this.accountService.checkEmail(email));
+	}
+
+	/**
+	 * MR-07 — 내 계정 조회. 200 과 {@code {email, createdAt}} (sp-docs/api-contract.md §2.2).
+	 *
+	 * <p><b>인증이 필요하다.</b> 조회 대상은 검증된 Access Token 의 {@code sub} 가 정한다 —
+	 * 파라미터·본문의 식별자를 신뢰하지 않으므로 타인의 {@code accountId} 를 실어 보내도
+	 * 무시된다 (sp-docs/security.md §4). 경로 인가는 AU-04 의 {@code SecurityConfig} 가
+	 * {@code /api/v1/accounts/me} 로 선반영했고, 토큰 없는 접근은 401 {@code A001} 이다.
+	 *
+	 * <p><b>탈퇴한 계정의 토큰으로 오면 404 {@code AU001} 이다</b> — Access Token 은 탈퇴 후에도
+	 * 만료까지 통과한다 (sp-docs/security.md §5.3). {@code DELETE /accounts/me} 만 그 경우에 204
+	 * 이고(멱등이 요구사항이다), 조회·변경은 404 다 (sp-docs/api-contract.md §2.2 의 표).
+	 *
+	 * <p>응답 형태는 {@link AccountMeResponse} 가 고정한다.
+	 */
+	@GetMapping("/me")
+	public ApiResponse<AccountMeResponse> me(@CurrentAccount LoginAccount loginAccount) {
+		return ApiResponse.success(this.accountService.getMe(loginAccount.accountId()));
 	}
 
 	/**

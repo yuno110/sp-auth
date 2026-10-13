@@ -13,8 +13,9 @@ import org.springframework.stereotype.Component;
  * <p>{@code AU001}(404, 계정을 찾을 수 없습니다) 은 sp-docs/api-contract.md §8.4 가 정본이다.
  *
  * <p><b>탈퇴 여부는 보지 않는다.</b> 탈퇴한 계정도 행은 존재하므로 조회는 성공한다.
- * {@code deleted} 검사는 기능별로 다르다 — 로그인·재발급은 거부하고(§3 규칙 5), 계정 탈퇴는
- * 이미 탈퇴한 계정에도 204 를 돌려주는 멱등 연산이다(sp-docs/api-contract.md §2.2).
+ * {@code deleted} 검사는 기능별로 한다 — 로그인·재발급은 거부하고, 계정 탈퇴는 이미 탈퇴한
+ * 계정에도 204 를 돌려주는 멱등 연산이다 (sp-docs/requirements/member.md §3 규칙 5. 엔드포인트별
+ * 결론은 거기서 가리키는 sp-docs/api-contract.md §2.2 의 표가 정한다).
  * 여기서 일괄 거부하면 그 차이가 사라진다.
  */
 @Component

@@ -1,6 +1,7 @@
 package com.example.auth.account.service;
 
 import com.example.auth.account.dto.AccountCreateRequest;
+import com.example.auth.account.dto.AccountMeResponse;
 import com.example.auth.account.dto.AccountResponse;
 import com.example.auth.account.dto.CheckResponse;
 import com.example.auth.account.dto.PasswordChangeRequest;
@@ -90,6 +91,40 @@ public class AccountService {
 	@Transactional(readOnly = true)
 	public CheckResponse checkEmail(String email) {
 		return new CheckResponse(!this.accountRepository.existsByEmail(email));
+	}
+
+	/**
+	 * MR-07 — 내 계정 조회 (sp-docs/api-contract.md §2.2, sp-docs/requirements/member.md §5).
+	 *
+	 * <p><b>MR-07 이 두 서비스로 갈라진 절반이다.</b> 나머지 절반(닉네임)은 member 의
+	 * {@code GET /api/v1/members/me} 이고, 화면 하나에 둘 다 필요하면 클라이언트가 두 번
+	 * 호출한다 — auth 는 다른 서비스를 호출하지 않는다 (sp-docs/architecture.md §5).
+	 *
+	 * <p><b>탈퇴한 계정은 404 {@code AU001} 로 거부한다</b> (sp-docs/api-contract.md §2.2) —
+	 * 탈퇴한 계정은 API 관점에서 없는 계정이다. Access Token 이 탈퇴 후에도 만료까지 통과하므로
+	 * (sp-docs/security.md §5.3) 실제로 도달 가능한 경로다. {@code sub} 가 가리키는 행이 아예
+	 * 없을 때도 같은 코드이고, 그쪽은 {@link AccountReader} 가 끝낸다.
+	 *
+	 * <p><b>이 검사를 {@code AccountReader} 에 두지 않는다.</b> 거기서 일괄 거부하면
+	 * {@code DELETE /accounts/me} 의 멱등성이 깨진다 — 그쪽은 이미 탈퇴한 계정에도 204 다.
+	 * 검사는 기능별로 한다 (sp-docs/requirements/member.md §3 규칙 5). {@link #changePassword}
+	 * 와 {@link #withdraw} 가 각자 검사하는 것과 같은 이유이고, <b>세 곳의 중복이 의도다</b> —
+	 * 결론이 엔드포인트마다 다르기 때문이다 (sp-docs/api-contract.md §2.2 의 표).
+	 *
+	 * @param accountId 검증된 Access Token 의 {@code sub}. 요청의 식별자를 쓰지 않는다
+	 *         (sp-docs/security.md §4)
+	 */
+	@Transactional(readOnly = true)
+	public AccountMeResponse getMe(Long accountId) {
+		Account account = this.accountReader.getById(accountId);
+
+		// 탈퇴한 계정은 없는 계정과 같이 다룬다 (sp-docs/api-contract.md §2.2).
+		// AccountReader 는 행의 존재만 보므로 거부는 여기에 있어야 한다
+		if (!account.isActive()) {
+			throw new BusinessException(ErrorCode.ACCOUNT_NOT_FOUND);
+		}
+
+		return AccountMeResponse.from(account);
 	}
 
 	/**
