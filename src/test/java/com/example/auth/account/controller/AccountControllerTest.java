@@ -1012,9 +1012,10 @@ class AccountControllerTest {
 	 * 타입을 {@code OffsetDateTime} 으로 바꾸거나 오프셋을 포함한 포맷을 지정하면 끝에 표기가
 	 * 붙어 여기서 잡힌다.
 	 *
-	 * <p><b>초 미만 자리는 실행 환경이 정한다.</b> MySQL {@code DATETIME} 은 초 단위이고
-	 * (sp-docs/domain-model.md §1.1) 테스트의 H2 는 소수부를 보존한다. 정본이 고정한 것은
-	 * 오프셋 미표기이므로 소수부는 선택으로 둔다.
+	 * <p><b>소수부는 선택으로 둔다.</b> 감사가 만든 값에는 소수부가 없지만({@code D-11} 이
+	 * 초로 잘랐다, sp-docs/api-contract.md §4.3) <b>SQL 로 심은 행에는 남을 수 있다</b> —
+	 * auth 의 ADMIN seed 가 {@code NOW()} 로 들어가고 그 행은 감사를 거치지 않는다.
+	 * 정본이 고정한 것은 오프셋 미표기뿐이다.
 	 */
 	@Test
 	@DisplayName("createdAt 에 오프셋 표기가 없다")
