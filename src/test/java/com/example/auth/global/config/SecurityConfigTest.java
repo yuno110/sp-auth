@@ -217,11 +217,11 @@ class SecurityConfigTest {
 				.andExpect(jsonPath("$.nickname").doesNotExist());
 	}
 
-	// --- CORS (sp-docs/security.md §1) ---
+	// --- CORS (sp-docs/security.md §1.1) ---
 
 	@Test
-	@DisplayName("CORS 설정에 * 가 없다")
-	void cors_에_와일드카드가_없다() {
+	@DisplayName("CORS 의 메서드·헤더·allowCredentials 가 정본 값이고 * 가 없다")
+	void cors_설정값이_정본과_일치한다() {
 		assertThat(this.corsConfigurationSource).isInstanceOf(UrlBasedCorsConfigurationSource.class);
 		CorsConfiguration configuration =
 				((UrlBasedCorsConfigurationSource) this.corsConfigurationSource)
@@ -230,8 +230,13 @@ class SecurityConfigTest {
 		assertThat(configuration).isNotNull();
 		assertThat(configuration.getAllowedOrigins()).isNotEmpty().doesNotContain("*");
 		assertThat(configuration.getAllowedOriginPatterns()).isNullOrEmpty();
-		assertThat(configuration.getAllowedMethods()).doesNotContain("*");
-		assertThat(configuration.getAllowedHeaders()).doesNotContain("*");
+		assertThat(configuration.getAllowedMethods())
+				.containsExactlyInAnyOrder("GET", "POST", "PATCH", "DELETE");
+		assertThat(configuration.getAllowedHeaders())
+				.containsExactlyInAnyOrder("Authorization", "Content-Type");
+		assertThat(configuration.getAllowCredentials())
+				.as("토큰을 Authorization 헤더로 보내므로 쿠키를 허용할 이유가 없다")
+				.isFalse();
 	}
 
 	@Test
