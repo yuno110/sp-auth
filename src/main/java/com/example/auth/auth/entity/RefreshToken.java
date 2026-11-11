@@ -25,9 +25,13 @@ import lombok.NoArgsConstructor;
  * {@code RefreshTokenRepository.rotate(...)} 가 처리한다. 읽고 나서 쓰는 방식은 탈퇴와
  * 겹칠 때 삭제된 행을 되살린다 (sp-docs/requirements/member.md §6).
  *
- * <p><b>로그인의 재발급은 다르다.</b> 저장된 행에 권한을 걸지 않으므로("0행이면 실패"가 성립할
+ * <p><b>로그인의 재발급은 다르다.</b> 저장된 행에 권한을 걸지 않으므로("0행이면 회전 실패"가 성립할
  * 대상이 없다) 찾아서 {@link #renew(String, LocalDateTime)} 로 갱신한다. 지우고 다시 넣으면
  * 로그인마다 {@code id} 가 올라간다 (sp-docs/plan/phase1.md §4 AU-06).
+ *
+ * <p><b>행 하나가 세션 하나다</b> (sp-docs/domain-model.md §2.2). 로그아웃은 제시된 토큰이 이 행의
+ * {@code token} 이나 {@code previousToken} 과 같을 때만 이 행을 지운다
+ * ({@code RefreshTokenRepository.deleteSession(...)}, sp-docs/requirements/member.md §6.4).
  */
 @Getter
 @Entity
@@ -56,6 +60,24 @@ public class RefreshToken {
 	@Column(name = "expires_at", nullable = false)
 	private LocalDateTime expiresAt;
 
+	/**
+	 * 직전 토큰 — 마지막 회전에서 제시된 토큰. 재사용 유예와 로그아웃의 대조에 쓴다
+	 * (sp-docs/domain-model.md §2.2, sp-docs/requirements/member.md §6.3·§6.4). 폭과 문자셋은
+	 * {@link #token} 과 같다({@code V5__add_refresh_token_previous.sql}).
+	 *
+	 * <p>회전이 쓰고({@code RefreshTokenRepository.rotate(...)}) 로그인이 비운다({@link #renew}).
+	 */
+	@Column(name = "previous_token", length = 1024)
+	private String previousToken;
+
+	/**
+	 * 마지막 회전 시각. 컬럼은 {@code DATETIME(6)} 이고 앱 시계의 값을 마이크로초로 잘라 넣는다.
+	 * 유예의 시작이지 만료가 아니다 (sp-docs/domain-model.md §2.2, sp-docs/requirements/member.md
+	 * §6.0). 로그인이 비운다.
+	 */
+	@Column(name = "rotated_at")
+	private LocalDateTime rotatedAt;
+
 	@Builder
 	private RefreshToken(Long accountId, String token, LocalDateTime expiresAt) {
 		this.accountId = accountId;
@@ -71,11 +93,17 @@ public class RefreshToken {
 	 * 조건부 UPDATE({@code RefreshTokenRepository.rotate(...)})여야 한다 — 이 메서드로 하면
 	 * 탈퇴와 겹칠 때 지운 행이 되살아난다 (sp-docs/requirements/member.md §6).
 	 *
+	 * <p><b>직전 토큰과 회전 시각을 비운다.</b> 로그인은 새 세션이므로 옛 세션의 토큰이 유예로 새
+	 * 세션을 얻거나 로그아웃으로 새 세션의 행을 지우지 못하게 한다
+	 * (sp-docs/requirements/member.md §6.3·§6.4).
+	 *
 	 * <p>{@code accountId} 는 바꾸지 않는다. 그것이 바뀌면 다른 계정의 행이다.
 	 */
 	public void renew(String token, LocalDateTime expiresAt) {
 		this.token = token;
 		this.expiresAt = expiresAt;
+		this.previousToken = null;
+		this.rotatedAt = null;
 	}
 
 	@Override

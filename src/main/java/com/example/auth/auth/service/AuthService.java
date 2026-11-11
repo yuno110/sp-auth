@@ -3,6 +3,7 @@ package com.example.auth.auth.service;
 import com.example.auth.account.entity.Account;
 import com.example.auth.account.repository.AccountRepository;
 import com.example.auth.auth.dto.LoginRequest;
+import com.example.auth.auth.dto.LogoutRequest;
 import com.example.auth.auth.dto.ReissueRequest;
 import com.example.auth.auth.dto.TokenResponse;
 import com.example.auth.auth.entity.RefreshToken;
@@ -10,7 +11,10 @@ import com.example.auth.auth.repository.RefreshTokenRepository;
 import com.example.auth.global.error.BusinessException;
 import com.example.auth.global.error.ErrorCode;
 import com.example.auth.global.security.JwtTokenProvider;
+import java.time.Clock;
+import java.time.Duration;
 import java.time.LocalDateTime;
+import java.time.temporal.ChronoUnit;
 import java.util.UUID;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
@@ -29,6 +33,12 @@ import org.springframework.util.StringUtils;
  */
 @Service
 public class AuthService {
+
+	/**
+	 * 직전 Refresh Token 의 재사용 유예. 회전 시각부터 10초다 (sp-docs/requirements/member.md §6.3,
+	 * sp-docs/api-contract.md §2.1).
+	 */
+	static final Duration REUSE_GRACE = Duration.ofSeconds(10);
 
 	private final AccountRepository accountRepository;
 	private final RefreshTokenRepository refreshTokenRepository;
@@ -49,16 +59,24 @@ public class AuthService {
 	 */
 	private final String dummyPasswordHash;
 
+	/**
+	 * 앱 시계. 회전 시각과 유예의 판정 시각이 이 시계 하나에서 나온다
+	 * (sp-docs/domain-model.md §2.2). DB 의 {@code NOW()} 를 쓰지 않는다.
+	 */
+	private final Clock clock;
+
 	public AuthService(
 			AccountRepository accountRepository,
 			RefreshTokenRepository refreshTokenRepository,
 			PasswordEncoder passwordEncoder,
-			JwtTokenProvider jwtTokenProvider) {
+			JwtTokenProvider jwtTokenProvider,
+			Clock clock) {
 
 		this.accountRepository = accountRepository;
 		this.refreshTokenRepository = refreshTokenRepository;
 		this.passwordEncoder = passwordEncoder;
 		this.jwtTokenProvider = jwtTokenProvider;
+		this.clock = clock;
 		// 맞출 평문이 없는 값이어야 한다. 기동마다 달라도 무해하다 — 비교 시간만 필요하다
 		this.dummyPasswordHash = passwordEncoder.encode(UUID.randomUUID().toString());
 	}
@@ -134,11 +152,14 @@ public class AuthService {
 	 * 커밋되면 탈퇴 계정 행을 INSERT 할 수 있다. 재발급이 {@code deleted} 를 같은 트랜잭션에서
 	 * 검사하는 한 그 행으로는 아무것도 할 수 없다.
 	 *
-	 * <p>거부는 모두 {@code A002} 다 — 세션이 없는 것(로그아웃·탈퇴), 저장값과 다른 것(이미
-	 * 회전된 토큰·Access Token), 탈퇴 계정의 유효 토큰. 정본의 검증표는 이 셋에 "실패"만 정했고
-	 * (sp-docs/plan/phase1.md §4 AU-07) §8.1 에서 "유효하지 않은 토큰입니다"가 그 셋에 맞는
-	 * 유일한 메시지다. <b>사유를 구분해 내보내지 않는다</b> — 어느 쪽이 틀렸는지 알려주면
-	 * 탈퇴 여부나 세션 존재가 드러난다.
+	 * <p><b>직전 토큰에는 회전 뒤 10초의 유예가 있다</b> (sp-docs/requirements/member.md §6.3).
+	 * 회전이 0행이고 제시된 토큰이 직전 토큰이며 유예 안이면, 다시 회전하지 않고 새 Access Token
+	 * 과 <b>지금 저장된</b> Refresh Token 을 준다 — {@link #withinReuseGrace}.
+	 *
+	 * <p>거부는 모두 {@code A002} 다 — 세션이 없는 것(로그아웃·탈퇴), 저장값과도 유예 안의 직전
+	 * 토큰과도 다른 것(유예 밖의 직전 토큰·그보다 앞의 토큰·Access Token), 탈퇴 계정의 유효
+	 * 토큰. <b>사유를 구분해 내보내지 않는다</b> (sp-docs/api-contract.md §2.1) — 어느 쪽이
+	 * 틀렸는지 알려주면 탈퇴 여부나 세션 존재가 드러난다.
 	 */
 	@Transactional
 	public TokenResponse reissue(ReissueRequest request) {
@@ -152,46 +173,79 @@ public class AuthService {
 		// 서명·만료 검증이 먼저다. 통과하지 못하면 A002(서명·형식)·A003(만료)이다
 		Long accountId = this.jwtTokenProvider.verifiedAccountId(presented);
 
-		// --- 아래 셋이 한 트랜잭션이다 (sp-docs/requirements/member.md §6) ---
+		// --- 아래가 한 트랜잭션이다 (sp-docs/requirements/member.md §6) ---
 
 		// 조회. 세션이 남아 있는지만 본다 — 저장값 일치는 아래 회전의 WHERE 가 판정한다.
 		// 여기서 값을 한 번 더 비교하지 않는 이유: 비교가 두 군데면 조건부 UPDATE 의
-		// "0행이면 실패"가 단일 스레드에서 도달 불가능해져, 회전이 실제로 판정하고 있는지
-		// 테스트로 확인할 수 없다. 서명만 맞는 옛 토큰을 거부하는 것이 그 판정의 본체다
+		// 0행 경로가 단일 스레드에서 도달 불가능해져, 회전이 실제로 판정하고 있는지
+		// 테스트로 확인할 수 없다
 		if (this.refreshTokenRepository.findByAccountId(accountId).isEmpty()) {
 			throw invalidToken();
 		}
 
 		// 탈퇴 계정은 재발급받을 수 없다 (sp-docs/requirements/member.md §3 규칙 5).
 		// 이 검사가 조회·회전과 같은 트랜잭션에 있어야 한다 — 밖으로 빼면 탈퇴 커밋과
-		// 겹치는 창이 생긴다
+		// 겹치는 창이 생긴다. 유예 경로도 이 검사를 지난 뒤다 (§6.3 "계정 활성 검사는 회전과 같다")
 		Account account = this.accountRepository.findById(accountId)
 				.filter(Account::isActive)
 				.orElseThrow(AuthService::invalidToken);
 
 		TokenResponse tokens = this.jwtTokenProvider.issue(account.getId(), account.getRole());
 
-		// 회전. 조건부 UPDATE 이고 0행이면 실패다 (sp-docs/requirements/member.md §6).
-		// 0행이 되는 경우는 둘이다 — 그 사이 행이 사라졌거나(탈퇴·로그아웃 커밋),
-		// 제시된 토큰이 저장값과 다르다(이미 회전된 토큰, 혹은 Access Token).
+		// 회전. 조건부 UPDATE 하나가 새 토큰·직전 토큰·회전 시각을 함께 쓴다 (§6.3).
+		// 회전 시각은 앱 시계를 마이크로초로 자른 값이다 — DATETIME(6) 에 넘는 소수부를 MySQL 이
+		// 반올림하면 저장값이 실제 회전보다 늦어질 수 있다 (sp-docs/domain-model.md §2.2).
 		//
 		// 같은 초에 두 번 발급하면 새 토큰이 저장값과 같은데(sp-docs/requirements/member.md
 		// §6.2) 그래도 1행이다 — 드라이버가 found rows 를 돌려주기 때문이다. 정당한 재발급이
 		// 거부되지 않으려면 JDBC URL 에 useAffectedRows=true 가 없어야 한다 (정본 §6.1)
 		int rotated = this.refreshTokenRepository.rotate(
-				accountId, presented, tokens.refreshToken(), refreshTokenExpiresAt());
-		if (rotated == 0) {
-			throw invalidToken();
+				accountId, presented, tokens.refreshToken(), refreshTokenExpiresAt(),
+				LocalDateTime.now(this.clock).truncatedTo(ChronoUnit.MICROS));
+		if (rotated == 1) {
+			return tokens;
 		}
-		return tokens;
+
+		// 0행 — 그 사이 행이 사라졌거나(탈퇴·로그아웃·비밀번호 변경 커밋), 제시된 토큰이
+		// 저장값과 다르다. 뒤쪽이 유예 안의 직전 토큰이면 회전하지 않고 지금 저장된 값을 준다
+		String current = this.refreshTokenRepository.findLatestForUpdate(accountId)
+				.filter(this::withinReuseGrace)
+				.filter(row -> presented.equals(row.getPreviousToken()))
+				.map(RefreshToken::getToken)
+				.orElseThrow(AuthService::invalidToken);
+		return TokenResponse.bearer(tokens.accessToken(), current, tokens.accessTokenExpiresIn());
 	}
 
 	/**
-	 * MR-06 — 로그아웃 (sp-docs/api-contract.md §2.1).
+	 * 판정 시각이 회전 시각 + 10초 이하인가 (sp-docs/domain-model.md §2.2,
+	 * sp-docs/requirements/member.md §6.3).
 	 *
-	 * <p>저장된 Refresh Token 을 지운다. <b>멱등이다</b> — 행이 없어도 지울 것이 없을 뿐이다.
-	 * 재발급이 저장값 대조를 최종 판정으로 쓰므로, 행이 사라지면 그 계정의 Refresh Token 은
-	 * 모두 무효가 된다.
+	 * <p>판정 시각은 회전 시각을 기록한 것과 같은 앱 시계의 값이고 <b>자르지 않는다.</b> 회전 시각은
+	 * 잘라서 저장했으므로 유예는 회전부터 10초에서 1마이크로초 미만 짧을 수 있고 앱 시계 기준으로
+	 * 길어지지 않는다.
+	 *
+	 * <p>이 판정은 행을 쓰지 않는다 — 유예 응답이 {@code rotated_at} 을 밀지 않으므로 유예는
+	 * 회전 한 번에 10초다. 로그인이 {@code rotated_at} 을 비우므로 비어 있으면 유예가 없다.
+	 *
+	 * @param row {@code findLatestForUpdate} 가 읽은 최신 커밋 값. 스냅샷 읽기로 얻은 행을
+	 *         넘기지 않는다 — 이유는 그 메서드에 있다
+	 */
+	private boolean withinReuseGrace(RefreshToken row) {
+		LocalDateTime rotatedAt = row.getRotatedAt();
+		return rotatedAt != null
+				&& !LocalDateTime.now(this.clock).isAfter(rotatedAt.plus(REUSE_GRACE));
+	}
+
+	/**
+	 * MR-06 — 로그아웃 (sp-docs/requirements/member.md §6.4, sp-docs/api-contract.md §2.1 §9.5).
+	 *
+	 * <p><b>제시한 세션의 행만 지운다.</b> 그 계정의 행을, 본문의 Refresh Token 이 저장된 토큰이나
+	 * 직전 토큰과 같을 때만 지운다. 계정당 1행이므로 같은 계정의 새 로그인이 행을 바꾼 뒤 늦게
+	 * 도착한 옛 세션의 로그아웃은 맞지 않아 새 세션을 지우지 않는다. <b>대조와 삭제가 DELETE
+	 * 하나다</b> — 따로 하면 그 사이 커밋된 로그인의 행을 지울 수 있다.
+	 *
+	 * <p><b>멱등이다.</b> 맞지 않거나 행이 없으면 아무것도 하지 않는다. 서명은 검증하지 않는다 —
+	 * 만료된 토큰도 문자열이 맞으면 지운다.
 	 *
 	 * <p>Access Token 은 서버에 상태가 없어 즉시 무효화되지 않는다. 최대 노출은 그 만료까지다
 	 * (sp-docs/api-contract.md §6, sp-docs/security.md §5.3).
@@ -200,8 +254,8 @@ public class AuthService {
 	 *         (sp-docs/security.md §4)
 	 */
 	@Transactional
-	public void logout(Long accountId) {
-		this.refreshTokenRepository.deleteByAccountId(accountId);
+	public void logout(Long accountId, LogoutRequest request) {
+		this.refreshTokenRepository.deleteSession(accountId, request.refreshToken());
 	}
 
 	/**
@@ -219,6 +273,9 @@ public class AuthService {
 	 * {@code refresh_token.id} 를 AUTO_INCREMENT 로 올리고 인덱스를 흔든다 —
 	 * 재로그인 후에도 {@code id} 가 같아야 한다 (sp-docs/plan/phase1.md §4 AU-06).
 	 * 영속 상태의 엔티티를 바꾸면 더티 체킹이 커밋 시점에 UPDATE 를 보낸다.
+	 *
+	 * <p><b>직전 토큰과 회전 시각을 비운다</b>({@link RefreshToken#renew}) — 새 세션이므로 옛 세션의
+	 * 토큰이 유예로 새 세션을 얻지 못한다 (sp-docs/requirements/member.md §6.3).
 	 *
 	 * <p>{@code expires_at} 은 Refresh Token 만료(14일)다 (sp-docs/security.md §1). 시간대는
 	 * 실행 환경이 정한다 (sp-docs/adr/0011).

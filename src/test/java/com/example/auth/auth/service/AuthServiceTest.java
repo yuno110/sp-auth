@@ -8,6 +8,7 @@ import com.example.auth.account.entity.Account;
 import com.example.auth.account.entity.Role;
 import com.example.auth.account.repository.AccountRepository;
 import com.example.auth.auth.dto.LoginRequest;
+import com.example.auth.auth.dto.LogoutRequest;
 import com.example.auth.auth.dto.ReissueRequest;
 import com.example.auth.auth.dto.TokenResponse;
 import com.example.auth.auth.entity.RefreshToken;
@@ -15,16 +16,24 @@ import com.example.auth.auth.repository.RefreshTokenRepository;
 import com.example.auth.global.error.BusinessException;
 import com.example.auth.global.error.ErrorCode;
 import com.example.auth.global.security.JwtTokenProvider;
+import com.example.auth.support.MutableClock;
 import com.example.auth.support.TestRsaKeys;
 import com.example.auth.support.TestTokens;
 import com.nimbusds.jwt.SignedJWT;
+import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
+import java.time.temporal.ChronoUnit;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -36,10 +45,11 @@ import org.springframework.security.oauth2.jwt.JwtEncoder;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.test.context.bean.override.convention.TestBean;
 
 /**
- * sp-docs/plan/phase1.md §4 AU-06·AU-07 의 "검증" 표 중 저장·Claim·회전 쪽을 테스트로 옮긴
- * 것이다. HTTP 상태·응답 본문은 {@link com.example.auth.auth.controller.AuthControllerTest}
+ * sp-docs/plan/phase1.md §4 AU-06·AU-07 의 "검증" 표 중 저장·Claim·회전 쪽과, D-17 의 "검증" 표 중
+ * 재사용 유예·로그아웃 대조 쪽을 테스트로 옮긴 것이다. HTTP 상태·응답 본문은 {@link com.example.auth.auth.controller.AuthControllerTest}
  * 가 본다.
  *
  * <p>정본은 sp-docs/requirements/member.md §1 (MR-04·MR-05·MR-06) §6, sp-docs/security.md §4,
@@ -65,9 +75,20 @@ class AuthServiceTest {
 	/** sp-docs/api-contract.md §6 의 claim 전체. 하나라도 늘거나 줄면 계약이 깨진다. */
 	private static final String[] CONTRACT_CLAIMS = {"sub", "role", "iss", "iat", "exp"};
 
+	/** 앱 시계를 바꿔 끼운다. 고정하지 않은 테스트에서는 시스템 시계다 ({@link MutableClock}). */
+	private static final MutableClock CLOCK = new MutableClock();
+
 	@DynamicPropertySource
 	static void jwtPrivateKey(DynamicPropertyRegistry registry) {
 		TestRsaKeys.registerPrivateKeyLocation(registry);
+	}
+
+	/** 애플리케이션의 {@code Clock} 빈을 {@link #CLOCK} 로 바꾼다 ({@code ClockConfig}). */
+	@TestBean
+	private Clock clock;
+
+	static Clock clock() {
+		return CLOCK;
 	}
 
 	@Autowired
@@ -104,6 +125,7 @@ class AuthServiceTest {
 	 */
 	@AfterEach
 	void 정리() {
+		CLOCK.reset();
 		this.refreshTokenRepository.deleteAll();
 		this.refreshTokenRepository.flush();
 		this.accountRepository.deleteAll(this.accountRepository.findAll().stream()
@@ -263,8 +285,8 @@ class AuthServiceTest {
 
 		CountingPasswordEncoder counting = new CountingPasswordEncoder(this.passwordEncoder);
 		// 더미 해시를 만드는 encode 는 생성자에서 한 번 일어난다 — matches 횟수는 0 에서 시작한다
-		AuthService service = new AuthService(
-				this.accountRepository, this.refreshTokenRepository, counting, this.jwtTokenProvider);
+		AuthService service = new AuthService(this.accountRepository, this.refreshTokenRepository,
+				counting, this.jwtTokenProvider, this.clock);
 
 		Map<String, LoginRequest> 실패_경로 = new LinkedHashMap<>();
 		실패_경로.put("없는 이메일", 로그인("nobody@example.com", RAW_PASSWORD));
@@ -386,30 +408,211 @@ class AuthServiceTest {
 	}
 
 	/**
-	 * <b>이 항목의 핵심 단언 하나다.</b> 회전이 조건부 UPDATE 이고 0행이면 실패한다는 것을
-	 * 서비스 경로에서 본다 — 제시된 토큰이 저장값과 다르면 거부되어야 한다
-	 * (sp-docs/plan/phase1.md §4 AU-07).
+	 * 회전이 조건부 UPDATE 이고 0행이면 회전하지 않는다는 것을 서비스 경로에서 본다 — 제시된
+	 * 토큰이 저장값과 다르고 유예 안의 직전 토큰도 아니면 거부되어야 한다
+	 * (sp-docs/plan/phase1.md §4 AU-07, D-17).
 	 *
-	 * <p>{@code RefreshToken.renew()} 로 바꿔 끼우면 이 테스트가 깨진다. 그 메서드는 조건 없이
-	 * 값을 덮으므로 이미 회전된 옛 토큰으로도 재발급이 성립한다.
+	 * <p>2026-11-11 D-17 전에는 회전 직후의 옛 토큰을 곧바로 거부했다. 지금은 회전 뒤 10초 동안
+	 * 유예가 있으므로(sp-docs/requirements/member.md §6.3) 시계를 유예 밖으로 옮겨서 본다.
+	 * {@code RefreshToken.renew()} 로 바꿔 끼우면 이 테스트가 깨진다 — 그 메서드는 조건 없이
+	 * 값을 덮으므로 옛 토큰으로도 회전이 성립한다.
 	 */
 	@Test
-	@DisplayName("회전 뒤 이전 Refresh Token 으로 재발급하면 실패한다")
-	void 이전_토큰_재사용은_실패한다() {
+	@DisplayName("유예 밖의 직전 Refresh Token 으로 재발급하면 A002 이고 행이 그대로다")
+	void 유예_밖의_직전_토큰은_실패한다() {
 		Account account = 계정을_만든다("rotated@example.com");
 		String 이전_토큰 = 저장된_세션을_만든다(account, 조금_전()).getToken();
 
 		TokenResponse 첫_재발급 = this.authService.reissue(new ReissueRequest(이전_토큰));
 		assertThat(첫_재발급.refreshToken()).isNotEqualTo(이전_토큰);
+		RefreshToken 회전_뒤 = 행(account);
 
+		CLOCK.set(회전_뒤.getRotatedAt().plusSeconds(11));
 		BusinessException thrown = 재발급에_실패한다(이전_토큰);
 
 		assertThat(thrown.getErrorCode()).isEqualTo(ErrorCode.INVALID_TOKEN);
+		행이_그대로다(account, 회전_뒤);
+	}
+
+	// --- D-17 재사용 유예 (sp-docs/requirements/member.md §6.3, sp-docs/domain-model.md §2.2) ---
+
+	@Test
+	@DisplayName("회전은 직전 토큰에 제시된 토큰을, 회전 시각에 앱 시계를 마이크로초로 자른 값을 넣는다")
+	void 회전이_직전_토큰과_회전_시각을_쓴다() {
+		Account account = 계정을_만든다("rotation-columns@example.com");
+		String 제시 = 저장된_세션을_만든다(account, 조금_전()).getToken();
+		LocalDateTime 회전_시각 = LocalDateTime.now().withNano(123_456_789);
+		CLOCK.set(회전_시각);
+
+		TokenResponse response = this.authService.reissue(new ReissueRequest(제시));
+
+		RefreshToken row = 행(account);
+		assertThat(row.getToken()).isEqualTo(response.refreshToken());
+		assertThat(row.getPreviousToken()).isEqualTo(제시);
+		assertThat(row.getRotatedAt())
+				.as("앱 시계의 값을 마이크로초로 자른다 — 반올림하면 실제 회전보다 늦을 수 있다")
+				.isEqualTo(회전_시각.withNano(123_456_000));
+	}
+
+	@Test
+	@DisplayName("회전 직후 직전 토큰으로 재발급하면 새 Access Token 과 지금 저장된 Refresh Token 을 받고 행이 그대로다")
+	void 유예_안의_직전_토큰은_지금_저장된_토큰을_받는다() throws Exception {
+		Account account = 계정을_만든다("grace@example.com");
+		String 직전_토큰 = 저장된_세션을_만든다(account, 조금_전()).getToken();
+		TokenResponse 회전 = this.authService.reissue(new ReissueRequest(직전_토큰));
+		RefreshToken 회전_뒤 = 행(account);
+
+		TokenResponse 유예 = this.authService.reissue(new ReissueRequest(직전_토큰));
+
+		assertThat(유예.grantType()).isEqualTo("Bearer");
+		assertThat(유예.refreshToken())
+				.as("다시 회전하지 않고 지금 저장된 값을 그대로 준다")
+				.isEqualTo(회전.refreshToken())
+				.isEqualTo(회전_뒤.getToken());
+		assertThat(SignedJWT.parse(유예.accessToken()).getJWTClaimsSet().getSubject())
+				.as("새 Access Token 은 그 계정의 것이다")
+				.isEqualTo(String.valueOf(account.getId()));
+		assertThat(유예.accessTokenExpiresIn()).isEqualTo(회전.accessTokenExpiresIn());
+		행이_그대로다(account, 회전_뒤);
+	}
+
+	/**
+	 * 10초 경계. 회전 시각을 마이크로초 아래 소수부가 있는 값으로 고정해, 저장값(잘린 값)과 실제
+	 * 회전 시각이 다르게 만든다. 판정은 「판정 시각 ≤ 저장된 회전 시각 + 10초」 이고 판정 시각은
+	 * 자르지 않는다 (sp-docs/domain-model.md §2.2).
+	 */
+	@Test
+	@DisplayName("판정 시각이 저장된 회전 시각 + 10초면 유예 안이고, 그보다 1나노초 뒤면 A002 다")
+	void 유예_경계() {
+		Account account = 계정을_만든다("grace-boundary@example.com");
+		String 직전_토큰 = 저장된_세션을_만든다(account, 조금_전()).getToken();
+		LocalDateTime 회전_시각 = LocalDateTime.now().withNano(700_000_500);
+		CLOCK.set(회전_시각);
+		TokenResponse 회전 = this.authService.reissue(new ReissueRequest(직전_토큰));
+		LocalDateTime 저장된_회전_시각 = 행(account).getRotatedAt();
+		assertThat(저장된_회전_시각).isEqualTo(회전_시각.truncatedTo(ChronoUnit.MICROS));
+
+		CLOCK.set(저장된_회전_시각.plusSeconds(10));
+		assertThat(this.authService.reissue(new ReissueRequest(직전_토큰)).refreshToken())
+				.as("경계 직전(= 저장된 회전 시각 + 10초)은 유예 안이다")
+				.isEqualTo(회전.refreshToken());
+
+		CLOCK.set(저장된_회전_시각.plusSeconds(10).plusNanos(1));
+		assertThat(재발급에_실패한다(직전_토큰).getErrorCode())
+				.as("경계 직후는 유예 밖이다")
+				.isEqualTo(ErrorCode.INVALID_TOKEN);
+	}
+
+	@Test
+	@DisplayName("유예 응답은 창을 밀지 않는다 — 첫 회전 시각 기준으로 유예 밖이면 A002")
+	void 유예_응답은_창을_밀지_않는다() {
+		Account account = 계정을_만든다("grace-window@example.com");
+		String 직전_토큰 = 저장된_세션을_만든다(account, 조금_전()).getToken();
+		CLOCK.set(LocalDateTime.now());
+		this.authService.reissue(new ReissueRequest(직전_토큰));
+		RefreshToken 회전_뒤 = 행(account);
+
+		CLOCK.set(회전_뒤.getRotatedAt().plusSeconds(8));
+		this.authService.reissue(new ReissueRequest(직전_토큰));
+		행이_그대로다(account, 회전_뒤);
+
+		// 유예 응답 기준으로는 5초 뒤지만 첫 회전 기준으로는 13초 뒤다
+		CLOCK.set(회전_뒤.getRotatedAt().plusSeconds(13));
+		assertThat(재발급에_실패한다(직전_토큰).getErrorCode()).isEqualTo(ErrorCode.INVALID_TOKEN);
+	}
+
+	@Test
+	@DisplayName("10초 안에 회전이 두 번 일어나면 처음 토큰은 A002 다 — 직전 토큰은 하나뿐이다")
+	void 회전_두_번_뒤_처음_토큰은_실패한다() {
+		Account account = 계정을_만든다("grace-twice@example.com");
+		String 처음_토큰 = 저장된_세션을_만든다(account, 조금_전()).getToken();
+		String 둘째_토큰 = this.authService.reissue(new ReissueRequest(처음_토큰)).refreshToken();
+		this.authService.reissue(new ReissueRequest(둘째_토큰));
+		RefreshToken 두_번_뒤 = 행(account);
+		assertThat(두_번_뒤.getPreviousToken()).isEqualTo(둘째_토큰);
+
+		assertThat(재발급에_실패한다(처음_토큰).getErrorCode()).isEqualTo(ErrorCode.INVALID_TOKEN);
+		행이_그대로다(account, 두_번_뒤);
+	}
+
+	@Test
+	@DisplayName("회전 뒤 다시 로그인하면 옛 세션의 직전 토큰은 A002 다 — 로그인이 직전 토큰을 비웠다")
+	void 로그인이_직전_토큰을_비운다() {
+		Account account = 계정을_만든다("grace-relogin@example.com");
+		String 직전_토큰 = 저장된_세션을_만든다(account, 조금_전()).getToken();
+		this.authService.reissue(new ReissueRequest(직전_토큰));
+
+		TokenResponse 새_로그인 = this.authService.login(로그인("grace-relogin@example.com", RAW_PASSWORD));
+
+		RefreshToken row = 행(account);
+		assertThat(row.getToken()).isEqualTo(새_로그인.refreshToken());
+		assertThat(row.getPreviousToken()).isNull();
+		assertThat(row.getRotatedAt()).isNull();
+		assertThat(재발급에_실패한다(직전_토큰).getErrorCode()).isEqualTo(ErrorCode.INVALID_TOKEN);
+		행이_그대로다(account, row);
+	}
+
+	/**
+	 * 탈퇴 1단계가 남기는 상태(계정 {@code deleted} + 행 삭제)를 두 단계로 만들어, 유예 경로에서도
+	 * 두 방어선이 각각 작동하는지 본다 — 계정 활성 검사와, 최신 커밋 값에 행이 없으면 유예도
+	 * 없다는 것 (sp-docs/requirements/member.md §6.3).
+	 */
+	@Test
+	@DisplayName("회전 뒤 계정이 탈퇴하면 유예 안의 직전 토큰도 A002 이고 행이 되살아나지 않는다")
+	void 탈퇴_뒤_직전_토큰은_실패한다() {
+		Account account = 계정을_만든다("grace-withdrawn@example.com");
+		String 직전_토큰 = 저장된_세션을_만든다(account, 조금_전()).getToken();
+		this.authService.reissue(new ReissueRequest(직전_토큰));
+		RefreshToken 회전_뒤 = 행(account);
+
+		account.withdraw();
+		this.accountRepository.saveAndFlush(account);
+		assertThat(재발급에_실패한다(직전_토큰).getErrorCode())
+				.as("행이 남아 있어도 계정 활성 검사가 유예 경로를 막는다")
+				.isEqualTo(ErrorCode.INVALID_TOKEN);
+		행이_그대로다(account, 회전_뒤);
+
+		this.refreshTokenRepository.deleteAll();
+		this.refreshTokenRepository.flush();
+		assertThat(재발급에_실패한다(직전_토큰).getErrorCode()).isEqualTo(ErrorCode.INVALID_TOKEN);
 		assertThat(this.refreshTokenRepository.findAll())
-				.as("거부된 재발급이 저장값을 건드리지 않는다")
-				.singleElement()
-				.extracting(RefreshToken::getToken)
-				.isEqualTo(첫_재발급.refreshToken());
+				.as("되살아나면 탈퇴 계정에 14일짜리 RefreshToken 이 생긴다")
+				.isEmpty();
+	}
+
+	/**
+	 * 같은 토큰으로 겹친 재발급 두 건. <b>H2 에서 돈다 — 이것만으로 판정하지 않는다</b>
+	 * (sp-docs/requirements/member.md §6.3). 실 MySQL 쪽은 로컬 기동으로 따로 본다.
+	 *
+	 * <p><b>어느 쪽이 회전하고 어느 쪽이 유예인지 단언하지 않는다.</b> 같은 초에 발급하면 새 토큰이
+	 * 제시 토큰과 같을 수 있고(§6.2) 실행 순서도 정할 수 없다. 결과로 단언한다 — 둘 다 성공하고,
+	 * 받은 Refresh Token 이 같고, 그것이 저장값이다.
+	 */
+	@Test
+	@DisplayName("같은 토큰으로 동시에 보낸 재발급 두 건이 둘 다 성공하고 같은 저장값을 받는다")
+	void 동시_재발급은_둘_다_성공한다() throws Exception {
+		Account account = 계정을_만든다("grace-concurrent@example.com");
+		String 제시 = 저장된_세션을_만든다(account, 조금_전()).getToken();
+		CountDownLatch 출발 = new CountDownLatch(1);
+		ExecutorService pool = Executors.newFixedThreadPool(2);
+		try {
+			Future<TokenResponse> 첫째 = pool.submit(() -> {
+				출발.await();
+				return this.authService.reissue(new ReissueRequest(제시));
+			});
+			Future<TokenResponse> 둘째 = pool.submit(() -> {
+				출발.await();
+				return this.authService.reissue(new ReissueRequest(제시));
+			});
+			출발.countDown();
+
+			String 첫째_토큰 = 첫째.get(30, TimeUnit.SECONDS).refreshToken();
+			String 둘째_토큰 = 둘째.get(30, TimeUnit.SECONDS).refreshToken();
+
+			assertThat(첫째_토큰).isEqualTo(둘째_토큰).isEqualTo(행(account).getToken());
+		} finally {
+			pool.shutdownNow();
+		}
 	}
 
 	/**
@@ -538,19 +741,36 @@ class AuthServiceTest {
 				.isEmpty();
 	}
 
-	@Test
-	@DisplayName("로그아웃은 저장된 Refresh Token 을 지우고, 행이 없어도 그대로 끝난다")
-	void 로그아웃은_행을_지운다() {
-		Account account = 계정을_만든다("logout@example.com");
-		저장된_세션을_만든다(account, 조금_전());
+	// --- 로그아웃 (sp-docs/requirements/member.md §6.4). HTTP 쪽은 AuthControllerTest 가 본다 ---
 
-		this.authService.logout(account.getId());
+	@Test
+	@DisplayName("로그아웃은 제시한 토큰이 저장된 토큰이면 행을 지우고, 다시 불러도 그대로 끝난다")
+	void 로그아웃은_저장된_토큰의_행을_지운다() {
+		Account account = 계정을_만든다("logout@example.com");
+		String 토큰 = 저장된_세션을_만든다(account, 조금_전()).getToken();
+
+		this.authService.logout(account.getId(), new LogoutRequest(토큰));
 
 		assertThat(this.refreshTokenRepository.findAll()).isEmpty();
 
 		// 이미 지워진 뒤에 다시 불러도 예외가 아니다 — 지울 것이 없을 뿐이다
-		this.authService.logout(account.getId());
+		this.authService.logout(account.getId(), new LogoutRequest(토큰));
 		assertThat(this.refreshTokenRepository.findAll()).isEmpty();
+	}
+
+	@Test
+	@DisplayName("로그아웃은 제시한 토큰이 직전 토큰이면 유예 밖이어도 행을 지운다")
+	void 로그아웃은_직전_토큰의_행도_지운다() {
+		Account account = 계정을_만든다("logout-previous@example.com");
+		String 직전_토큰 = 저장된_세션을_만든다(account, 조금_전()).getToken();
+		this.authService.reissue(new ReissueRequest(직전_토큰));
+		CLOCK.set(행(account).getRotatedAt().plusMinutes(5));
+
+		this.authService.logout(account.getId(), new LogoutRequest(직전_토큰));
+
+		assertThat(this.refreshTokenRepository.findAll())
+				.as("previous_token 일치에는 시간 제한이 없다 (§6.4)")
+				.isEmpty();
 	}
 
 	@Test
@@ -559,12 +779,27 @@ class AuthServiceTest {
 		Account account = 계정을_만든다("logout-reissue@example.com");
 		String 토큰 = 저장된_세션을_만든다(account, 조금_전()).getToken();
 
-		this.authService.logout(account.getId());
+		this.authService.logout(account.getId(), new LogoutRequest(토큰));
 
 		assertThat(재발급에_실패한다(토큰).getErrorCode()).isEqualTo(ErrorCode.INVALID_TOKEN);
 		assertThat(this.refreshTokenRepository.findAll())
 				.as("거부된 재발급이 행을 다시 만들지 않는다")
 				.isEmpty();
+	}
+
+	/** 계정당 1행이다 (sp-docs/domain-model.md §2.2). 매번 DB 에서 다시 읽는다. */
+	private RefreshToken 행(Account account) {
+		return this.refreshTokenRepository.findByAccountId(account.getId()).orElseThrow();
+	}
+
+	/** 거부·유예 응답이 행의 값(토큰·만료·직전 토큰·회전 시각)을 바꾸지 않았는가. */
+	private void 행이_그대로다(Account account, RefreshToken 전) {
+		RefreshToken 후 = 행(account);
+		assertThat(후.getId()).isEqualTo(전.getId());
+		assertThat(후.getToken()).isEqualTo(전.getToken());
+		assertThat(후.getExpiresAt()).isEqualTo(전.getExpiresAt());
+		assertThat(후.getPreviousToken()).isEqualTo(전.getPreviousToken());
+		assertThat(후.getRotatedAt()).isEqualTo(전.getRotatedAt());
 	}
 
 	/** 실패 사유를 비교해야 하므로 예외 객체 자체가 필요하다. */

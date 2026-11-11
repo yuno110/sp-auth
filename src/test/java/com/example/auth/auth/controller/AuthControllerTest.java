@@ -17,6 +17,8 @@ import com.jayway.jsonpath.JsonPath;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.temporal.ChronoUnit;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -34,9 +36,10 @@ import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
 import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder;
+import org.springframework.transaction.support.TransactionTemplate;
 
 /**
- * sp-docs/plan/phase1.md §4 AU-06·AU-07 의 "검증" 표 중 HTTP 쪽을 테스트로 옮긴 것이다.
+ * sp-docs/plan/phase1.md §4 AU-06·AU-07 과 D-17 의 "검증" 표 중 HTTP 쪽을 테스트로 옮긴 것이다.
  * 저장·Claim·회전은 {@link com.example.auth.auth.service.AuthServiceTest} 가 본다.
  *
  * <p>정본은 sp-docs/api-contract.md §2.1 §9.2 §8.1 §8.4 다.
@@ -89,6 +92,10 @@ class AuthControllerTest {
 	/** 만료된 토큰 픽스처를 애플리케이션의 서명 키로 만든다 ({@link TestTokens}). */
 	@Autowired
 	private JwtEncoder jwtEncoder;
+
+	/** 직전 토큰이 있는 행을 심을 때 조건부 UPDATE 를 트랜잭션 안에서 부른다. */
+	@Autowired
+	private TransactionTemplate transactionTemplate;
 
 	/**
 	 * <b>seed 행은 남긴다.</b> H2 는 테스트 클래스 사이에 공유되므로
@@ -280,13 +287,13 @@ class AuthControllerTest {
 	}
 
 	@Test
-	@DisplayName("로그아웃은 204 와 빈 본문을 반환하고 refresh_token 행을 지운다")
+	@DisplayName("로그아웃은 본문이 저장된 토큰이면 204 와 빈 본문을 반환하고 refresh_token 행을 지운다")
 	void 정상_로그아웃() throws Exception {
 		계정을_만든다("logout@example.com");
 		IssuedTokens 로그인 = 로그인한다("logout@example.com");
 		assertThat(this.refreshTokenRepository.findAll()).hasSize(1);
 
-		String body = this.mockMvc.perform(logout(로그인.accessToken()))
+		String body = this.mockMvc.perform(logout(로그인.accessToken(), 로그인.refreshToken()))
 				.andExpect(status().isNoContent())
 				.andReturn().getResponse().getContentAsString(StandardCharsets.UTF_8);
 
@@ -300,7 +307,8 @@ class AuthControllerTest {
 		계정을_만든다("logout-reissue@example.com");
 		IssuedTokens 로그인 = 로그인한다("logout-reissue@example.com");
 
-		this.mockMvc.perform(logout(로그인.accessToken())).andExpect(status().isNoContent());
+		this.mockMvc.perform(logout(로그인.accessToken(), 로그인.refreshToken()))
+				.andExpect(status().isNoContent());
 
 		this.mockMvc.perform(reissue(로그인.refreshToken()))
 				.andExpect(status().isUnauthorized())
@@ -308,6 +316,178 @@ class AuthControllerTest {
 		assertThat(this.refreshTokenRepository.findAll())
 				.as("거부된 재발급이 행을 다시 만들지 않는다")
 				.isEmpty();
+	}
+
+	// --- D-17 재사용 유예·로그아웃의 대조 (sp-docs/requirements/member.md §6.3·§6.4) ---
+
+	@Test
+	@DisplayName("회전 직후 직전 토큰으로 재발급하면 200 이고 Refresh Token 은 지금 저장된 값이다")
+	void 유예_안의_직전_토큰_재발급() throws Exception {
+		Account account = 계정을_만든다("grace@example.com");
+		String 직전_토큰 = 저장된_세션을_만든다(account);
+		String 회전된_토큰 = JsonPath.read(this.mockMvc.perform(reissue(직전_토큰))
+				.andExpect(status().isOk())
+				.andReturn().getResponse().getContentAsString(StandardCharsets.UTF_8), "$.data.refreshToken");
+
+		this.mockMvc.perform(reissue(직전_토큰))
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.success").value(true))
+				.andExpect(jsonPath("$.data.grantType").value("Bearer"))
+				.andExpect(jsonPath("$.data.accessToken").isNotEmpty())
+				.andExpect(jsonPath("$.data.refreshToken").value(회전된_토큰))
+				.andExpect(jsonPath("$.data.accessTokenExpiresIn").value(ACCESS_TOKEN_SECONDS));
+
+		assertThat(this.refreshTokenRepository.findAll())
+				.singleElement()
+				.satisfies(row -> {
+					assertThat(row.getToken()).isEqualTo(회전된_토큰);
+					assertThat(row.getPreviousToken()).isEqualTo(직전_토큰);
+				});
+	}
+
+	@Test
+	@DisplayName("로그아웃 — 본문이 직전 토큰이면 204 이고 행을 지운다")
+	void 직전_토큰으로_로그아웃() throws Exception {
+		Account account = 계정을_만든다("logout-previous@example.com");
+		IssuedTokens 로그인 = 로그인한다("logout-previous@example.com");
+		String 직전_토큰 = 저장된_세션을_만든다(account);
+		this.mockMvc.perform(reissue(직전_토큰)).andExpect(status().isOk());
+
+		this.mockMvc.perform(logout(로그인.accessToken(), 직전_토큰))
+				.andExpect(status().isNoContent());
+
+		assertThat(this.refreshTokenRepository.findAll()).isEmpty();
+	}
+
+	@Test
+	@DisplayName("로그아웃 — 본문이 저장값·직전 토큰 어느 쪽과도 다르거나 JWT 가 아니면 204 이고 행이 그대로다")
+	void 맞지_않는_토큰으로_로그아웃() throws Exception {
+		Account account = 계정을_만든다("logout-mismatch@example.com");
+		IssuedTokens 로그인 = 로그인한다("logout-mismatch@example.com");
+		String 다른_토큰 = TestTokens.signed(this.jwtEncoder, account.getId(), Role.USER,
+				Instant.now().minusSeconds(30), Duration.ofDays(14));
+
+		for (String 제시 : new String[] {다른_토큰, 로그인.accessToken(), "not-a-jwt"}) {
+			this.mockMvc.perform(logout(로그인.accessToken(), 제시))
+					.andExpect(status().isNoContent());
+		}
+
+		assertThat(this.refreshTokenRepository.findAll())
+				.as("서명을 검증하지 않고 문자열 대조로만 판정한다 — 맞지 않으면 아무것도 하지 않는다")
+				.singleElement()
+				.extracting(RefreshToken::getToken)
+				.isEqualTo(로그인.refreshToken());
+	}
+
+	/**
+	 * 서명·만료를 검증하지 않는다 — 만료된 토큰도 문자열이 맞으면 지운다
+	 * (sp-docs/requirements/member.md §6.4). 만료 JWT 는 과거 시각으로 서명해 만든다
+	 * ({@link TestTokens#signed}).
+	 */
+	@Test
+	@DisplayName("로그아웃 — 본문이 만료된 저장 토큰·직전 토큰 문자열이어도 204 이고 행을 지운다")
+	void 만료된_토큰으로_로그아웃() throws Exception {
+		Account account = 계정을_만든다("logout-expired@example.com");
+		IssuedTokens 로그인 = 로그인한다("logout-expired@example.com");
+		String 만료된_저장_토큰 = 만료된_토큰(account.getId());
+		String 만료된_직전_토큰 = TestTokens.signed(this.jwtEncoder, account.getId(), Role.USER,
+				Instant.now().minus(Duration.ofHours(3)), Duration.ofHours(1));
+
+		// 저장 토큰이 만료된 행
+		세션을_심는다(account, 만료된_저장_토큰, null);
+		this.mockMvc.perform(logout(로그인.accessToken(), 만료된_저장_토큰))
+				.andExpect(status().isNoContent());
+		assertThat(this.refreshTokenRepository.findAll()).isEmpty();
+
+		// 직전 토큰이 만료된 행
+		세션을_심는다(account, 로그인.refreshToken(), 만료된_직전_토큰);
+		this.mockMvc.perform(logout(로그인.accessToken(), 만료된_직전_토큰))
+				.andExpect(status().isNoContent());
+		assertThat(this.refreshTokenRepository.findAll()).isEmpty();
+	}
+
+	@Test
+	@DisplayName("로그아웃 — refreshToken 이 없거나 null·빈 문자열이면 400 C001, fieldErrors 에 refreshToken, 행 그대로")
+	void refreshToken_누락_로그아웃() throws Exception {
+		계정을_만든다("logout-missing@example.com");
+		IssuedTokens 로그인 = 로그인한다("logout-missing@example.com");
+
+		for (String json : new String[] {"{}", "{\"refreshToken\": null}", "{\"refreshToken\": \"\"}",
+				"{\"refreshToken\": \"   \"}"}) {
+			this.mockMvc.perform(logoutWithBody(로그인.accessToken(), json))
+					.andExpect(status().isBadRequest())
+					.andExpect(jsonPath("$.success").value(false))
+					.andExpect(jsonPath("$.error.code").value("C001"))
+					.andExpect(jsonPath("$.error.fieldErrors.length()").value(1))
+					.andExpect(jsonPath("$.error.fieldErrors[0].field").value("refreshToken"));
+		}
+
+		assertThat(this.refreshTokenRepository.findAll())
+				.singleElement()
+				.extracting(RefreshToken::getToken)
+				.isEqualTo(로그인.refreshToken());
+	}
+
+	@Test
+	@DisplayName("로그아웃 — 행이 없어도 204 다")
+	void 행이_없을_때_로그아웃() throws Exception {
+		계정을_만든다("logout-norow@example.com");
+		IssuedTokens 로그인 = 로그인한다("logout-norow@example.com");
+		this.refreshTokenRepository.deleteAll();
+		this.refreshTokenRepository.flush();
+
+		this.mockMvc.perform(logout(로그인.accessToken(), 로그인.refreshToken()))
+				.andExpect(status().isNoContent());
+		assertThat(this.refreshTokenRepository.findAll()).isEmpty();
+	}
+
+	/**
+	 * 지울 계정은 Access Token 의 {@code sub} 가 정한다 — 본문의 토큰이 다른 계정의 저장값과
+	 * 같아도 그 계정의 행을 지우지 않는다 (sp-docs/requirements/member.md §6.4).
+	 */
+	@Test
+	@DisplayName("로그아웃 — A 의 Access Token 에 본문이 B 의 저장된 토큰이면 204 이고 B 의 행이 그대로다")
+	void 다른_계정의_토큰으로_로그아웃() throws Exception {
+		계정을_만든다("logout-a@example.com");
+		Account b = 계정을_만든다("logout-b@example.com");
+		IssuedTokens a로그인 = 로그인한다("logout-a@example.com");
+		IssuedTokens b로그인 = 로그인한다("logout-b@example.com");
+
+		this.mockMvc.perform(logout(a로그인.accessToken(), b로그인.refreshToken()))
+				.andExpect(status().isNoContent());
+
+		assertThat(this.refreshTokenRepository.findByAccountId(b.getId()))
+				.get()
+				.extracting(RefreshToken::getToken)
+				.isEqualTo(b로그인.refreshToken());
+		assertThat(this.refreshTokenRepository.findAll()).hasSize(2);
+	}
+
+	/**
+	 * 늦게 도착한 옛 세션의 로그아웃이 새 세션을 지우지 않는다 (plan D-17 의 결함 2).
+	 *
+	 * <p>세션 A 의 토큰은 과거 시각으로 서명해 심는다 — 같은 초에 로그인을 두 번 하면 두 토큰의
+	 * 문자열이 같아 세션을 가를 수 없다 (sp-docs/requirements/member.md §6.2).
+	 */
+	@Test
+	@DisplayName("로그인 A → 같은 계정 로그인 B → A 의 로그아웃이 늦게 도착하면 204 이고 B 의 행이 남아 재발급이 된다")
+	void 늦은_로그아웃은_새_세션을_지우지_않는다() throws Exception {
+		Account account = 계정을_만든다("logout-late@example.com");
+		Instant a발급 = Instant.now().minusSeconds(10);
+		String a토큰 = 저장된_세션을_만든다(account);
+		String a액세스 = TestTokens.signed(this.jwtEncoder, account.getId(), Role.USER, a발급,
+				Duration.ofSeconds(ACCESS_TOKEN_SECONDS));
+		IssuedTokens b로그인 = 로그인한다("logout-late@example.com");
+
+		this.mockMvc.perform(logout(a액세스, a토큰))
+				.andExpect(status().isNoContent());
+
+		assertThat(this.refreshTokenRepository.findAll())
+				.singleElement()
+				.extracting(RefreshToken::getToken)
+				.isEqualTo(b로그인.refreshToken());
+		this.mockMvc.perform(reissue(b로그인.refreshToken()))
+				.andExpect(status().isOk());
 	}
 
 	/**
@@ -328,12 +508,12 @@ class AuthControllerTest {
 				.andExpect(jsonPath("$.error.code").value("A001"))
 				.andExpect(jsonPath("$.error.message").value("인증이 필요합니다."));
 
-		this.mockMvc.perform(logout(TestTokens.tamperSignature(로그인.accessToken())))
+		this.mockMvc.perform(logout(TestTokens.tamperSignature(로그인.accessToken()), 로그인.refreshToken()))
 				.andExpect(status().isUnauthorized())
 				.andExpect(jsonPath("$.error.code").value("A002"))
 				.andExpect(jsonPath("$.error.message").value(INVALID_TOKEN_MESSAGE));
 
-		this.mockMvc.perform(logout(만료된_토큰(accountId)))
+		this.mockMvc.perform(logout(만료된_토큰(accountId), 로그인.refreshToken()))
 				.andExpect(status().isUnauthorized())
 				.andExpect(jsonPath("$.error.code").value("A003"))
 				.andExpect(jsonPath("$.error.message").value(EXPIRED_TOKEN_MESSAGE));
@@ -372,9 +552,52 @@ class AuthControllerTest {
 				.content("{\"refreshToken\": \"" + refreshToken + "\"}");
 	}
 
-	private static MockHttpServletRequestBuilder logout(String accessToken) {
+	private static MockHttpServletRequestBuilder logout(String accessToken, String refreshToken) {
+		return logoutWithBody(accessToken, "{\"refreshToken\": \"" + refreshToken + "\"}");
+	}
+
+	/** 로그아웃 본문은 로그아웃을 시작한 세션의 Refresh Token 이다 (sp-docs/api-contract.md §9.5). */
+	private static MockHttpServletRequestBuilder logoutWithBody(String accessToken, String json) {
 		return post("/api/v1/auth/logout")
-				.header(HttpHeaders.AUTHORIZATION, "Bearer " + accessToken);
+				.header(HttpHeaders.AUTHORIZATION, "Bearer " + accessToken)
+				.contentType(MediaType.APPLICATION_JSON)
+				.characterEncoding(StandardCharsets.UTF_8)
+				.content(json);
+	}
+
+	/**
+	 * 10초 전에 발급된 것으로 서명한 Refresh Token 으로 그 계정의 세션을 심는다. 재발급이 돌려주는
+	 * 토큰과 문자열이 달라야 회전 전후를 가를 수 있다 (sp-docs/requirements/member.md §6.2).
+	 */
+	private String 저장된_세션을_만든다(Account account) {
+		String token = TestTokens.signed(this.jwtEncoder, account.getId(), Role.USER,
+				Instant.now().minusSeconds(10), Duration.ofDays(14));
+		세션을_심는다(account, token, null);
+		return token;
+	}
+
+	/**
+	 * 그 계정의 행을 {@code token} 으로 바꿔 심는다. {@code previousToken} 이 있으면 그 값으로 행을
+	 * 만든 뒤 조건부 UPDATE({@code rotate}) 로 회전시켜 직전 토큰이 되게 한다 — 직전 토큰을 쓰는
+	 * 경로가 운영과 같다.
+	 */
+	private void 세션을_심는다(Account account, String token, String previousToken) {
+		this.refreshTokenRepository.findByAccountId(account.getId())
+				.ifPresent(this.refreshTokenRepository::delete);
+		this.refreshTokenRepository.flush();
+
+		LocalDateTime expiresAt = LocalDateTime.now().plusDays(14);
+		this.refreshTokenRepository.saveAndFlush(RefreshToken.builder()
+				.accountId(account.getId())
+				.token(previousToken != null ? previousToken : token)
+				.expiresAt(expiresAt)
+				.build());
+		if (previousToken != null) {
+			Integer rotated = this.transactionTemplate.execute(status -> this.refreshTokenRepository.rotate(
+					account.getId(), previousToken, token, expiresAt,
+					LocalDateTime.now().truncatedTo(ChronoUnit.MICROS)));
+			assertThat(rotated).isOne();
+		}
 	}
 
 	/** 로그인 응답에서 꺼낸 두 토큰. */

@@ -79,6 +79,9 @@ class RefreshTokenRepositoryTest {
 	private static final LocalDateTime OLD_EXPIRES_AT = LocalDateTime.of(2026, 10, 13, 9, 0, 0);
 	private static final LocalDateTime NEW_EXPIRES_AT = LocalDateTime.of(2026, 10, 20, 9, 0, 0);
 
+	/** 마이크로초까지 있는 회전 시각. {@code DATETIME(6)} 이 그 자리까지 담는지 함께 본다. */
+	private static final LocalDateTime ROTATED_AT = LocalDateTime.of(2026, 10, 6, 9, 0, 0, 123_456_000);
+
 	@DynamicPropertySource
 	static void jwtPrivateKey(DynamicPropertyRegistry registry) {
 		TestRsaKeys.registerPrivateKeyLocation(registry);
@@ -171,14 +174,14 @@ class RefreshTokenRepositoryTest {
 	 * 길이를 비교하지 않으므로</b> 둘이 어긋나도 기동은 성공한다.
 	 */
 	@Test
-	@DisplayName("Flyway 가 V1~V4 를 적용했고 엔티티의 length 가 실제 컬럼 폭과 같다")
+	@DisplayName("Flyway 가 V1~V5 를 적용했고 엔티티의 length 가 실제 컬럼 폭과 같다")
 	void 마이그레이션과_엔티티가_일치한다() throws Exception {
 		List<?> applied = em.getEntityManager()
 				.createNativeQuery("select version from flyway_schema_history "
 						+ "where success = true order by installed_rank")
 				.getResultList();
 
-		assertThat(applied).map(String::valueOf).contains("1", "2", "3", "4");
+		assertThat(applied).map(String::valueOf).contains("1", "2", "3", "4", "5");
 
 		Number width = (Number) em.getEntityManager()
 				.createNativeQuery("select character_maximum_length from information_schema.columns "
@@ -190,6 +193,30 @@ class RefreshTokenRepositoryTest {
 		assertThat(declared)
 				.as("엔티티와 마이그레이션이 어긋나도 validate 는 통과한다. 여기서 막는다")
 				.isEqualTo(width.intValue());
+	}
+
+	/**
+	 * {@code V5} 가 더한 두 컬럼 (sp-docs/domain-model.md §2.2). <b>H2 에서 본 것이다</b> — 실 MySQL
+	 * 의 문자셋은 H2 가 보여주지 않으므로 로컬 기동 뒤 {@code information_schema} 로 따로 본다.
+	 */
+	@Test
+	@DisplayName("V5 의 previous_token 은 token 과 같은 폭이고 rotated_at 은 마이크로초 정밀도이며 둘 다 NULL 을 허용한다")
+	void V5_컬럼() throws Exception {
+		Object[] previous = (Object[]) em.getEntityManager()
+				.createNativeQuery("select character_maximum_length, is_nullable from information_schema.columns "
+						+ "where table_name = 'refresh_token' and column_name = 'previous_token'")
+				.getSingleResult();
+		assertThat(((Number) previous[0]).intValue()).isEqualTo(COLUMN_LENGTH);
+		assertThat(previous[1]).isEqualTo("YES");
+		assertThat(RefreshToken.class.getDeclaredField("previousToken").getAnnotation(Column.class).length())
+				.isEqualTo(COLUMN_LENGTH);
+
+		Object[] rotated = (Object[]) em.getEntityManager()
+				.createNativeQuery("select datetime_precision, is_nullable from information_schema.columns "
+						+ "where table_name = 'refresh_token' and column_name = 'rotated_at'")
+				.getSingleResult();
+		assertThat(((Number) rotated[0]).intValue()).isEqualTo(6);
+		assertThat(rotated[1]).isEqualTo("YES");
 	}
 
 	@Test
@@ -222,12 +249,16 @@ class RefreshTokenRepositoryTest {
 		Long accountId = persistAccount("rotate@example.com");
 		refreshTokenRepository.saveAndFlush(refreshToken(accountId, OLD_TOKEN, OLD_EXPIRES_AT));
 
-		int affected = refreshTokenRepository.rotate(accountId, OLD_TOKEN, NEW_TOKEN, NEW_EXPIRES_AT);
+		int affected = refreshTokenRepository.rotate(accountId, OLD_TOKEN, NEW_TOKEN, NEW_EXPIRES_AT, ROTATED_AT);
 
 		assertThat(affected).isOne();
 		RefreshToken found = refreshTokenRepository.findByAccountId(accountId).orElseThrow();
 		assertThat(found.getToken()).isEqualTo(NEW_TOKEN);
 		assertThat(found.getExpiresAt()).isEqualTo(NEW_EXPIRES_AT);
+		assertThat(found.getPreviousToken())
+				.as("같은 UPDATE 가 직전 토큰에 제시된 토큰을 쓴다 (sp-docs/requirements/member.md §6.3)")
+				.isEqualTo(OLD_TOKEN);
+		assertThat(found.getRotatedAt()).isEqualTo(ROTATED_AT);
 	}
 
 	@Test
@@ -244,7 +275,7 @@ class RefreshTokenRepositoryTest {
 		em.clear();
 
 		// R2) 재발급이 옛 토큰으로 회전을 시도한다
-		int affected = refreshTokenRepository.rotate(accountId, OLD_TOKEN, NEW_TOKEN, NEW_EXPIRES_AT);
+		int affected = refreshTokenRepository.rotate(accountId, OLD_TOKEN, NEW_TOKEN, NEW_EXPIRES_AT, ROTATED_AT);
 
 		assertThat(affected)
 				.as("0행이어야 실패로 처리된다. 1행이면 지운 행이 되살아났다는 뜻이다")
@@ -262,12 +293,14 @@ class RefreshTokenRepositoryTest {
 		refreshTokenRepository.saveAndFlush(refreshToken(accountId, OLD_TOKEN, OLD_EXPIRES_AT));
 		em.clear();
 
-		int affected = refreshTokenRepository.rotate(accountId, OTHERS_TOKEN, NEW_TOKEN, NEW_EXPIRES_AT);
+		int affected = refreshTokenRepository.rotate(accountId, OTHERS_TOKEN, NEW_TOKEN, NEW_EXPIRES_AT, ROTATED_AT);
 
 		assertThat(affected).isZero();
 		RefreshToken found = refreshTokenRepository.findByAccountId(accountId).orElseThrow();
 		assertThat(found.getToken()).isEqualTo(OLD_TOKEN);
 		assertThat(found.getExpiresAt()).isEqualTo(OLD_EXPIRES_AT);
+		assertThat(found.getPreviousToken()).isNull();
+		assertThat(found.getRotatedAt()).isNull();
 	}
 
 	/**
@@ -277,7 +310,7 @@ class RefreshTokenRepositoryTest {
 	 * 같은 계정이 같은 초에 두 번 발급받으면 토큰 문자열이 완전히 같다
 	 * (sp-docs/requirements/member.md §6.2). 그때 재발급은 <b>저장값과 같은 값으로</b> 회전한다.
 	 *
-	 * <p><b>"0행이면 실패" 판정이 드라이버가 found rows 를 돌려주는 데 의존한다</b> (정본 §6.1 의
+	 * <p><b>"0행이면 회전 실패" 판정이 드라이버가 found rows 를 돌려주는 데 의존한다</b> (정본 §6.1 의
 	 * 측정표). MySQL(Connector/J 기본)과 H2 는 값이 바뀌지 않아도 1을 돌려주므로 정당한 재발급이
 	 * 통과한다. {@code useAffectedRows=true} 를 JDBC URL 에 넣으면 <b>변경된</b> 행을 돌려주므로
 	 * 0행이 되어 이 재발급이 거부된다 — 그래서 그 플래그를 쓰지 않는다.
@@ -293,7 +326,7 @@ class RefreshTokenRepositoryTest {
 		refreshTokenRepository.saveAndFlush(refreshToken(accountId, OLD_TOKEN, OLD_EXPIRES_AT));
 		em.clear();
 
-		int affected = refreshTokenRepository.rotate(accountId, OLD_TOKEN, OLD_TOKEN, OLD_EXPIRES_AT);
+		int affected = refreshTokenRepository.rotate(accountId, OLD_TOKEN, OLD_TOKEN, OLD_EXPIRES_AT, ROTATED_AT);
 
 		assertThat(affected)
 				.as("0행이면 JDBC URL 에 useAffectedRows=true 가 들어온 것이다 "
@@ -321,6 +354,39 @@ class RefreshTokenRepositoryTest {
 				.as("useAffectedRows=true 는 변경된 행을 돌려주므로 값이 같은 회전이 0행이 되어 "
 						+ "정당한 재발급이 거부된다 (sp-docs/requirements/member.md §6.1)")
 				.doesNotContain("useAffectedRows");
+	}
+
+	/**
+	 * 로그아웃의 조건부 DELETE (sp-docs/requirements/member.md §6.4). 대조가 삭제의 조건이다 —
+	 * 그 계정의 행이고, 저장된 토큰이나 직전 토큰이 제시값과 같을 때만 지운다.
+	 */
+	@Test
+	@DisplayName("deleteSession 은 그 계정의 행을 저장된 토큰이나 직전 토큰이 같을 때만 지운다")
+	void 세션_삭제() {
+		Long accountId = persistAccount("session@example.com");
+		Long othersId = persistAccount("session-others@example.com");
+		refreshTokenRepository.saveAndFlush(refreshToken(accountId, OLD_TOKEN, OLD_EXPIRES_AT));
+		refreshTokenRepository.saveAndFlush(refreshToken(othersId, OTHERS_TOKEN, OLD_EXPIRES_AT));
+		refreshTokenRepository.rotate(accountId, OLD_TOKEN, NEW_TOKEN, NEW_EXPIRES_AT, ROTATED_AT);
+		em.clear();
+
+		assertThat(refreshTokenRepository.deleteSession(accountId, OTHERS_TOKEN))
+				.as("다른 계정의 저장값과 같아도 이 계정의 행과 맞지 않으면 지우지 않는다")
+				.isZero();
+		assertThat(refreshTokenRepository.deleteSession(othersId, NEW_TOKEN))
+				.as("다른 계정의 sub 로는 이 계정의 행을 지우지 않는다")
+				.isZero();
+		assertThat(refreshTokenRepository.count()).isEqualTo(2);
+
+		assertThat(refreshTokenRepository.deleteSession(accountId, OLD_TOKEN))
+				.as("직전 토큰이 맞으면 지운다")
+				.isOne();
+		assertThat(refreshTokenRepository.findByAccountId(accountId)).isEmpty();
+
+		assertThat(refreshTokenRepository.deleteSession(othersId, OTHERS_TOKEN))
+				.as("저장된 토큰이 맞으면 지운다")
+				.isOne();
+		assertThat(refreshTokenRepository.count()).isZero();
 	}
 
 	@Test

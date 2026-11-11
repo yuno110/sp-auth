@@ -1,12 +1,14 @@
 package com.example.auth.auth.controller;
 
 import com.example.auth.auth.dto.LoginRequest;
+import com.example.auth.auth.dto.LogoutRequest;
 import com.example.auth.auth.dto.ReissueRequest;
 import com.example.auth.auth.dto.TokenResponse;
 import com.example.auth.auth.service.AuthService;
 import com.example.auth.global.common.ApiResponse;
 import com.example.auth.global.security.CurrentAccount;
 import com.example.auth.global.security.LoginAccount;
+import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.HttpStatus;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -55,15 +57,17 @@ public class AuthController {
 	}
 
 	/**
-	 * 로그아웃. <b>204, 본문 없음</b> (sp-docs/api-contract.md §2.1).
+	 * 로그아웃. <b>204, 본문 없음</b> (sp-docs/api-contract.md §2.1 §9.5).
 	 *
-	 * <p><b>인증이 필요하고 본문을 받지 않는다.</b> 지울 대상은 검증된 Access Token 의
-	 * {@code sub} 가 정한다 — 본문의 식별자를 신뢰하지 않는다 (sp-docs/security.md §4).
+	 * <p><b>인증이 필요하고 본문으로 {@code refreshToken} 을 받는다.</b> 지울 계정은 검증된 Access
+	 * Token 의 {@code sub} 가 정하고, 그 계정의 행 중 본문의 토큰과 맞는 세션만 지운다
+	 * (sp-docs/requirements/member.md §6.4). 맞지 않아도 204 다. {@code refreshToken} 이 없거나
+	 * 비면 400 {@code C001} 이다({@link LogoutRequest}).
 	 */
 	@PostMapping("/logout")
 	@ResponseStatus(HttpStatus.NO_CONTENT)
-	public void logout(@CurrentAccount LoginAccount loginAccount) {
-		this.authService.logout(loginAccount.accountId());
+	public void logout(@CurrentAccount LoginAccount loginAccount, @Valid @RequestBody LogoutRequest request) {
+		this.authService.logout(loginAccount.accountId(), request);
 	}
 
 }
