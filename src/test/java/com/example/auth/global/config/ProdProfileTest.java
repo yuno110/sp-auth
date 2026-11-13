@@ -14,6 +14,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.core.env.Environment;
+import org.springframework.mail.javamail.JavaMailSenderImpl;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
@@ -34,8 +35,15 @@ import org.springframework.test.web.servlet.MockMvc;
  * 그때 {@code test} 의 H2 가 이겨 이 테스트가 실제 DB 로 끌려가지 않는다.
  *
  * <p>운영 MySQL·실제 개인키에 의존하지 않으므로 다른 PC·CI 에서도 돈다.
+ *
+ * <p><b>SMTP 계정을 시험용 값으로 준다.</b> 운영 프로파일은 {@code spring.mail.username}·{@code password}
+ * 가 둘 다 있어야 뜨고(메일 기동 가드, sp-docs/tech-stack.md §4.7), {@code application-test.yml} 은 둘을
+ * 로컬 Mailpit 과 같은 빈 값으로 둔다. 이 컨텍스트는 운영의 배선 그대로 SMTP 발송기를 쓰지만 아무것도
+ * 보내지 않는다 — SMTP 에 접속하지 않는다.
  */
-@SpringBootTest
+@SpringBootTest(properties = {
+		"spring.mail.username=prod-profile-test-user",
+		"spring.mail.password=prod-profile-test-password"})
 @AutoConfigureMockMvc
 @ActiveProfiles({"prod", "test"})
 class ProdProfileTest {
@@ -51,6 +59,9 @@ class ProdProfileTest {
 
 	@Autowired
 	private Environment environment;
+
+	@Autowired
+	private JavaMailSenderImpl javaMailSender;
 
 	/**
 	 * {@code /swagger-ui.html} 과 {@code /v3/api-docs} 를 함께 본다. UI 만 꺼도 후자가 열려
@@ -88,6 +99,18 @@ class ProdProfileTest {
 		assertThat(this.environment.getProperty("logging.level.org.hibernate.orm.jdbc.bind"))
 				.as("바인드 파라미터는 TRACE 로 남는다. 비밀번호가 그대로 실린다")
 				.isEqualTo("warn");
+	}
+
+	/**
+	 * 운영은 SMTP 에 암호화 연결을 요구한다 (sp-docs/tech-stack.md §4.7 의 「암호화 연결」 줄,
+	 * sp-docs/security.md §12). 설정 파일이 아니라 JavaMail 에 실제로 넘어가는 속성을 본다.
+	 */
+	@Test
+	@DisplayName("prod 프로파일의 메일 속성이 STARTTLS 를 필수로 요구한다")
+	void prod_에서_SMTP_암호화_연결을_요구한다() {
+		assertThat(this.javaMailSender.getJavaMailProperties())
+				.containsEntry("mail.smtp.starttls.enable", "true")
+				.containsEntry("mail.smtp.starttls.required", "true");
 	}
 
 }

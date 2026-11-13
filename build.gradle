@@ -30,6 +30,10 @@ dependencies {
 	implementation 'org.springframework.security:spring-security-oauth2-jose'
 	implementation 'org.springframework.boot:spring-boot-starter-oauth2-resource-server'
 
+	// 메일 — 이메일 인증·비밀번호 재설정 메일을 SMTP 로 보낸다 (sp-docs/tech-stack.md §3.2 §4.7).
+	// 버전은 Boot BOM 이 정한다
+	implementation 'org.springframework.boot:spring-boot-starter-mail'
+
 	// Lombok (annotationProcessor 선언은 QueryDSL보다 먼저)
 	compileOnly 'org.projectlombok:lombok'
 	annotationProcessor 'org.projectlombok:lombok'

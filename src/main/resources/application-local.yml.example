@@ -1,6 +1,8 @@
 # 이 파일을 application-local.yml 로 복사한 뒤 실제 값을 채운다.
 #   cp application-local.yml.example application-local.yml
 # application-local.yml 은 .gitignore 에 있어 커밋되지 않는다.
+# 이미 application-local.yml 이 있으면 템플릿에 새로 생긴 줄을 옮긴다 — 메일 설정(spring.mail.*, mail.*)이
+# 없으면 기동 가드에 걸려 local 로 뜨지 않는다.
 
 spring:
   datasource:
@@ -20,6 +22,18 @@ spring:
       hibernate:
         format_sql: true
 
+  # 메일 — 로컬의 SMTP 는 Mailpit 이다 (sp-docs/tech-stack.md §4.7.1). Docker 없이 실행 파일 하나다.
+  #   버전: v1.33.1. 버전은 작업 항목이 고정한다(§4.7.1) — AU-14 가 2026-11-13 의 최신 릴리스로 정했다
+  #   받기: https://github.com/axllent/mailpit/releases/tag/v1.33.1 (Windows 는 mailpit-windows-amd64.zip)
+  #   실행: mailpit — SMTP localhost:1025, 웹 화면·API localhost:8025 (Mailpit 의 기본값)
+  # Mailpit 은 인증을 받지 않으므로 username·password 를 둘 다 빈 값으로 둔다. 하나만 채우면 기동이
+  # 실패한다. Mailpit 이 꺼져 있으면 가입은 201 이지만 메일이 나가지 않고 발송 실패가 WARN 로그로만 남는다
+  mail:
+    host: localhost
+    port: 1025
+    username:
+    password:
+
 # 개인키는 저장소 밖에 둔다. RSA 키 페어 생성은 sp-docs/tech-stack.md §4.2.
 jwt:
   private-key-location: file:${user.home}/keys/sp/private.pem
@@ -28,6 +42,12 @@ jwt:
 # * 는 쓸 수 없다 — 기동이 실패한다. 여러 개는 쉼표로 구분한다
 cors:
   allowed-origins: http://localhost:3000
+
+# 메일의 보내는 주소와 링크의 기준 주소(화면의 오리진 — sp-frontend 의 개발 서버).
+# 비었거나 http·https 의 절대 URL 이 아니면 기동이 실패한다 (sp-docs/tech-stack.md §4.7)
+mail:
+  from: no-reply@localhost
+  frontend-base-url: http://localhost:3000
 
 logging:
   level:

@@ -1,0 +1,2 @@
+# 메일 설정의 기동 가드 — 컨텍스트를 만들기 전에 돈다 (com.example.auth.mail.MailStartupGuard)
+org.springframework.boot.env.EnvironmentPostProcessor=com.example.auth.mail.MailStartupGuard

@@ -106,7 +106,20 @@ cp src/main/resources/application-local.yml.example src/main/resources/applicati
 # 파일을 열어 MySQL 비밀번호 · adminPasswordHash · 개인키 경로를 채운다
 ```
 
-### 5. 실행
+메일 설정(`spring.mail.*`, `mail.*`)은 템플릿의 Mailpit 값을 그대로 쓴다. **이미 `application-local.yml`이 있으면 템플릿에서 그 줄을 옮긴다** — 메일 설정이 없으면 기동 가드에 걸려 `local`로 뜨지 않는다 (`sp-docs/tech-stack.md` §4.7).
+
+### 5. Mailpit — 로컬의 SMTP
+
+로컬은 Mailpit으로 메일을 받는다 (`sp-docs/tech-stack.md` §4.7.1). **Docker 없이 실행 파일 하나다.** 버전은 **v1.33.1**로 고정한다 — 템플릿(`application-local.yml.example`)의 주석과 같다.
+
+1. https://github.com/axllent/mailpit/releases/tag/v1.33.1 에서 운영체제에 맞는 파일을 받아 푼다 (Windows는 `mailpit-windows-amd64.zip`)
+2. 인자 없이 실행한다 — SMTP `localhost:1025`, 웹 화면·API `localhost:8025` (Mailpit의 기본값)
+
+받은 메일은 http://localhost:8025 에서 본다. 인증을 받지 않으므로 `application-local.yml`의 `spring.mail.username`·`password`는 둘 다 빈 값이다.
+
+**Mailpit이 꺼져 있으면 가입은 201이지만 메일이 나가지 않는다** — 발송 실패가 WARN 로그로만 남는다. 로컬에서 가입한 계정이 로그인되지 않으면 Mailpit부터 본다.
+
+### 6. 실행
 
 ```bash
 ./gradlew bootRun --args='--spring.profiles.active=local'
@@ -126,10 +139,18 @@ cp src/main/resources/application-local.yml.example src/main/resources/applicati
 | `JWT_PRIVATE_KEY_LOCATION` | **없음** | 개인키 **경로** (`file:`·`classpath:`). PEM 본문이 아니다 |
 | `ADMIN_PASSWORD_HASH` | **없음** | ADMIN seed의 BCrypt 해시. 없으면 마이그레이션 전에 기동이 실패한다 |
 | `CORS_ALLOWED_ORIGINS` | **없음** | 허용 오리진 목록(쉼표 구분). 비었거나 `*`가 섞이면 기동 실패 |
+| `MAIL_HOST` | **없음** | SMTP 서버. 비었거나 해석되지 않으면 기동 실패. 로컬은 Mailpit `localhost` |
+| `MAIL_PORT` | **없음** | SMTP 포트. 규칙은 `MAIL_HOST`와 같다. 로컬은 Mailpit `1025` |
+| `MAIL_USERNAME` | **없음** | SMTP 계정. **`prod`는 `MAIL_PASSWORD`와 둘 다 있어야 한다.** 하나만 있으면 어느 프로파일이든 기동 실패. 로컬 Mailpit은 둘 다 빈 값 |
+| `MAIL_PASSWORD` | **없음** | SMTP 비밀번호. 규칙은 `MAIL_USERNAME`과 같다 |
+| `MAIL_FROM` | **없음** | 보내는 주소. 비었거나 해석되지 않으면 기동 실패 |
+| `FRONTEND_BASE_URL` | **없음** | 메일 링크의 기준 주소(화면의 오리진). `http`·`https`의 절대 URL이 아니면 기동 실패 |
 | `DB_URL` | `jdbc:mysql://localhost:3306/sp_auth?serverTimezone=Asia/Seoul&characterEncoding=UTF-8` | |
 | `DB_USERNAME` | `root` | |
 
 **비밀값과 정책값에는 기본값을 두지 않는다.** 임의 기본값을 두면 그 값이 정해진 정책인지 임시값인지 구분할 수 없고 운영에 그대로 나간다. 없으면 기동이 실패하는 것이 의도된 동작이다.
+
+메일 값은 `MailStartupGuard`가 기동 시점에 본다. `MAIL_HOST`·`MAIL_PORT`·`MAIL_FROM`·`FRONTEND_BASE_URL`은 해석되지 않은 `${…}`도 빈 값도 통과하지 않고, `MAIL_USERNAME`·`MAIL_PASSWORD`는 해석되지 않은 `${…}`가 통과하지 않는다. `prod`는 SMTP에 STARTTLS를 필수로 요구한다(`application-prod.yml`). SMTP 타임아웃(연결 5초·읽기 10초·쓰기 10초)과 발송 대기열 상한(`mail.executor.queue-capacity`, 100)은 `application.yml`에 값으로 적혀 있다 (`sp-docs/tech-stack.md` §4.7).
 
 시간대는 실행 환경이 정한다. 환경변수로 넘길 것은 없고, JVM이 KST가 아니어도 DB 경계는 고정된다 (`sp-docs/tech-stack.md` §6.2).
 

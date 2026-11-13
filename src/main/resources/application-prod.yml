@@ -1,6 +1,6 @@
 # 운영 프로파일. application.yml 과 달라야 하는 것만 적는다.
 #
-# 비밀 값을 이 파일에 적지 않는다. DB 비밀번호·개인키 경로·ADMIN seed 해시·CORS 오리진은
+# 비밀 값을 이 파일에 적지 않는다. DB 비밀번호·개인키 경로·ADMIN seed 해시·CORS 오리진·메일 설정은
 # application.yml 이 환경변수로 받고 기본값을 두지 않으므로, 없으면 기동이 실패한다
 # (sp-docs/tech-stack.md §4.3). 이 파일은 커밋되므로 값을 적으면 이력에 남는다.
 #
@@ -14,6 +14,14 @@ spring:
     properties:
       hibernate:
         format_sql: false
+  # 운영은 SMTP 에 암호화 연결을 요구한다 (sp-docs/tech-stack.md §4.7 의 「암호화 연결」 줄,
+  # sp-docs/security.md §12). STARTTLS 를 필수로 한다 — 서버가 STARTTLS 를 받지 않으면 평문으로
+  # 보내지 않고 발송이 실패한다. 로컬 Mailpit 은 평문이고 이 파일을 읽지 않는다.
+  # 계정(MAIL_USERNAME·MAIL_PASSWORD)은 운영에서 둘 다 있어야 한다 — 기동 가드가 본다
+  mail:
+    properties:
+      mail.smtp.starttls.enable: true
+      mail.smtp.starttls.required: true
 
 # API 문서는 운영에서 비활성화한다 (sp-docs/nfr.md §8, sp-docs/security.md §5.1.1).
 #
