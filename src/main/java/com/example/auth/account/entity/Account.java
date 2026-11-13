@@ -9,6 +9,9 @@ import jakarta.persistence.GeneratedValue;
 import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
 import jakarta.persistence.Table;
+import java.time.Clock;
+import java.time.LocalDateTime;
+import java.time.temporal.ChronoUnit;
 import java.util.Objects;
 import lombok.AccessLevel;
 import lombok.Builder;
@@ -51,6 +54,16 @@ public class Account extends BaseTimeEntity {
 	@Column(nullable = false)
 	private boolean deleted;
 
+	/**
+	 * 이메일 인증 시각. <b>NULL 이면 미인증이다</b> (sp-docs/domain-model.md §2.1).
+	 *
+	 * <p>감사 시각이 아니다 — {@code @LastModifiedDate} 와 무관하고 {@link #markEmailVerified(Clock)}
+	 * 가 채운다. 컬럼을 더한 마이그레이션({@code V6__add_account_email_verified_at.sql})이 그때의 행을
+	 * {@code created_at} 으로 채웠고, 그 뒤에 만든 계정은 NULL 로 시작한다 — 빌더가 이 값을 받지 않는다.
+	 */
+	@Column(name = "email_verified_at")
+	private LocalDateTime emailVerifiedAt;
+
 	@Builder
 	private Account(String email, String password, Role role) {
 		this.email = email;
@@ -73,6 +86,22 @@ public class Account extends BaseTimeEntity {
 	/** 탈퇴. 행은 남긴다 (Soft Delete). */
 	public void withdraw() {
 		this.deleted = true;
+	}
+
+	/**
+	 * 이메일 인증을 표시한다. 인증 확인과 비밀번호 재설정 확인이 채우는 값이다
+	 * (sp-docs/domain-model.md §2.1, sp-docs/requirements/member.md §11).
+	 *
+	 * <p><b>이미 채워져 있으면 덮지 않는다</b> — 처음 인증한 시각이 남는다. 인증을 되돌리는 메서드는
+	 * 두지 않는다 — 정본에 인증을 취소하는 기능이 없다.
+	 *
+	 * <p>앱 시계의 값을 <b>초로 잘라</b> 넣는다. 컬럼이 {@code DATETIME} 이라 MySQL 이 소수부를
+	 * 반올림하므로, 자르지 않으면 엔터티의 값과 저장값이 달라진다 (sp-docs/domain-model.md §1.1).
+	 */
+	public void markEmailVerified(Clock clock) {
+		if (this.emailVerifiedAt == null) {
+			this.emailVerifiedAt = LocalDateTime.now(clock).truncatedTo(ChronoUnit.SECONDS);
+		}
 	}
 
 	/**

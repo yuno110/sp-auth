@@ -9,6 +9,8 @@ import com.example.auth.account.support.AccountReader;
 import com.example.auth.global.config.JpaConfig;
 import com.example.auth.global.error.BusinessException;
 import com.example.auth.global.error.ErrorCode;
+import com.example.auth.support.MutableClock;
+import java.time.LocalDateTime;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -20,7 +22,8 @@ import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.test.context.ActiveProfiles;
 
 /**
- * sp-docs/plan/phase1.md §4 AU-03 의 "검증" 표 중 account 쪽을 테스트로 옮긴 것이다.
+ * sp-docs/plan/phase1.md §4 AU-03 의 "검증" 표 중 account 쪽을 테스트로 옮긴 것이다. 이메일 인증
+ * 표시의 테스트는 sp-docs/plan/phase2-auth-member.md §3 AU-12 의 "검증" 표다.
  *
  * <p>{@code replace = NONE} 이 필수다. {@code @DataJpaTest} 의 기본값은 DataSource 를
  * {@code jdbc:h2:mem:<uuid>} 로 교체해 {@code MODE=MySQL} 을 날려버린다
@@ -209,6 +212,66 @@ class AccountRepositoryTest {
 		assertThat(accountRepository.existsByEmail("find@example.com")).isTrue();
 		assertThat(accountRepository.existsByEmail("missing@example.com")).isFalse();
 		assertThat(accountRepository.findByEmail("find@example.com")).isPresent();
+	}
+
+	@Test
+	@DisplayName("마이그레이션 뒤에 만든 계정은 email_verified_at 이 NULL 이다")
+	void 새_계정은_미인증이다() {
+		Long id = accountRepository.saveAndFlush(Account.builder()
+				.email("unverified@example.com")
+				.password(RAW_ENCODED_PASSWORD)
+				.build()).getId();
+		em.clear();
+
+		assertThat(accountRepository.findById(id).orElseThrow().getEmailVerifiedAt()).isNull();
+	}
+
+	@Test
+	@DisplayName("인증 표시를 두 번 하면 처음 시각이 남는다")
+	void 인증_표시는_덮지_않는다() {
+		Long id = accountRepository.saveAndFlush(Account.builder()
+				.email("verify-twice@example.com")
+				.password(RAW_ENCODED_PASSWORD)
+				.build()).getId();
+		em.clear();
+		MutableClock clock = new MutableClock();
+		LocalDateTime first = LocalDateTime.of(2026, 11, 13, 10, 0, 0);
+
+		clock.set(first);
+		accountRepository.findById(id).orElseThrow().markEmailVerified(clock);
+		em.flush();
+		em.clear();
+		clock.set(first.plusHours(1));
+		accountRepository.findById(id).orElseThrow().markEmailVerified(clock);
+		em.flush();
+		em.clear();
+
+		assertThat(accountRepository.findById(id).orElseThrow().getEmailVerifiedAt()).isEqualTo(first);
+	}
+
+	/**
+	 * 컬럼이 {@code DATETIME} 이라 MySQL 은 소수부를 반올림하고 H2 는 남긴다
+	 * (sp-docs/domain-model.md §1.1). 쓰는 쪽이 초로 자르지 않으면 이 H2 테스트에서 소수부가 남는다.
+	 */
+	@Test
+	@DisplayName("소수부가 있는 시계로 쓴 email_verified_at 은 저장값에 소수부가 없다")
+	void 인증_시각은_초로_잘려_저장된다() {
+		Long id = accountRepository.saveAndFlush(Account.builder()
+				.email("verify-fraction@example.com")
+				.password(RAW_ENCODED_PASSWORD)
+				.build()).getId();
+		em.clear();
+		MutableClock clock = new MutableClock();
+		LocalDateTime verifiedAt = LocalDateTime.of(2026, 11, 13, 10, 0, 0);
+		clock.set(verifiedAt.withNano(700_000_000));
+
+		accountRepository.findById(id).orElseThrow().markEmailVerified(clock);
+		em.flush();
+		em.clear();
+
+		LocalDateTime stored = accountRepository.findById(id).orElseThrow().getEmailVerifiedAt();
+		assertThat(stored).isEqualTo(verifiedAt);
+		assertThat(stored.getNano()).isZero();
 	}
 
 	@Test

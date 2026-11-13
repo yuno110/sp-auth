@@ -100,6 +100,21 @@ class AdminSeedTest {
 	}
 
 	/**
+	 * {@code V6} 이 컬럼을 더하면서 그때의 행 전부를 {@code created_at} 으로 채운다 — ADMIN seed 의
+	 * 행도 포함된다 (sp-docs/domain-model.md §7, sp-docs/plan/phase2-auth-member.md §3 AU-12 의 검증 표).
+	 */
+	@Test
+	@DisplayName("마이그레이션 뒤 ADMIN seed 의 email_verified_at 이 그 행의 created_at 과 같다")
+	void seed_는_인증된_것으로_소급된다() {
+		Object[] row = (Object[]) this.em.getEntityManager()
+				.createNativeQuery("select email_verified_at, created_at from account where id = 1")
+				.getSingleResult();
+
+		assertThat(row[0]).as("NULL 이면 소급되지 않은 것이다").isNotNull();
+		assertThat(row[0]).isEqualTo(row[1]);
+	}
+
+	/**
 	 * <b>여기서 읽는 값은 커밋된 픽스처에서 왔으므로 그 모양을 되읽지 않는다.</b>
 	 * {@code application-test.yml} 이 준 값이 그대로 저장된 것이라, 형식을 단언하면 픽스처가
 	 * 자기 모양을 되읽는 순환이 되어 실질 정보가 없다 (sp-docs/requirements/member.md §10.2).
