@@ -13,7 +13,9 @@ import org.junit.jupiter.api.Test;
  * sp-docs/api-contract.md §8.1 §8.4 의 표를 그대로 옮긴 것과 enum 전체를 맞춘다.
  *
  * <p>집합 비교이므로 정본에 없는 코드가 하나라도 있으면 실패한다. `M002`·`M004`·`M005` 를
- * 다시 끌어오는 실수가 여기서 잡힌다 (§8.4 — 번호는 재사용하지 않는다).
+ * 다시 끌어오는 실수가 여기서 잡힌다 (§8.4 — 번호는 재사용하지 않는다). 같은 이유로 {@code C008}·
+ * {@code C009} 를 공통 코드가 아니라 auth 접두어로 더하는 실수도 잡힌다 (§8.1 이 두 코드를 공통으로
+ * 둔 이유를 적는다).
  */
 class ErrorCodeTest {
 
@@ -29,6 +31,8 @@ class ErrorCodeTest {
 		contract.put("C005", "500 서버 내부 오류가 발생했습니다.");
 		contract.put("C006", "415 지원하지 않는 미디어 타입입니다.");
 		contract.put("C007", "406 응답할 수 있는 형식이 없습니다.");
+		contract.put("C008", "413 요청 크기가 허용 한도를 넘었습니다.");
+		contract.put("C009", "429 요청이 너무 많습니다. 잠시 후 다시 시도해 주세요.");
 		contract.put("A001", "401 인증이 필요합니다.");
 		contract.put("A002", "401 유효하지 않은 토큰입니다.");
 		contract.put("A003", "401 만료된 토큰입니다.");
@@ -38,6 +42,9 @@ class ErrorCodeTest {
 		contract.put("AU002", "409 이미 사용 중인 이메일입니다.");
 		contract.put("AU003", "401 이메일 또는 비밀번호가 일치하지 않습니다.");
 		contract.put("AU004", "400 현재 비밀번호가 일치하지 않습니다.");
+		contract.put("AU005", "401 로그인 시도가 많아 잠시 로그인할 수 없습니다.");
+		contract.put("AU006", "403 이메일 인증이 필요합니다.");
+		contract.put("AU007", "400 링크가 유효하지 않거나 만료되었습니다.");
 
 		Map<String, String> implemented = Stream.of(ErrorCode.values())
 				.collect(Collectors.toMap(

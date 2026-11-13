@@ -6,6 +6,7 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
 import org.springframework.security.config.Customizer;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
@@ -70,8 +71,23 @@ public class SecurityConfig {
 						// ★ /accounts/me 를 /accounts 보다 먼저 선언한다. 먼저 선언된 규칙이
 						// 이기므로 순서를 바꾸면 내 계정이 무인증으로 열린다
 						.requestMatchers("/api/v1/accounts/me", "/api/v1/accounts/me/**").authenticated()
+						// 메서드를 붙인 그대로 둔다 — 그래야 아래 GET /accounts 가 인증 경로로 남는다
+						// (sp-docs/api-contract.md §2.4 의 SecurityConfig 문단)
 						.requestMatchers(HttpMethod.POST, "/api/v1/accounts").permitAll()
 						.requestMatchers(HttpMethod.GET, "/api/v1/accounts/check-email").permitAll()
+						// 이메일 인증과 비밀번호 재설정 (sp-docs/api-contract.md §2.4). 경로를 메서드와
+						// 함께 하나씩 연다. /accounts/** 같은 넓은 무인증 규칙을 두지 않는다 — 위의
+						// /accounts/me 보다 앞에 놓이면 내 계정이 무인증으로 열린다
+						.requestMatchers(HttpMethod.POST,
+								"/api/v1/accounts/email-verification",
+								"/api/v1/accounts/email-verification/confirm").permitAll()
+						.requestMatchers(HttpMethod.POST,
+								"/api/v1/accounts/password-reset",
+								"/api/v1/accounts/password-reset/confirm").permitAll()
+						// 계정 목록 (sp-docs/api-contract.md §2.5). ADMIN 판정은 Service 가 role 값으로
+						// 한다 (sp-docs/security.md §5.1) — 여기는 인증만 요구한다. 이 줄이 없어도
+						// anyRequest() 가 막지만 경로마다 규칙을 두는 방식을 따른다
+						.requestMatchers(HttpMethod.GET, "/api/v1/accounts").authenticated()
 
 						// --- 인증 (sp-docs/api-contract.md §2.1) ---
 						.requestMatchers(HttpMethod.POST, "/api/v1/auth/login", "/api/v1/auth/reissue")
@@ -137,6 +153,10 @@ public class SecurityConfig {
 				HttpMethod.GET.name(), HttpMethod.POST.name(),
 				HttpMethod.PATCH.name(), HttpMethod.DELETE.name()));
 		configuration.setAllowedHeaders(List.of("Authorization", "Content-Type"));
+		// 브라우저는 교차 출처 응답에서 단순 응답 헤더가 아닌 헤더를 스크립트에 숨긴다.
+		// Retry-After 가 그렇다 — 노출하지 않으면 화면이 429 를 받고도 언제 다시 할지 말할 수
+		// 없다 (sp-docs/security.md §1.1). 429 자체는 요청 수 제한이 만든다 (§10)
+		configuration.setExposedHeaders(List.of(HttpHeaders.RETRY_AFTER));
 		// 토큰은 Authorization 헤더로 오므로 쿠키를 허용할 이유가 없다
 		configuration.setAllowCredentials(false);
 

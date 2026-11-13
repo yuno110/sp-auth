@@ -17,6 +17,9 @@ import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.method.annotation.HandlerMethodValidationException;
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
+import org.springframework.web.multipart.MaxUploadSizeExceededException;
+import org.springframework.web.multipart.MultipartException;
+import org.springframework.web.multipart.support.MissingServletRequestPartException;
 import org.springframework.web.servlet.resource.NoResourceFoundException;
 
 /**
@@ -150,6 +153,50 @@ public class GlobalExceptionHandler {
 		return ResponseEntity.status(errorCode.getStatus())
 				.contentType(MediaType.APPLICATION_JSON)
 				.body(ApiResponse.failure(error));
+	}
+
+	/**
+	 * multipart 요청이 크기 한도를 넘었다.
+	 *
+	 * <p><b>413 {@code C008} 이고 {@code fieldErrors} 는 빈 배열이다</b> (sp-docs/conventions.md
+	 * §6.1). multipart 를 받지 않는 auth 에도 sp-docs/api-contract.md §8.1 의 {@code C008} 문단이
+	 * 이 핸들러를 요구한다 — 이 예외는 컨트롤러를 고르기 전, {@code DispatcherServlet} 이 요청을
+	 * multipart 로 해석하는 단계에서 나므로 경로를 가리지 않는다. 이 핸들러가 없을 때 실서버의
+	 * 응답은 마지막 그물의 <b>500 {@code C005} 와 ERROR 로그</b>였다 (AU-13 이 넣기 전에 쟀다).
+	 *
+	 * <p>{@link MultipartException} 의 하위 타입이다. 두 핸들러가 함께 있으면 더 구체적인 이쪽이
+	 * 고른다 — 상위 타입만 두면 크기 위반이 {@code C001} 이 된다 (§6.1).
+	 */
+	@ExceptionHandler(MaxUploadSizeExceededException.class)
+	public ResponseEntity<ApiResponse<Void>> handleMaxUploadSizeExceeded(MaxUploadSizeExceededException e) {
+		// 원인 메시지에 클라이언트가 붙인 파트 이름이 들어 있으므로 남기지 않는다
+		log.warn("multipart size limit exceeded");
+		return toResponse(ErrorCode.PAYLOAD_TOO_LARGE);
+	}
+
+	/**
+	 * multipart 를 해석하지 못했다 — 예: {@code Content-Type} 에 경계 선언이 없거나 본문이 파트
+	 * 중간에서 끝났다.
+	 *
+	 * <p><b>클라이언트 오류이므로 400 {@code C001} 이고 {@code fieldErrors} 는 빈 배열이다</b> —
+	 * 바인딩이 일어나지 않았다 (sp-docs/conventions.md §6.1). 크기 위반과 같은 자리에서 나므로
+	 * 이 핸들러가 없을 때의 실서버 응답도 같았다 — 마지막 그물의 500 {@code C005} 와 ERROR 로그
+	 * (AU-13 이 넣기 전에 쟀다).
+	 */
+	@ExceptionHandler(MultipartException.class)
+	public ResponseEntity<ApiResponse<Void>> handleMultipart(MultipartException e) {
+		log.warn("multipart request not parsable");
+		return toResponse(ErrorCode.INVALID_INPUT_VALUE);
+	}
+
+	/**
+	 * 필요한 파트가 없다. <b>400 {@code C001} 이고 {@code fieldErrors} 는 빈 배열이다</b>
+	 * (sp-docs/conventions.md §6.1). 같은 절의 multipart 표를 세 서비스가 똑같이 구현한다.
+	 */
+	@ExceptionHandler(MissingServletRequestPartException.class)
+	public ResponseEntity<ApiResponse<Void>> handleMissingServletRequestPart(MissingServletRequestPartException e) {
+		log.warn("missing request part: {}", e.getRequestPartName());
+		return toResponse(ErrorCode.INVALID_INPUT_VALUE);
 	}
 
 	/** 마지막 그물. 여기까지 온 것은 예상하지 못한 예외이므로 서버 로그에만 원인을 남긴다. */

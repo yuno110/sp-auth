@@ -18,12 +18,18 @@ import com.example.auth.auth.repository.RefreshTokenRepository;
 import com.example.auth.global.security.JwtTokenProvider;
 import com.example.auth.global.security.SecurityErrorResponder;
 import com.example.auth.support.TestRsaKeys;
+import com.example.auth.support.TestTokens;
 import com.example.securityprobe.CurrentAccountProbeController;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.List;
+import java.util.stream.Stream;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
@@ -36,6 +42,7 @@ import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.security.oauth2.jwt.JwtEncoder;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
@@ -47,7 +54,9 @@ import org.springframework.web.cors.CorsConfigurationSource;
 import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
 
 /**
- * sp-docs/plan/phase1.md §4 AU-04 의 "검증" 표 중 인가 쪽을 테스트로 옮긴 것이다.
+ * sp-docs/plan/phase1.md §4 AU-04 의 "검증" 표 중 인가 쪽을 테스트로 옮긴 것이다. 이메일 인증·
+ * 비밀번호 재설정·계정 목록의 경로, 무인증 경로에 실린 거부되는 토큰, CORS 의 노출 헤더는
+ * sp-docs/plan/phase2-auth-member.md 의 AU-13 이 더했다.
  *
  * <p>업무 경로의 정본은 sp-docs/api-contract.md §2, 인프라 경로는 sp-docs/security.md §5.1.1 이다.
  *
@@ -74,6 +83,10 @@ class SecurityConfigTest {
 	@Autowired
 	private JwtTokenProvider jwtTokenProvider;
 
+	/** 만료된 토큰 픽스처를 애플리케이션의 서명 키로 만든다 ({@link TestTokens}). */
+	@Autowired
+	private JwtEncoder jwtEncoder;
+
 	@Autowired
 	private CorsConfigurationSource corsConfigurationSource;
 
@@ -90,7 +103,10 @@ class SecurityConfigTest {
 			"GET,/api/v1/accounts/me",
 			"PATCH,/api/v1/accounts/me/password",
 			"DELETE,/api/v1/accounts/me",
-			"POST,/api/v1/auth/logout"
+			"POST,/api/v1/auth/logout",
+			// 계정 목록 (sp-docs/api-contract.md §2.5). POST /accounts 의 permitAll 이 메서드를 붙인
+			// 그대로여야 이 경로가 열리지 않는다 (§2.4 의 SecurityConfig 문단)
+			"GET,/api/v1/accounts"
 	})
 	@DisplayName("인증이 필요한 경로는 토큰 없이 401 A001 이다")
 	void 인증이_필요한_경로(String method, String path) throws Exception {
@@ -106,12 +122,80 @@ class SecurityConfigTest {
 			"POST,/api/v1/accounts",
 			"GET,/api/v1/accounts/check-email",
 			"POST,/api/v1/auth/login",
-			"POST,/api/v1/auth/reissue"
+			"POST,/api/v1/auth/reissue",
+			// 이메일 인증과 비밀번호 재설정 (sp-docs/api-contract.md §2.4)
+			"POST,/api/v1/accounts/email-verification",
+			"POST,/api/v1/accounts/email-verification/confirm",
+			"POST,/api/v1/accounts/password-reset",
+			"POST,/api/v1/accounts/password-reset/confirm"
 	})
 	@DisplayName("무인증 경로는 토큰 없이도 401 이 아니다")
 	void 무인증_경로(String method, String path) throws Exception {
 		this.mockMvc.perform(request(HttpMethod.valueOf(method), path))
 				.andExpect(notUnauthorized());
+	}
+
+	/**
+	 * sp-docs/api-contract.md §2.4 의 경로는 메서드를 붙여 하나씩 열었다. 같은 경로를 다른 메서드로
+	 * 부르면 무인증으로 열리지 않는다 — 메서드 없이 경로만 열면 이 요청들이 인가를 지나 401 이
+	 * 아니게 된다.
+	 */
+	@ParameterizedTest(name = "{0} {1}")
+	@CsvSource({
+			"GET,/api/v1/accounts/email-verification",
+			"GET,/api/v1/accounts/email-verification/confirm",
+			"GET,/api/v1/accounts/password-reset",
+			"GET,/api/v1/accounts/password-reset/confirm"
+	})
+	@DisplayName("무인증 경로를 다른 메서드로 부르면 토큰 없이 401 A001 이다")
+	void 무인증_경로의_다른_메서드는_열리지_않는다(String method, String path) throws Exception {
+		this.mockMvc.perform(request(HttpMethod.valueOf(method), path))
+				.andExpect(status().isUnauthorized())
+				.andExpect(jsonPath("$.success").value(false))
+				.andExpect(jsonPath("$.error.code").value("A001"))
+				.andExpect(jsonPath("$.error.message").value("인증이 필요합니다."));
+	}
+
+	/**
+	 * 무인증 경로에 거부되는 토큰을 실어도 인증 경로와 같은 401 코드다.
+	 *
+	 * <p>sp-docs/plan/phase2-auth-member.md 의 AU-13 이 정한 테스트다. 화면이 무인증 요청에 저장된
+	 * 토큰을 실을 때의 응답을 고정한다(같은 계획 §5.2). 코드의 경계는 sp-docs/api-contract.md §8.5
+	 * 의 표다.
+	 *
+	 * <p>Bearer 토큰 필터는 인가 규칙과 무관하게 실린 토큰을 검증하고, 실패하면 인가에 닿기 전에
+	 * 끊는다. 그래서 같은 {@code Authorization} 을 인증 경로({@code GET /api/v1/accounts/me})에 실은
+	 * 응답을 함께 보고, 둘이 같은 코드인지 단언한다.
+	 *
+	 * <p><b>케이스는 필터가 끊는 토큰으로 한다</b> — AU-13 의 완료 기준이다. claim 계약 위반(예:
+	 * 열거 밖 {@code role})은 여기서 단언하지 않는다 — AU-13 이 그 결과는 단언하지 말고 관측해
+	 * 보고하라고 정했고, 무인증 경로의 그 응답은 같은 계획 §5.3 이 정본 개정으로 넘겼다. auth 는 그
+	 * 계약을 {@code @CurrentAccount} 의 인자 해석에서 집행한다(§8.5 의 블록인용).
+	 */
+	@ParameterizedTest(name = "{0} {1} + {2}")
+	@MethodSource("무인증_경로와_거부되는_토큰")
+	@DisplayName("무인증 경로에 거부되는 토큰을 실으면 인증 경로와 같은 401 코드다")
+	void 무인증_경로의_거부되는_토큰(HttpMethod method, String path, 거부되는_토큰 token) throws Exception {
+		String authorization = authorizationOf(token);
+
+		this.mockMvc.perform(get("/api/v1/accounts/me").header(HttpHeaders.AUTHORIZATION, authorization))
+				.andExpect(status().isUnauthorized())
+				.andExpect(jsonPath("$.error.code").value(token.code));
+
+		this.mockMvc.perform(request(method, path).header(HttpHeaders.AUTHORIZATION, authorization))
+				.andExpect(status().isUnauthorized())
+				.andExpect(jsonPath("$.success").value(false))
+				.andExpect(jsonPath("$.error.code").value(token.code))
+				.andExpect(jsonPath("$.error.message").value(token.message));
+	}
+
+	static Stream<Arguments> 무인증_경로와_거부되는_토큰() {
+		List<Arguments> paths = List.of(
+				Arguments.of(HttpMethod.GET, "/api/v1/accounts/check-email"),
+				Arguments.of(HttpMethod.POST, "/api/v1/auth/login"),
+				Arguments.of(HttpMethod.POST, "/api/v1/accounts/email-verification/confirm"));
+		return paths.stream().flatMap(path -> Stream.of(거부되는_토큰.values())
+				.map(token -> Arguments.of(path.get()[0], path.get()[1], token)));
 	}
 
 	/**
@@ -220,7 +304,7 @@ class SecurityConfigTest {
 	// --- CORS (sp-docs/security.md §1.1) ---
 
 	@Test
-	@DisplayName("CORS 의 메서드·헤더·allowCredentials 가 정본 값이고 * 가 없다")
+	@DisplayName("CORS 의 메서드·헤더·allowCredentials·노출 헤더가 정본 값이고 * 가 없다")
 	void cors_설정값이_정본과_일치한다() {
 		assertThat(this.corsConfigurationSource).isInstanceOf(UrlBasedCorsConfigurationSource.class);
 		CorsConfiguration configuration =
@@ -237,6 +321,10 @@ class SecurityConfigTest {
 		assertThat(configuration.getAllowCredentials())
 				.as("토큰을 Authorization 헤더로 보내므로 쿠키를 허용할 이유가 없다")
 				.isFalse();
+		assertThat(configuration.getExposedHeaders())
+				.as("노출하지 않으면 브라우저가 Retry-After 를 스크립트에 숨겨 화면이 429 뒤 언제 다시 할지 "
+						+ "말할 수 없다 (sp-docs/security.md §1.1)")
+				.containsExactly("Retry-After");
 	}
 
 	@Test
@@ -283,6 +371,39 @@ class SecurityConfigTest {
 
 	private String bearerToken() {
 		return "Bearer " + this.jwtTokenProvider.issue(7L, Role.ADMIN).accessToken();
+	}
+
+	private String authorizationOf(거부되는_토큰 token) {
+		return switch (token) {
+			// RFC 6750 의 b64token 문법 위반 — 리졸버가 디코더 앞에서 끊는다 (§8.5 의 블록인용)
+			case 문법_위반 -> "Bearer not!a!token";
+			// 문법은 맞지만 JWT 가 아니다
+			case JWT_아님 -> "Bearer notajwt";
+			case 서명_불일치 -> "Bearer " + TestTokens.tamperSignature(
+					this.jwtTokenProvider.issue(7L, Role.USER).accessToken());
+			// 한 시간 전에 만료됐다. 만료 폭은 픽스처 산수이고 정책값이 아니다 — 디코더의 기본
+			// clock skew 60초보다 충분히 과거면 된다
+			case 만료 -> "Bearer " + TestTokens.signed(this.jwtEncoder, 7L, Role.USER,
+					Instant.now().minus(Duration.ofHours(2)), Duration.ofHours(1));
+		};
+	}
+
+	/** 이 테스트가 싣는 토큰. 각 줄과 그 코드는 sp-docs/api-contract.md §8.5 의 표, 메시지는 §8.1 이다. */
+	enum 거부되는_토큰 {
+
+		문법_위반("A001", "인증이 필요합니다."),
+		JWT_아님("A002", "유효하지 않은 토큰입니다."),
+		서명_불일치("A002", "유효하지 않은 토큰입니다."),
+		만료("A003", "만료된 토큰입니다.");
+
+		private final String code;
+		private final String message;
+
+		거부되는_토큰(String code, String message) {
+			this.code = code;
+			this.message = message;
+		}
+
 	}
 
 	private void assertNoSession(MvcResult result) {
