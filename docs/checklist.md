@@ -1,6 +1,6 @@
 # auth-service 구현 체크리스트
 
-`AU-xx` 항목 **상태의 단일 원본**이다. 항목의 범위·완료 기준·검증은 `sp-docs/plan/phase1.md` §4의 같은 ID를 본다.
+`AU-xx` 항목 **상태의 단일 원본**이다. 항목의 범위·완료 기준·검증은 `sp-docs/plan/phase1.md` §4의 같은 ID를 본다. 2차의 `AU-12` 부터는 `sp-docs/plan/phase2-auth-member.md` 의 같은 ID를 본다.
 
 줄 형식: `- [ ] <ID> <이름> · 상태 <todo|doing|review|blocked|done> · 커밋 <해시 또는 ->`
 `blocked`는 줄 끝에 `· 사유: ...`를 붙인다. 사유는 다음 작업자가 이어받을 수 있을 만큼 구체적으로 적는다.
@@ -52,7 +52,22 @@
 
 `I-xx`의 상태 원본은 **`sp-board`의 `docs/checklist.md`**다. 여기에 적지 않는다.
 
-**AU-11·M-11·B-09가 모두 `done`이 된 뒤에** 시작한다.
+1차의 `I-xx` 는 **AU-11·M-11·B-09가 모두 `done`이 된 뒤에** 시작한다. 2차의 `I-xx` 는 `sp-docs/plan/phase2-frontend-integration.md` §1.3 을 따른다.
+
+## 2차 기능 확장
+
+범위·의존·완료 기준·검증은 `sp-docs/plan/phase2-auth-member.md` 다. 단계와 순서는 그 문서의 §1 이다.
+
+- [ ] AU-12 2차 마이그레이션과 엔티티 · 상태 todo · 커밋 -
+- [ ] AU-13 에러 코드·예외 매핑·경로 선언 · 상태 todo · 커밋 -
+- [ ] AU-14 메일 발송 기반 · 상태 todo · 커밋 -
+- [ ] AU-15 링크 토큰 발급 작업 · 상태 todo · 커밋 -
+- [ ] AU-16 이메일 인증과 미인증 로그인 차단 · 상태 todo · 커밋 -
+- [ ] AU-17 비밀번호 재설정 · 상태 todo · 커밋 -
+- [ ] AU-18 로그인 잠금 · 상태 todo · 커밋 -
+- [ ] AU-19 요청 수 제한 — auth · 상태 todo · 커밋 -
+- [ ] AU-20 계정 목록 (ADMIN) · 상태 todo · 커밋 -
+- [ ] AU-21 만료 토큰·오래된 잠금 행 정리 · 상태 todo · 커밋 -
 
 ## 선행 조건
 
