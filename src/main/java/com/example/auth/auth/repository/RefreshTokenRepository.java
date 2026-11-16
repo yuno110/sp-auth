@@ -92,8 +92,9 @@ public interface RefreshTokenRepository extends JpaRepository<RefreshToken, Long
 	int deleteSession(@Param("accountId") Long accountId, @Param("refreshToken") String refreshToken);
 
 	/**
-	 * 그 계정의 행을 대조 없이 지운다. <b>비밀번호 변경·계정 탈퇴가 쓴다</b>
-	 * (sp-docs/api-contract.md §2.2). 로그아웃은 쓰지 않는다 — {@link #deleteSession}.
+	 * 그 계정의 행을 대조 없이 지운다. <b>그 계정의 모든 세션을 끝내는 동작이 쓴다</b> — 예: 비밀번호 변경·계정 탈퇴
+	 * (sp-docs/api-contract.md §2.2), 비밀번호 재설정 확인(sp-docs/requirements/member.md §11.4). 로그아웃은 쓰지 않는다 —
+	 * {@link #deleteSession}.
 	 */
 	void deleteByAccountId(Long accountId);
 

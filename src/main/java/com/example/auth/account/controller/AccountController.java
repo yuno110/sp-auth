@@ -6,6 +6,7 @@ import com.example.auth.account.dto.AccountResponse;
 import com.example.auth.account.dto.CheckResponse;
 import com.example.auth.account.dto.EmailRequest;
 import com.example.auth.account.dto.PasswordChangeRequest;
+import com.example.auth.account.dto.PasswordResetConfirmRequest;
 import com.example.auth.account.dto.TokenConfirmRequest;
 import com.example.auth.account.dto.WithdrawRequest;
 import com.example.auth.account.service.AccountService;
@@ -32,7 +33,7 @@ import org.springframework.web.bind.annotation.RestController;
  * 계정 API. 정본: sp-docs/api-contract.md §2.2.
  *
  * <p>AU-05 가 만들고 AU-08·AU-09·AU-10 이 확장한다 (sp-docs/plan/phase1.md §2.3). 2차의 AU-16 이 인증 메일
- * 재발송·확인을 더했다 (sp-docs/plan/phase2-auth-member.md).
+ * 재발송·확인을, AU-17 이 비밀번호 재설정 요청·확인을 더했다 (sp-docs/plan/phase2-auth-member.md).
  *
  * <p>경로별 인가는 AU-04 의 {@code SecurityConfig} 가 선반영했다 — {@code POST /api/v1/accounts}
  * 는 무인증이다 (sp-docs/security.md §5.1).
@@ -81,6 +82,36 @@ public class AccountController {
 	@ResponseStatus(HttpStatus.NO_CONTENT)
 	public void confirmVerification(@Valid @RequestBody TokenConfirmRequest request) {
 		this.accountService.confirmEmailVerification(request.token());
+	}
+
+	/**
+	 * MR-15 — 비밀번호 재설정 요청. <b>202</b> 와 {@code {success: true, data: null, error: null}}
+	 * (sp-docs/api-contract.md §2.4 §9.11). 무인증이다.
+	 *
+	 * <p>{@link #resendVerification} 과 같은 모양이다 — 202 가 계정의 상태를 말하지 않는다. 계정이 없다·탈퇴했다·인증됐다·
+	 * 아니다 어느 경우든 같은 상태와 본문이고, 메일이 나가는지는 뒤의 발급 작업이 정한다. {@code email} 의 형식 위반은
+	 * 400 {@code C001} 이다 ({@link EmailRequest}). 요청만으로는 세션·잠금·비밀번호가 바뀌지 않는다
+	 * (sp-docs/requirements/member.md §11.3).
+	 */
+	@PostMapping("/password-reset")
+	@ResponseStatus(HttpStatus.ACCEPTED)
+	public ApiResponse<Void> requestPasswordReset(@Valid @RequestBody EmailRequest request) {
+		this.accountService.requestPasswordReset(request.email());
+		return ApiResponse.success(null);
+	}
+
+	/**
+	 * MR-16 — 비밀번호 재설정 확인. <b>204, 본문 없음</b> (sp-docs/api-contract.md §2.4 §9.11). 무인증이다.
+	 *
+	 * <p>{@code token} 누락·빈 값과 {@code newPassword} 의 비밀번호 규칙 위반은 400 {@code C001} 이고
+	 * ({@link PasswordResetConfirmRequest}), 이 검증이 서비스보다 먼저 돌아 위반한 요청은 토큰을 쓰지 않는다. 토큰이
+	 * 없다·만료됐다·이미 쓰였다·목적이 다르다·그 계정이 탈퇴했다는 모두 400 {@code AU007} 이다. <b>토큰(Access·Refresh)을
+	 * 주지 않는다</b> — 로그인은 새 비밀번호로 따로 한다.
+	 */
+	@PostMapping("/password-reset/confirm")
+	@ResponseStatus(HttpStatus.NO_CONTENT)
+	public void confirmPasswordReset(@Valid @RequestBody PasswordResetConfirmRequest request) {
+		this.accountService.confirmPasswordReset(request.token(), request.newPassword());
 	}
 
 	/**

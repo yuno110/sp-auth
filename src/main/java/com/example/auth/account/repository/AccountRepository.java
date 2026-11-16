@@ -14,8 +14,8 @@ public interface AccountRepository extends JpaRepository<Account, Long> {
 	Optional<Account> findByEmail(String email);
 
 	/**
-	 * 잠금 읽기({@code SELECT ... FOR UPDATE}). <b>이메일 인증 확인이 쓴다</b>
-	 * (sp-docs/requirements/member.md §11.2).
+	 * 잠금 읽기({@code SELECT ... FOR UPDATE}). <b>링크 토큰의 확인이 계정을 읽을 때 쓴다</b>
+	 * (sp-docs/requirements/member.md §11.2·§11.4).
 	 *
 	 * <p><b>읽은 행을 엔터티로 고쳐 쓰므로 잠금 읽기다.</b> 엔터티의 변경은 커밋 때 그 행을 읽어 둔 값으로 다시 쓴다
 	 * ({@code Account} 에 바뀐 컬럼만 싣는 설정이 없다). 잠그지 않고 읽으면 읽기와 그 쓰기 사이에 커밋된 탈퇴의

@@ -3,6 +3,7 @@ package com.example.auth.account.service;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.tuple;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -27,7 +28,9 @@ import com.example.auth.account.repository.AccountRepository;
 import com.example.auth.account.repository.AccountTokenRepository;
 import com.example.auth.account.support.AccountReader;
 import com.example.auth.account.support.AccountTokens;
+import com.example.auth.auth.entity.LoginAttempt;
 import com.example.auth.auth.entity.RefreshToken;
+import com.example.auth.auth.repository.LoginAttemptRepository;
 import com.example.auth.auth.repository.RefreshTokenRepository;
 import com.example.auth.global.error.BusinessException;
 import com.example.auth.global.error.ErrorCode;
@@ -39,6 +42,7 @@ import com.example.auth.support.TestRsaKeys;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.LocalDateTime;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
@@ -46,7 +50,9 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Pattern;
+import org.assertj.core.api.SoftAssertions;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
@@ -54,6 +60,8 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
+import org.mockito.Mockito;
+import org.mockito.stubbing.Answer;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -124,6 +132,10 @@ class AccountServiceTest {
 	@Autowired
 	private AccountTokenRepository accountTokenRepository;
 
+	/** AU-17 — 스텁 생성자에 넘긴다. 재설정 확인이 잠금을 푸는 곳이다. */
+	@Autowired
+	private LoginAttemptRepository loginAttemptRepository;
+
 	/** AU-16 — 앱 시계. 이 클래스는 바꿔 끼우지 않는다(시스템 시계). 토큰 픽스처의 발급 시각을 정한다. */
 	@Autowired
 	private Clock clock;
@@ -151,6 +163,8 @@ class AccountServiceTest {
 	 * <p><b>AU-16 부터 가입이 다른 스레드에서 {@code account_token} 행을 만든다.</b> 그 작업이 끝나기를 먼저
 	 * 기다리고({@link MailExecutorDrain}) 그 행을 지운다 — 남기면 계정 삭제가 {@code fk_account_token_account} 에
 	 * 걸린다.
+	 *
+	 * <p>AU-17 의 테스트가 {@code login_attempt} 행을 심는다. 그 테이블은 계정을 참조하지 않으므로 지우는 순서와 상관없다.
 	 */
 	@AfterEach
 	void 정리() {
@@ -158,6 +172,7 @@ class AccountServiceTest {
 		this.accountTokenRepository.deleteAllInBatch();
 		this.refreshTokenRepository.deleteAll();
 		this.refreshTokenRepository.flush();
+		this.jdbcTemplate.update("delete from login_attempt");
 		this.accountRepository.deleteAll(this.accountRepository.findAll().stream()
 				.filter(account -> !ADMIN_EMAIL.equals(account.getEmail()))
 				.toList());
@@ -263,7 +278,7 @@ class AccountServiceTest {
 		// 나머지 협력자는 실제 빈이다. create 경로가 쓰지 않으므로 스텁할 것이 없다
 		AccountService service = new AccountService(
 				stub, this.passwordEncoder, this.accountReader, this.refreshTokenRepository,
-				this.accountTokenIssuer, this.accountTokenRepository, this.clock);
+				this.accountTokenIssuer, this.accountTokenRepository, this.loginAttemptRepository, this.clock);
 
 		assertThatThrownBy(() ->
 				service.create(new AccountCreateRequest("race@example.com", RAW_PASSWORD)))
@@ -991,9 +1006,12 @@ class AccountServiceTest {
 		void 재발송은_작업을_넘기기만_한다() {
 			Long id = 미인증_계정을_만든다("au16-resend-handover@example.com");
 			clearInvocations(this.accountRepository, this.spyTransactionManager);
+			RecordingStatementInspector.clear();
 
 			this.accountService.resendVerification("au16-resend-handover@example.com");
 
+			assertThat(RecordingStatementInspector.statements())
+					.as("부른 스레드는 SQL 을 내지 않는다 — 리포지터리마다 따로 보지 않고 DB 일 전체를 본다").isEmpty();
 			verifyNoInteractions(this.accountRepository);
 			verify(this.spyTransactionManager, never()).getTransaction(any());
 			ArgumentCaptor<Runnable> handedOver = ArgumentCaptor.forClass(Runnable.class);
@@ -1108,6 +1126,313 @@ class AccountServiceTest {
 
 	}
 
+	// --- AU-17 비밀번호 재설정 (sp-docs/requirements/member.md §11.3·§11.4) ---
+
+	/**
+	 * 재설정 확인의 트랜잭션 경계(sp-docs/process/review-policy.md §4.1)와 재설정 요청이 발급을 넘기는 모양
+	 * (sp-docs/plan/phase2-auth-member.md AU-17 의 완료 기준·검증 표). 확인의 단계 번호는 sp-docs/requirements/member.md
+	 * §11.4 의 것이다 — 1 사용 처리, 2 탈퇴 검사, 3 비밀번호, 4 {@code refresh_token} 삭제, 5 잠금 해제, 6 인증.
+	 *
+	 * <p>대역은 {@link 인증_트랜잭션_경계} 와 같은 이유로 둔다 — 발송 실행기의 대역은 받은 작업을 돌리지 않고, SQL 기록기가
+	 * 확인이 낸 문장을 보게 한다. 두 리포지터리 스파이는 확인 도중에 끼어들 자리다.
+	 *
+	 * <p>계정·토큰·Refresh Token 의 준비는 바깥 클래스의 헬퍼가 바깥 컨텍스트의 빈으로 한다 — 두 컨텍스트가 같은 H2 DB 를
+	 * 본다. 이 클래스의 {@link #jdbcTemplate} 은 서비스와 같은 {@code DataSource} 다 — 확인의 트랜잭션 안에서 부르면 그
+	 * 트랜잭션이 묶은 커넥션을 쓰고, 밖에서 부르면 곧바로 커밋된 값을 쓰고 읽는다. <b>확인 도중의 쓰기와 읽기는 이것으로
+	 * 한다</b> — 다른 {@code DataSource} 의 커넥션은 그 트랜잭션 밖이다.
+	 */
+	@Nested
+	@TestPropertySource(properties = "spring.jpa.properties.hibernate.session_factory.statement_inspector="
+			+ "com.example.auth.support.RecordingStatementInspector")
+	@DisplayName("비밀번호 재설정 요청·확인의 트랜잭션 경계")
+	class 재설정_트랜잭션_경계 {
+
+		@DynamicPropertySource
+		static void jwtPrivateKey(DynamicPropertyRegistry registry) {
+			TestRsaKeys.registerPrivateKeyLocation(registry);
+		}
+
+		/** 커밋이 전부 지나는 곳. {@code isNewTransaction()} 이 참인 커밋만 센다. */
+		@MockitoSpyBean
+		private PlatformTransactionManager spyTransactionManager;
+
+		/** 발송 실행기의 대역. 받은 작업을 돌리지 않는다. */
+		@MockitoBean(name = MailExecutorConfig.MAIL_EXECUTOR)
+		private ThreadPoolTaskExecutor mailExecutorDouble;
+
+		/** 요청한 스레드가 계정을 찾지 않는지 보고, 확인의 6 이 계정을 다시 읽는 자리에 실패를 넣는다. 나머지는 실제 빈에 위임된다. */
+		@MockitoSpyBean
+		private AccountRepository spyAccountRepository;
+
+		/** 확인의 4 에 끼어든다. 나머지는 실제 빈에 위임된다. */
+		@MockitoSpyBean
+		private RefreshTokenRepository spyRefreshTokenRepository;
+
+		/** 이 클래스의 대역들을 주입받은 쪽이다. 바깥 클래스의 것과 다른 인스턴스다. */
+		@Autowired
+		private AccountService accountService;
+
+		/** 서비스와 같은 {@code DataSource} 다 — 확인의 트랜잭션 안에서 부르면 그 트랜잭션에 참여한다. */
+		@Autowired
+		private JdbcTemplate jdbcTemplate;
+
+		/**
+		 * 완료 기준 「요청 스레드는 DB 일을 하지 않는다」(sp-docs/plan/phase2-auth-member.md AU-17, sp-docs/security.md §12).
+		 * 재설정 요청을 부른 스레드는 계정을 찾지도 트랜잭션을 열지도 않고 발급 작업 하나를 넘긴다 — 재발송과 같은 모양이다.
+		 * 계정 찾기는 그 작업이 한다.
+		 */
+		@Test
+		@DisplayName("재설정 요청은 발급 작업을 넘기기만 한다 — 부른 스레드는 계정을 찾지도 트랜잭션을 열지도 않는다")
+		void 재설정_요청은_작업을_넘기기만_한다() {
+			Long id = 미인증_계정을_만든다("au17-request-handover@example.com");
+			clearInvocations(this.spyAccountRepository, this.spyTransactionManager);
+			RecordingStatementInspector.clear();
+
+			this.accountService.requestPasswordReset("au17-request-handover@example.com");
+
+			assertThat(RecordingStatementInspector.statements())
+					.as("부른 스레드는 SQL 을 내지 않는다 — 리포지터리마다 따로 보지 않고 DB 일 전체를 본다").isEmpty();
+			verifyNoInteractions(this.spyAccountRepository);
+			verify(this.spyTransactionManager, never()).getTransaction(any());
+			ArgumentCaptor<Runnable> handedOver = ArgumentCaptor.forClass(Runnable.class);
+			verify(this.mailExecutorDouble).execute(handedOver.capture());
+
+			handedOver.getValue().run();
+			verify(this.spyAccountRepository).findByEmail("au17-request-handover@example.com");
+			assertThat(AccountServiceTest.this.accountTokenRepository.findAll())
+					.extracting(AccountToken::getAccountId, AccountToken::getPurpose)
+					.as("넘겨받은 작업이 재설정 토큰을 만든다")
+					.containsExactly(tuple(id, TokenPurpose.PASSWORD_RESET));
+		}
+
+		/**
+		 * 완료 기준의 경계 관측 — 한 번의 확인에 커밋이 한 번이다 (sp-docs/plan/phase2-auth-member.md AU-17). 단계들이 서로
+		 * 다른 트랜잭션으로 갈라져도(변이 C) 정상 경로의 효과는 그대로 다 일어나 그 경로의 행위 단언이 통과한다(AU-17 실측) —
+		 * 경계는 커밋을 세어서 본다 (sp-docs/process/review-policy.md §4.1).
+		 */
+		@Test
+		@DisplayName("한 번의 재설정 확인에 물리 트랜잭션이 정확히 하나 커밋된다")
+		void 재설정_확인의_커밋이_정확히_한_번이다() {
+			Long id = 미인증_계정을_만든다("au17-confirm-boundary@example.com");
+			refresh_token_행을_만든다(id);
+			String token = 재설정_토큰을_심는다(id);
+			String password = 커밋된_비밀번호(id);
+
+			List<TransactionStatus> 커밋된_물리_트랜잭션 = 커밋을_센다();
+			this.accountService.confirmPasswordReset(token, NEW_PASSWORD);
+
+			assertThat(커밋된_물리_트랜잭션)
+					.as("확인은 한 로컬 트랜잭션이다 (sp-docs/requirements/member.md §11.4)")
+					.hasSize(1);
+			assertThat(커밋된_비밀번호(id)).as("그 한 번이 비밀번호를 바꿨다").isNotEqualTo(password);
+		}
+
+		/**
+		 * 확인이 계정을 잠금 읽기({@code AccountRepository#findByIdForUpdate})로 읽는다 — 6 의 다시 읽기도 같다. 못박는 것은
+		 * 결과가 아니라 이 구현이 고른 수단이다. 결과 쪽은 {@link #확인_도중의_탈퇴를_덮지_않는다()} 가 본다.
+		 */
+		@Test
+		@DisplayName("재설정 확인은 계정 행을 잠금 읽기(for update)로 읽는다")
+		void 재설정_확인은_계정을_잠금_읽기로_읽는다() {
+			Long id = 미인증_계정을_만든다("au17-confirm-lock-read@example.com");
+			String token = 재설정_토큰을_심는다(id);
+			// account 테이블을 읽는 SELECT. account_token·account_id 는 뒤에 밑줄이 이어져 \b 에 걸리지 않는다
+			Pattern accountRead = Pattern.compile("(?is)^\\s*select\\b.*\\baccount\\b");
+
+			RecordingStatementInspector.clear();
+			this.accountService.confirmPasswordReset(token, NEW_PASSWORD);
+
+			assertThat(RecordingStatementInspector.statements())
+					.filteredOn(sql -> accountRead.matcher(sql).find())
+					.as("확인이 account 행을 읽은 SELECT")
+					.isNotEmpty()
+					.allSatisfy(sql -> assertThat(sql).as("잠금 읽기다").containsPattern("(?i)\\bfor update\\b"));
+		}
+
+		/**
+		 * 탈퇴 검사가 3~6 의 쓰기보다 먼저다 — 닫힌 행에는 쓰지 않는다 (sp-docs/requirements/member.md §11.4). 커밋된 값으로는
+		 * 가를 수 없다 — 검사가 쓰기 뒤에 있어도 예외가 그 쓰기를 모두 되돌린다(AU-17 실측). 그래서 확인이 낸 쓰는 문장을 본다. 그 계정에는
+		 * 지울 {@code refresh_token} 행과 풀 잠금이 있다.
+		 */
+		@Test
+		@DisplayName("탈퇴한 계정의 재설정 확인은 400 AU007 이고, 토큰의 사용 처리 밖에 쓰는 문장이 없다")
+		void 탈퇴한_계정에는_토큰_밖에_쓰지_않는다() {
+			Long id = 미인증_계정을_만든다("au17-withdrawn-writes@example.com");
+			refresh_token_행을_만든다(id);
+			잠긴_행을_심는다("au17-withdrawn-writes@example.com");
+			String token = 재설정_토큰을_심는다(id);
+			탈퇴시킨다(id);
+			Pattern write = Pattern.compile("(?is)^\\s*(insert|update|delete)\\b");
+
+			RecordingStatementInspector.clear();
+			assertThatThrownBy(() -> this.accountService.confirmPasswordReset(token, NEW_PASSWORD))
+					.isInstanceOf(BusinessException.class)
+					.extracting(e -> ((BusinessException) e).getErrorCode())
+					.isEqualTo(ErrorCode.INVALID_LINK_TOKEN);
+
+			assertThat(RecordingStatementInspector.statements())
+					.filteredOn(sql -> write.matcher(sql).find())
+					.as("확인이 낸 쓰는 문장")
+					.isNotEmpty()
+					.allSatisfy(sql -> assertThat(sql).as("토큰의 사용 처리뿐이다")
+							.containsPattern("(?is)^\\s*update\\s+account_token\\b"));
+		}
+
+		/**
+		 * 완료 기준 「중간 실패가 §11.4 의 변경을 모두 되돌린다. 변경마다 반증 가능한 단언이다」
+		 * (sp-docs/plan/phase2-auth-member.md AU-17, sp-docs/process/review-policy.md §4.1). 실패는 6 이 계정을 다시 읽는 자리에
+		 * 넣는다 — 1·3·4·5 가 실제로 돈 뒤다. 3·4 는 5 의 문장이 flush 했다. 그 자리는 확인 안의 두 번째
+		 * {@code findByIdForUpdate} 호출이다. 계정을 그 메서드로 두 번 읽지 않는 구현에서는 실패가 들어가지 않아, 이 테스트는
+		 * 예외가 나지 않았다는 이유로 실패한다 — 롤백을 관측한 실패가 아니다(AU-17 실측).
+		 *
+		 * <p><b>6 의 쓰기는 스텁이 만든다.</b> 실패를 넣는 자리가 6 의 쓰기보다 앞이므로, 스텁이 그 쓰기를 이 트랜잭션의 커넥션으로
+		 * 실제로 낸 뒤에 던진다 — 되돌릴 효과가 없으면 인증 쪽 단언은 어떤 구현에서도 참이다. 스텁은 1·3·4·5 의 변경이 이
+		 * 트랜잭션 안에 있는지도 본다 — 없으면 그 쪽 단언들도 반증할 수 없다.
+		 */
+		@Test
+		@DisplayName("재설정 확인이 6 에서 실패하면 비밀번호·토큰 사용·Refresh Token·잠금·인증이 모두 그대로다")
+		void 중간_실패는_모두_되돌린다() {
+			String email = "au17-rollback@example.com";
+			Long id = 미인증_계정을_만든다(email);
+			refresh_token_행을_만든다(id);
+			LockState locked = 잠긴_행을_심는다(email);
+			String token = 재설정_토큰을_심는다(id);
+			String password = 커밋된_비밀번호(id);
+
+			Answer<?> real = 실제_빈에_위임한다(this.spyAccountRepository);
+			AtomicInteger reads = new AtomicInteger();
+			willAnswer(invocation -> {
+				if (reads.incrementAndGet() == 1) {
+					return real.answer(invocation);
+				}
+				// 1·3·4·5 의 변경이 이 트랜잭션 안에 있다
+				assertThat(this.jdbcTemplate.queryForObject("select used_at from account_token where token_hash = ?",
+						LocalDateTime.class, AccountTokens.hash(token))).as("1 토큰 사용").isNotNull();
+				assertThat(this.jdbcTemplate.queryForObject("select password from account where id = ?",
+						String.class, id)).as("3 비밀번호").isNotEqualTo(password);
+				assertThat(this.jdbcTemplate.queryForObject("select count(*) from refresh_token where account_id = ?",
+						Long.class, id)).as("4 Refresh Token").isZero();
+				assertThat(this.jdbcTemplate.queryForObject("select failed_count from login_attempt where email_key = ?",
+						Integer.class, LoginAttempt.emailKeyOf(email))).as("5 잠금").isZero();
+				// 이 문장의 짝은 6 의 쓰기 — Account#markEmailVerified 가 바꾼 엔터티를 커밋 때 flush 하는 account 의 UPDATE 다.
+				// 영향 행 수를 버리면 0행이 되어도 조용하고, 되돌릴 효과가 없으므로 인증 단언이 반증 불가능해진다
+				int verified = this.jdbcTemplate.update("update account set email_verified_at = ? where id = ?",
+						LocalDateTime.now(AccountServiceTest.this.clock).truncatedTo(ChronoUnit.SECONDS), id);
+				assertThat(verified).as("주입한 UPDATE 가 실제로 행을 바꿔야 이 테스트가 일한다").isEqualTo(1);
+				throw new DataIntegrityViolationException("다시 읽기 실패");
+			}).given(this.spyAccountRepository).findByIdForUpdate(anyLong());
+
+			assertThatThrownBy(() -> this.accountService.confirmPasswordReset(token, NEW_PASSWORD))
+					.isInstanceOf(DataIntegrityViolationException.class);
+
+			SoftAssertions softly = new SoftAssertions();
+			softly.assertThat(커밋된_비밀번호(id)).as("3 비밀번호").isEqualTo(password);
+			softly.assertThat(커밋된_사용_시각(token)).as("1 토큰 사용").isNull();
+			softly.assertThat(커밋된_토큰_행_수(id)).as("4 Refresh Token").isOne();
+			softly.assertThat(커밋된_잠금(email)).as("5 잠금").isEqualTo(locked);
+			softly.assertThat(커밋된_인증_시각(id)).as("6 인증").isNull();
+			softly.assertAll();
+		}
+
+		/**
+		 * 확인이 읽은 계정 행은 그 트랜잭션이 끝날 때까지 잠긴다. 확인 도중 — 탈퇴 검사가 계정을 읽은 뒤, 3 의 쓰기가 flush 되기
+		 * 전 — 에 다른 연결이 탈퇴({@code deleted = true})를 커밋하려 하면 확인의 커밋을 기다려야 한다. 기다리지 않고 먼저
+		 * 커밋되면 확인의 쓰기가 읽어 둔 {@code deleted = false} 로 그 행을 덮어 탈퇴한 계정이 되살아난다 — 이유는
+		 * {@code AccountRepository#findByIdForUpdate} 에 있다. 끼어드는 자리는 4 다.
+		 */
+		@Test
+		@DisplayName("재설정 확인이 읽은 계정 행은 커밋까지 잠긴다 — 확인 도중에 커밋하려는 탈퇴를 덮지 않는다")
+		void 확인_도중의_탈퇴를_덮지_않는다() throws Exception {
+			Long id = 미인증_계정을_만든다("au17-lock-race@example.com");
+			String token = 재설정_토큰을_심는다(id);
+			String password = 커밋된_비밀번호(id);
+			ExecutorService otherConnection = Executors.newSingleThreadExecutor();
+			try {
+				Answer<?> real = 실제_빈에_위임한다(this.spyRefreshTokenRepository);
+				List<Future<Integer>> withdrawal = new ArrayList<>();
+				List<Boolean> 확인_커밋_전에_끝났다 = new ArrayList<>();
+				willAnswer(invocation -> {
+					// 트랜잭션이 묶이지 않은 다른 스레드다 — 바깥 컨텍스트의 커넥션 하나로 곧바로 커밋하려 한다
+					Future<Integer> started = otherConnection.submit(() -> AccountServiceTest.this.jdbcTemplate
+							.update("update account set deleted = true where id = ?", id));
+					withdrawal.add(started);
+					확인_커밋_전에_끝났다.add(끝났는가(started, 300));
+					return real.answer(invocation);
+				}).given(this.spyRefreshTokenRepository).deleteByAccountId(anyLong());
+
+				this.accountService.confirmPasswordReset(token, NEW_PASSWORD);
+
+				assertThat(withdrawal).as("확인이 4 를 지났다").hasSize(1);
+				assertThat(withdrawal.get(0).get(5, TimeUnit.SECONDS)).as("탈퇴는 확인이 커밋한 뒤에 들어간다").isOne();
+				assertThat(커밋된_탈퇴_여부(id)).as("확인의 쓰기가 탈퇴를 덮지 않았다").isTrue();
+				assertThat(커밋된_비밀번호(id)).as("확인은 탈퇴보다 먼저 커밋됐다").isNotEqualTo(password);
+				assertThat(확인_커밋_전에_끝났다).as("탈퇴가 확인의 커밋을 기다렸다").containsExactly(false);
+			} finally {
+				otherConnection.shutdownNow();
+			}
+		}
+
+		/** 지금부터 커밋되는 물리 트랜잭션을 모은다. 준비가 끝난 뒤에 부른다. */
+		private List<TransactionStatus> 커밋을_센다() {
+			List<TransactionStatus> committed = new ArrayList<>();
+			willAnswer(invocation -> {
+				TransactionStatus status = invocation.getArgument(0);
+				if (status.isNewTransaction()) {
+					committed.add(status);
+				}
+				return invocation.callRealMethod();
+			}).given(this.spyTransactionManager).commit(any(TransactionStatus.class));
+			return committed;
+		}
+
+		/**
+		 * 스파이의 기본 응답 — 실제 빈에 위임한다. 리포지터리는 JDK 프록시라 {@code callRealMethod()} 를 쓸 수 없고
+		 * ({@link 트랜잭션_경계#둘_다_롤백된다()} 의 주석), 스파이는 그 빈을 이 응답으로 감싼다.
+		 */
+		private Answer<?> 실제_빈에_위임한다(Object spy) {
+			return Mockito.mockingDetails(spy).getMockCreationSettings().getDefaultAnswer();
+		}
+
+		/**
+		 * 그 이메일의 잠긴 {@code login_attempt} 행을 SQL 로 심고 그 값을 돌려준다 — 실패를 세어 잠그는 경로를 거치지 않고 행의
+		 * 값을 이 테스트가 정한다. 키는 AU-12 의 변환으로 만든다.
+		 */
+		private LockState 잠긴_행을_심는다(String email) {
+			LocalDateTime now = LocalDateTime.now(AccountServiceTest.this.clock).truncatedTo(ChronoUnit.SECONDS);
+			LockState locked = new LockState(5, now.plusMinutes(15));
+			this.jdbcTemplate.update(
+					"insert into login_attempt (email_key, failed_count, locked_until, updated_at) values (?, ?, ?, ?)",
+					LoginAttempt.emailKeyOf(email), locked.failedCount(), locked.lockedUntil(), now);
+			return locked;
+		}
+
+		private String 커밋된_비밀번호(Long accountId) {
+			return this.jdbcTemplate.queryForObject("select password from account where id = ?", String.class, accountId);
+		}
+
+		private LocalDateTime 커밋된_사용_시각(String token) {
+			return this.jdbcTemplate.queryForObject("select used_at from account_token where token_hash = ?",
+					LocalDateTime.class, AccountTokens.hash(token));
+		}
+
+		private long 커밋된_토큰_행_수(Long accountId) {
+			return this.jdbcTemplate.queryForObject(
+					"select count(*) from refresh_token where account_id = ?", Long.class, accountId);
+		}
+
+		private LockState 커밋된_잠금(String email) {
+			return this.jdbcTemplate.queryForObject(
+					"select failed_count, locked_until from login_attempt where email_key = ?",
+					(rs, rowNum) -> new LockState(rs.getInt("failed_count"), rs.getObject("locked_until", LocalDateTime.class)),
+					LoginAttempt.emailKeyOf(email));
+		}
+
+	}
+
+	/** AU-17 — {@code login_attempt} 의 연속 실패 수와 잠금 시각. */
+	private record LockState(int failedCount, LocalDateTime lockedUntil) {
+	}
+
 	/** 시간 안에 끝났으면 참, 아니면 거짓. 끝나지 않은 작업을 취소하지 않는다. */
 	private static boolean 끝났는가(Future<?> future, long millis) {
 		try {
@@ -1134,6 +1459,14 @@ class AccountServiceTest {
 		String token = AccountTokens.generate();
 		this.accountTokenRepository.saveAndFlush(AccountToken.issue(accountId, TokenPurpose.EMAIL_VERIFICATION,
 				AccountTokens.hash(token), Duration.ofHours(24), this.clock));
+		return token;
+	}
+
+	/** AU-17 — 그 계정의 재설정 토큰 행을 심고 원문을 돌려준다. 수명은 발급 작업의 것을 쓴다. */
+	private String 재설정_토큰을_심는다(Long accountId) {
+		String token = AccountTokens.generate();
+		this.accountTokenRepository.saveAndFlush(AccountToken.issue(accountId, TokenPurpose.PASSWORD_RESET,
+				AccountTokens.hash(token), AccountTokenIssuer.PASSWORD_RESET_LIFETIME, this.clock));
 		return token;
 	}
 

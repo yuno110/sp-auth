@@ -5,7 +5,7 @@ import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Size;
 
 /**
- * 이메일 하나를 받는 요청 — 인증 메일 재발송. 정본: sp-docs/api-contract.md §2.4.
+ * 이메일 하나만 받는 요청 본문(예: 인증 메일 재발송, 비밀번호 재설정 요청). 정본: sp-docs/api-contract.md §2.4.
  *
  * <p><b>{@code email} 은 생성과 같은 규칙이다</b> (§2.4, sp-docs/requirements/member.md §2). 누락·빈 값·형식·길이
  * 위반은 400 {@code C001} 이고 {@code fieldErrors} 에 {@code email} 이 담긴다. 규칙을 두 군데 적지 않기 위해

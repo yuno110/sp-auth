@@ -13,6 +13,8 @@ import com.example.auth.account.repository.AccountRepository;
 import com.example.auth.account.repository.AccountTokenRepository;
 import com.example.auth.account.support.AccountReader;
 import com.example.auth.account.support.AccountTokens;
+import com.example.auth.auth.entity.LoginAttempt;
+import com.example.auth.auth.repository.LoginAttemptRepository;
 import com.example.auth.auth.repository.RefreshTokenRepository;
 import com.example.auth.global.error.BusinessException;
 import com.example.auth.global.error.ErrorCode;
@@ -28,7 +30,8 @@ import org.springframework.transaction.annotation.Transactional;
  * sp-docs/api-contract.md §2.2 §9.1.
  *
  * <p>AU-05 가 만들고 AU-08·AU-09·AU-10 이 확장한다 (sp-docs/plan/phase1.md §2.3). 2차의 AU-16 이 가입 뒤 발급과
- * 인증 메일 재발송·확인을 더했다 (sp-docs/plan/phase2-auth-member.md, sp-docs/requirements/member.md §11.2).
+ * 인증 메일 재발송·확인을 더했다 (sp-docs/plan/phase2-auth-member.md, sp-docs/requirements/member.md §11.2). AU-17 이
+ * 비밀번호 재설정 요청·확인을 더했다 (sp-docs/requirements/member.md §11.3·§11.4).
  *
  * <p><b>닉네임을 다루지 않는다.</b> 계정은 이메일·비밀번호·권한만 갖는다
  * (sp-docs/adr/0012-auth-as-separate-service.md).
@@ -54,13 +57,22 @@ public class AccountService {
 	 */
 	private final RefreshTokenRepository refreshTokenRepository;
 
-	/** 인증 메일의 발급 작업 — 가입과 재발송이 넘긴다 (AU-15, sp-docs/requirements/member.md §11.5). */
+	/**
+	 * 링크 메일의 발급 작업. 이 클래스는 작업을 넘기기만 하고 계정 찾기·토큰·메일은 그 작업이 한다 (AU-15,
+	 * sp-docs/requirements/member.md §11.5).
+	 */
 	private final AccountTokenIssuer accountTokenIssuer;
 
-	/** 인증 확인의 사용 처리 (sp-docs/requirements/member.md §11.1). */
+	/** 링크 토큰 확인의 사용 처리 (sp-docs/requirements/member.md §11.1). */
 	private final AccountTokenRepository accountTokenRepository;
 
-	/** 앱 시계. 토큰의 만료 판정과 인증 시각이 이 시계에서 나온다 — DB 의 {@code NOW()} 를 쓰지 않는다 (§11.1). */
+	/**
+	 * 재설정 확인이 그 계정 이메일의 로그인 잠금을 푼다 (sp-docs/requirements/member.md §11.4·§12.2). 해제 문장과 키 변환은
+	 * AU-12 의 것을 쓴다 ({@link LoginAttemptRepository#reset}, {@link LoginAttempt#emailKeyOf}).
+	 */
+	private final LoginAttemptRepository loginAttemptRepository;
+
+	/** 앱 시계. 판정과 기록의 시각이 이 시계에서 나온다 — DB 의 {@code NOW()} 를 쓰지 않는다 (§11.1). */
 	private final Clock clock;
 
 	/**
@@ -164,6 +176,93 @@ public class AccountService {
 
 		// 3) 처음 인증한 시각이 남는다 — 이미 채워져 있으면 덮지 않는다 (Account#markEmailVerified)
 		account.markEmailVerified(this.clock);
+	}
+
+	/**
+	 * MR-15 — 비밀번호 재설정 요청 (sp-docs/requirements/member.md §11.3, sp-docs/api-contract.md §2.4).
+	 *
+	 * <p><b>이 메서드는 DB 일을 하지 않는다.</b> {@link #resendVerification} 과 같은 모양이다 — 발급 작업을 발송 실행기에
+	 * 넘기기만 하고, 계정 찾기·보낼 조건(활성)·토큰·메일은 그 작업이 한다. 응답 시간이 계정의 유무로 갈리지 않는다
+	 * (sp-docs/security.md §12). 할 DB 일이 없으므로 {@code @Transactional} 을 두지 않는다.
+	 *
+	 * <p>계정이 없거나 탈퇴했어도 실패가 아니다 — 응답은 언제나 같은 202 다. <b>요청만으로는 세션·잠금·비밀번호가 바뀌지
+	 * 않는다</b> — 바뀌는 것은 확인({@link #confirmPasswordReset}) 때다 (§11.3).
+	 *
+	 * @param email 요청에 실린 문자열. 메일은 이 표기가 아니라 계정에 저장된 주소로 간다 (§11.3)
+	 */
+	public void requestPasswordReset(String email) {
+		this.accountTokenIssuer.request(TokenPurpose.PASSWORD_RESET, email);
+	}
+
+	/**
+	 * MR-16 — 비밀번호 재설정 확인 (sp-docs/requirements/member.md §11.4, sp-docs/api-contract.md §2.4).
+	 *
+	 * <p>{@code newPassword} 는 여기 오기 전에 비밀번호 규칙으로 걸러졌다 — 요청 본문의 검증이 컨트롤러가 이 메서드를 부르기
+	 * 전에 돈다 ({@code PasswordResetConfirmRequest}). 그래서 규칙을 어긴 입력은 토큰을 쓰지 않는다 (§11.4).
+	 *
+	 * <p><b>한 로컬 트랜잭션이다.</b> 순서는 §11.4 를 따른다.
+	 * <ol>
+	 *   <li>토큰 사용 처리 — 조건부 UPDATE 하나가 판정한다. 0행이면 400 {@code AU007}</li>
+	 *   <li>그 계정이 탈퇴했으면 되돌린다 — 400 {@code AU007}. 예외가 이 트랜잭션을 되돌려 1의 사용 처리도 없던 일이
+	 *   된다</li>
+	 *   <li>비밀번호를 새 값의 BCrypt 해시로 바꾼다</li>
+	 *   <li>그 계정의 {@code refresh_token} 행을 지운다 — 비밀번호 변경(§3 규칙 4)과 같다</li>
+	 *   <li>그 계정 이메일의 로그인 잠금을 푼다 (§12.2). 키는 계정에 저장된 이메일에서 만든다</li>
+	 *   <li>{@code email_verified_at} 이 NULL 이면 지금 시각으로 채운다. 이미 인증됐으면 그대로 둔다</li>
+	 * </ol>
+	 * 일부만 커밋되면 비밀번호는 바뀌었는데 옛 Refresh Token 이 살거나, 토큰은 쓰였는데 비밀번호가 그대로인 상태가 남는다
+	 * (§11.4).
+	 *
+	 * <p>없음·만료·사용됨·목적 다름·탈퇴 계정을 가르지 않는다 — 모두 같은 {@code AU007} 이다 (§11.1). 토큰의 길이·문자가
+	 * 틀려도 형식 오류가 아니라 맞지 않는 토큰이다 (sp-docs/api-contract.md §2.4).
+	 *
+	 * <p><b>로그인하지 않는다.</b> 토큰(Access·Refresh)을 주지 않는다. 이미 발급된 Access Token 은 만료까지 통과한다 —
+	 * 비밀번호 변경과 같은 창이고, 막는 코드를 두지 않는다 (sp-docs/security.md §5.3).
+	 *
+	 * @param token 메일 링크의 토큰 원문. 받은 문자열을 해시해 찾는다 — 원문은 저장돼 있지 않다
+	 * @param newPassword 비밀번호 규칙을 지난 평문. 저장하는 것은 그 BCrypt 해시다
+	 */
+	@Transactional
+	public void confirmPasswordReset(String token, String newPassword) {
+		String tokenHash = AccountTokens.hash(token);
+
+		// 1) 사용 처리. 읽어서 확인한 뒤 쓰지 않는다 — 같은 토큰의 동시 확인 둘이 모두 성공한다.
+		// 이 문장은 영속성 컨텍스트를 비운다. 그래서 계정은 이 문장 뒤에 처음 읽는다
+		if (this.accountTokenRepository.consume(tokenHash, TokenPurpose.PASSWORD_RESET, this.clock) != 1) {
+			throw invalidLinkToken();
+		}
+
+		// 방금 이 트랜잭션이 사용 처리한 행이다. 없다면 판정이 아니라 불변식이 깨진 것이므로 숨기지 않는다
+		Long accountId = this.accountTokenRepository.findByTokenHash(tokenHash)
+				.map(AccountToken::getAccountId)
+				.orElseThrow(() -> new IllegalStateException("사용 처리한 토큰의 행이 없다"));
+
+		// 잠금 읽기다 — 3·6 의 쓰기가 탈퇴 검사가 본 값 위에 놓인다. 이유는 AccountRepository#findByIdForUpdate 에 있다.
+		// 행은 있어야 한다 — fk_account_token_account(ON DELETE 절 없음, V7)가 토큰이 남은 계정의 삭제를 막는다
+		Account account = this.accountRepository.findByIdForUpdate(accountId)
+				.orElseThrow(() -> new IllegalStateException("토큰이 가리키는 계정의 행이 없다"));
+
+		// 2) 탈퇴 계정. 토큰 오류와 같은 응답이다. 닫힌 행에는 쓰지 않는다 — 이 검사가 3~6 의 쓰기보다 먼저다
+		if (!account.isActive()) {
+			throw invalidLinkToken();
+		}
+
+		// 3) 평문을 저장하지 않는다. 해싱은 서비스 계층의 몫이다
+		account.changePassword(this.passwordEncoder.encode(newPassword));
+
+		// 4) 같은 트랜잭션이다. 멱등이므로 저장된 행이 없어도 지울 것이 없을 뿐이다
+		this.refreshTokenRepository.deleteByAccountId(accountId);
+
+		// 5) 키는 계정에 저장된 이메일을 AU-12 의 키 변환으로 바꾼 값이다. 그 키의 행이 없으면 0행이고 실패가 아니다 —
+		// 잠기지 않은 것과 결과가 같다 (LoginAttemptRepository#reset). 이 문장은 3·4 를 flush 한 뒤 영속성 컨텍스트를
+		// 비운다 — 여기부터 account 는 준영속이다
+		this.loginAttemptRepository.reset(LoginAttempt.emailKeyOf(account.getEmail()), this.clock);
+
+		// 6) 5 가 비운 뒤라 다시 읽어서 바꾼다 — 준영속인 account 를 바꾸면 저장되지 않는다. 이 트랜잭션이 이미 그 행을
+		// 잠갔으므로 기다리지 않는다. 처음 인증한 시각이 남는다 — 이미 채워져 있으면 덮지 않는다 (Account#markEmailVerified)
+		this.accountRepository.findByIdForUpdate(accountId)
+				.orElseThrow(() -> new IllegalStateException("토큰이 가리키는 계정의 행이 없다"))
+				.markEmailVerified(this.clock);
 	}
 
 	/**
