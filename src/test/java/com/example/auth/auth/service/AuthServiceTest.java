@@ -350,6 +350,59 @@ class AuthServiceTest {
 		assertThat(this.refreshTokenRepository.findAll()).isEmpty();
 	}
 
+	// --- AU-16 미인증 로그인 차단 (sp-docs/requirements/member.md §3 규칙 11·§12.1 의 5) ---
+
+	@Test
+	@DisplayName("미인증 계정은 비밀번호가 맞으면 403 AU006 이고 Refresh Token 을 저장하지 않는다")
+	void 미인증_계정의_맞는_비밀번호는_AU006() {
+		미인증_계정을_만든다("au16-unverified@example.com");
+
+		BusinessException thrown = 로그인에_실패한다("au16-unverified@example.com", RAW_PASSWORD);
+
+		assertThat(thrown.getErrorCode()).isEqualTo(ErrorCode.EMAIL_NOT_VERIFIED);
+		assertThat(thrown.getErrorCode().getStatus()).isEqualTo(HttpStatus.FORBIDDEN);
+		assertThat(this.refreshTokenRepository.findAll()).as("토큰을 주지 않는다").isEmpty();
+	}
+
+	@Test
+	@DisplayName("미인증 계정이어도 비밀번호가 틀리면 401 AU003 이다 — AU006 은 비밀번호가 맞은 뒤에만 나온다")
+	void 미인증_계정의_틀린_비밀번호는_AU003() {
+		미인증_계정을_만든다("au16-unverified-wrong@example.com");
+
+		BusinessException thrown = 로그인에_실패한다("au16-unverified-wrong@example.com", "Other1!pw");
+
+		assertThat(thrown.getErrorCode()).isEqualTo(ErrorCode.LOGIN_FAILED);
+		assertThat(this.refreshTokenRepository.findAll()).isEmpty();
+	}
+
+	@Test
+	@DisplayName("탈퇴한 미인증 계정은 비밀번호가 맞아도 AU006 이 아니라 401 AU003 이다 — 탈퇴 계정은 없는 계정이다")
+	void 탈퇴한_미인증_계정은_AU003() {
+		Account account = 미인증_계정을_만든다("au16-unverified-withdrawn@example.com");
+		account.withdraw();
+		this.accountRepository.saveAndFlush(account);
+
+		BusinessException thrown = 로그인에_실패한다("au16-unverified-withdrawn@example.com", RAW_PASSWORD);
+
+		assertThat(thrown.getErrorCode()).isEqualTo(ErrorCode.LOGIN_FAILED);
+		assertThat(this.refreshTokenRepository.findAll()).isEmpty();
+	}
+
+	@Test
+	@DisplayName("인증을 채운 뒤에는 같은 계정이 로그인된다")
+	void 인증한_뒤_로그인된다() {
+		Account account = 미인증_계정을_만든다("au16-verified-later@example.com");
+		assertThat(로그인에_실패한다("au16-verified-later@example.com", RAW_PASSWORD).getErrorCode())
+				.isEqualTo(ErrorCode.EMAIL_NOT_VERIFIED);
+		account.markEmailVerified(CLOCK);
+		this.accountRepository.saveAndFlush(account);
+
+		TokenResponse tokens = this.authService.login(로그인("au16-verified-later@example.com", RAW_PASSWORD));
+
+		assertThat(tokens.accessToken()).isNotBlank();
+		assertThat(this.refreshTokenRepository.findByAccountId(account.getId())).isPresent();
+	}
+
 	/**
 	 * claim 집합을 <b>"정확히 이 다섯 개"</b>로 고정한다. {@code nickname} 이 없는지만 보면 다른
 	 * claim 이 늘어나는 것을 놓친다 — §6 은 세 서비스가 공유하는 계약이다.
@@ -856,8 +909,21 @@ class AuthServiceTest {
 		return new LoginRequest(email, password);
 	}
 
-	/** 프로필은 만들지 않는다 — auth 는 프로필을 소유하지 않는다. */
+	/**
+	 * 인증된 계정. 프로필은 만들지 않는다 — auth 는 프로필을 소유하지 않는다.
+	 *
+	 * <p><b>AU-16 부터 인증을 채운다.</b> 미인증 계정의 맞는 비밀번호는 403 {@code AU006} 이므로
+	 * (sp-docs/requirements/member.md §3 규칙 11) 로그인을 선행 상태로 쓰는 테스트들의 계정은 인증돼 있어야 한다.
+	 * 미인증은 {@link #미인증_계정을_만든다} 가 만든다.
+	 */
 	private Account 계정을_만든다(String email) {
+		Account account = 미인증_계정을_만든다(email);
+		account.markEmailVerified(CLOCK);
+		return this.accountRepository.saveAndFlush(account);
+	}
+
+	/** {@code email_verified_at} 이 NULL 인 계정 — AU-16 뒤에 가입한 계정이 인증 전에 그렇다. */
+	private Account 미인증_계정을_만든다(String email) {
 		return this.accountRepository.saveAndFlush(Account.builder()
 				.email(email)
 				// 런타임에 인코딩한다. 해시를 테스트 파일에 적으면 커밋되는 픽스처가 된다

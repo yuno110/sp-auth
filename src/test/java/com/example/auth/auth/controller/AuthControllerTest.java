@@ -7,18 +7,24 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 import com.example.auth.account.entity.Account;
+import com.example.auth.account.entity.AccountToken;
 import com.example.auth.account.entity.Role;
+import com.example.auth.account.entity.TokenPurpose;
 import com.example.auth.account.repository.AccountRepository;
+import com.example.auth.account.repository.AccountTokenRepository;
+import com.example.auth.account.support.AccountTokens;
 import com.example.auth.auth.entity.RefreshToken;
 import com.example.auth.auth.repository.RefreshTokenRepository;
 import com.example.auth.support.TestRsaKeys;
 import com.example.auth.support.TestTokens;
 import com.jayway.jsonpath.JsonPath;
 import java.nio.charset.StandardCharsets;
+import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.temporal.ChronoUnit;
+import java.util.Map;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -28,6 +34,7 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.security.oauth2.jwt.JwtEncoder;
 import org.springframework.test.context.ActiveProfiles;
@@ -69,6 +76,9 @@ class AuthControllerTest {
 	/** sp-docs/api-contract.md §8.1 {@code A003}. */
 	private static final String EXPIRED_TOKEN_MESSAGE = "만료된 토큰입니다.";
 
+	/** AU-16. sp-docs/api-contract.md §8.4 {@code AU006}, §9.10. */
+	private static final String EMAIL_NOT_VERIFIED_MESSAGE = "이메일 인증이 필요합니다.";
+
 	/** sp-docs/security.md §1: Access 30분. */
 	private static final int ACCESS_TOKEN_SECONDS = 1800;
 
@@ -97,15 +107,25 @@ class AuthControllerTest {
 	@Autowired
 	private TransactionTemplate transactionTemplate;
 
+	/** AU-16 — 인증 확인을 거친 로그인의 토큰 행. 이 클래스는 가입을 부르지 않으므로 다른 스레드가 만드는 행은 없다. */
+	@Autowired
+	private AccountTokenRepository accountTokenRepository;
+
+	/** AU-16 — ADMIN seed 의 행을 잠시 바꾸고 되돌린다. */
+	@Autowired
+	private JdbcTemplate jdbcTemplate;
+
 	/**
 	 * <b>seed 행은 남긴다.</b> H2 는 테스트 클래스 사이에 공유되므로
 	 * ({@code DB_CLOSE_DELAY=-1}, sp-docs/tech-stack.md §5.3) 여기서 지우면
 	 * {@code AdminSeedTest} 가 자기와 무관한 이유로 깨진다.
 	 *
-	 * <p>{@code fk_refresh_token_account} 가 있으므로 토큰을 먼저 지운다.
+	 * <p>{@code fk_refresh_token_account} 가 있으므로 토큰을 먼저 지운다. AU-16 의 테스트가 만드는
+	 * {@code account_token} 행도 같은 이유로 먼저 지운다({@code fk_account_token_account}).
 	 */
 	@AfterEach
 	void 정리() {
+		this.accountTokenRepository.deleteAllInBatch();
 		this.refreshTokenRepository.deleteAll();
 		this.refreshTokenRepository.flush();
 		this.accountRepository.deleteAll(this.accountRepository.findAll().stream()
@@ -535,6 +555,83 @@ class AuthControllerTest {
 				Instant.now().minus(Duration.ofHours(2)), Duration.ofHours(1));
 	}
 
+	// --- AU-16 미인증 로그인 차단 (sp-docs/api-contract.md §2.1 의 표, §9.10) ---
+
+	@Test
+	@DisplayName("미인증 계정이 맞는 비밀번호로 로그인하면 403 AU006 이고 토큰이 없다")
+	void 미인증_계정은_403_AU006() throws Exception {
+		Account account = 미인증_계정을_만든다("au16-login-unverified@example.com");
+
+		this.mockMvc.perform(login("au16-login-unverified@example.com", RAW_PASSWORD))
+				.andExpect(status().isForbidden())
+				.andExpect(jsonPath("$.success").value(false))
+				.andExpect(jsonPath("$.data").isEmpty())
+				.andExpect(jsonPath("$.error.code").value("AU006"))
+				.andExpect(jsonPath("$.error.message").value(EMAIL_NOT_VERIFIED_MESSAGE))
+				.andExpect(jsonPath("$.error.fieldErrors").isEmpty());
+
+		assertThat(this.refreshTokenRepository.findByAccountId(account.getId())).isEmpty();
+	}
+
+	@Test
+	@DisplayName("미인증 계정이어도 비밀번호가 틀리면 401 AU003 이다")
+	void 미인증_계정의_틀린_비밀번호는_401_AU003() throws Exception {
+		미인증_계정을_만든다("au16-login-unverified-wrong@example.com");
+
+		this.mockMvc.perform(login("au16-login-unverified-wrong@example.com", "Other1!pw"))
+				.andExpect(status().isUnauthorized())
+				.andExpect(jsonPath("$.error.code").value("AU003"))
+				.andExpect(jsonPath("$.error.message").value(LOGIN_FAILED_MESSAGE));
+	}
+
+	/** 인증 확인({@code POST /accounts/email-verification/confirm})을 HTTP 로 거친 뒤의 로그인. */
+	@Test
+	@DisplayName("인증 확인을 거친 뒤에는 같은 계정이 200 으로 로그인된다")
+	void 인증한_뒤_로그인은_200() throws Exception {
+		Account account = 미인증_계정을_만든다("au16-login-verified@example.com");
+		String token = AccountTokens.generate();
+		this.accountTokenRepository.saveAndFlush(AccountToken.issue(account.getId(), TokenPurpose.EMAIL_VERIFICATION,
+				AccountTokens.hash(token), Duration.ofHours(24), Clock.systemDefaultZone()));
+		this.mockMvc.perform(login("au16-login-verified@example.com", RAW_PASSWORD))
+				.andExpect(status().isForbidden());
+
+		this.mockMvc.perform(post("/api/v1/accounts/email-verification/confirm")
+						.contentType(MediaType.APPLICATION_JSON)
+						.characterEncoding(StandardCharsets.UTF_8)
+						.content("{\"token\": \"" + token + "\"}"))
+				.andExpect(status().isNoContent());
+
+		this.mockMvc.perform(login("au16-login-verified@example.com", RAW_PASSWORD))
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.data.accessToken").isNotEmpty());
+	}
+
+	/**
+	 * {@code V6} 이 컬럼을 더하며 그때의 행 전부를 인증된 것으로 채웠다 — ADMIN seed 도 그 행이다
+	 * (sp-docs/domain-model.md §2.1). 그래서 seed 는 인증 메일 없이 로그인한다.
+	 *
+	 * <p>테스트 프로파일의 seed 비밀번호는 BCrypt 해시가 아닌 placeholder 다(sp-docs/requirements/member.md §10.2) —
+	 * 맞출 평문이 없다. 이 테스트 동안만 런타임에 인코딩한 값으로 바꾸고 끝나면 되돌린다. seed 행은 클래스 사이에
+	 * 공유된다.
+	 */
+	@Test
+	@DisplayName("V6 이 인증으로 채운 ADMIN seed 는 200 으로 로그인된다")
+	void ADMIN_seed_는_로그인된다() throws Exception {
+		Map<String, Object> seed = this.jdbcTemplate.queryForMap(
+				"select id, password, email_verified_at from account where email = ?", ADMIN_EMAIL);
+		assertThat(seed.get("email_verified_at")).as("V6 이 채웠다").isNotNull();
+		Object seedId = seed.get("id");
+		this.jdbcTemplate.update("update account set password = ? where id = ?",
+				this.passwordEncoder.encode(RAW_PASSWORD), seedId);
+		try {
+			this.mockMvc.perform(login(ADMIN_EMAIL, RAW_PASSWORD))
+					.andExpect(status().isOk())
+					.andExpect(jsonPath("$.data.accessToken").isNotEmpty());
+		} finally {
+			this.jdbcTemplate.update("update account set password = ? where id = ?", seed.get("password"), seedId);
+		}
+	}
+
 	private IssuedTokens 로그인한다(String email) throws Exception {
 		String body = this.mockMvc.perform(login(email, RAW_PASSWORD))
 				.andExpect(status().isOk())
@@ -614,8 +711,20 @@ class AuthControllerTest {
 				.content(json);
 	}
 
-	/** 프로필은 만들지 않는다 — auth 는 프로필을 소유하지 않는다. */
+	/**
+	 * 인증된 계정. 프로필은 만들지 않는다 — auth 는 프로필을 소유하지 않는다.
+	 *
+	 * <p><b>AU-16 부터 인증을 채운다.</b> 미인증 계정의 맞는 비밀번호는 403 {@code AU006} 이므로
+	 * (sp-docs/requirements/member.md §3 규칙 11) 로그인을 선행 상태로 쓰는 테스트들의 계정은 인증돼 있어야 한다.
+	 */
 	private Account 계정을_만든다(String email) {
+		Account account = 미인증_계정을_만든다(email);
+		account.markEmailVerified(Clock.systemDefaultZone());
+		return this.accountRepository.saveAndFlush(account);
+	}
+
+	/** {@code email_verified_at} 이 NULL 인 계정 — AU-16 뒤에 가입한 계정이 인증 전에 그렇다. */
+	private Account 미인증_계정을_만든다(String email) {
 		return this.accountRepository.saveAndFlush(Account.builder()
 				.email(email)
 				// 런타임에 인코딩한다. 해시를 테스트 파일에 적으면 커밋되는 픽스처가 된다

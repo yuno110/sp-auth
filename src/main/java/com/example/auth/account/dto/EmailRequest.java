@@ -1,0 +1,24 @@
+package com.example.auth.account.dto;
+
+import jakarta.validation.constraints.Email;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Size;
+
+/**
+ * 이메일 하나를 받는 요청 — 인증 메일 재발송. 정본: sp-docs/api-contract.md §2.4.
+ *
+ * <p><b>{@code email} 은 생성과 같은 규칙이다</b> (§2.4, sp-docs/requirements/member.md §2). 누락·빈 값·형식·길이
+ * 위반은 400 {@code C001} 이고 {@code fieldErrors} 에 {@code email} 이 담긴다. 규칙을 두 군데 적지 않기 위해
+ * {@link AccountCreateRequest} 의 상수를 그대로 쓴다 — {@code GET /accounts/check-email} 과 같은 방식이다.
+ *
+ * <p>그 밖의 입력은 계정의 상태와 상관없이 202 다. 이 값으로 계정을 찾는 것은 요청 스레드가 아니라 발급 작업이다
+ * (sp-docs/requirements/member.md §11.3).
+ */
+public record EmailRequest(
+
+		@NotBlank(message = AccountCreateRequest.EMAIL_MESSAGE)
+		@Email(message = AccountCreateRequest.EMAIL_MESSAGE)
+		@Size(max = AccountCreateRequest.EMAIL_MAX_LENGTH, message = AccountCreateRequest.EMAIL_MESSAGE)
+		String email) {
+
+}

@@ -7,11 +7,16 @@ import com.example.auth.account.dto.CheckResponse;
 import com.example.auth.account.dto.PasswordChangeRequest;
 import com.example.auth.account.dto.WithdrawRequest;
 import com.example.auth.account.entity.Account;
+import com.example.auth.account.entity.AccountToken;
+import com.example.auth.account.entity.TokenPurpose;
 import com.example.auth.account.repository.AccountRepository;
+import com.example.auth.account.repository.AccountTokenRepository;
 import com.example.auth.account.support.AccountReader;
+import com.example.auth.account.support.AccountTokens;
 import com.example.auth.auth.repository.RefreshTokenRepository;
 import com.example.auth.global.error.BusinessException;
 import com.example.auth.global.error.ErrorCode;
+import java.time.Clock;
 import lombok.RequiredArgsConstructor;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.security.crypto.password.PasswordEncoder;
@@ -22,7 +27,8 @@ import org.springframework.transaction.annotation.Transactional;
  * 계정 유스케이스. 정본: sp-docs/requirements/member.md §1 §2 §4,
  * sp-docs/api-contract.md §2.2 §9.1.
  *
- * <p>AU-05 가 만들고 AU-08·AU-09·AU-10 이 확장한다 (sp-docs/plan/phase1.md §2.3).
+ * <p>AU-05 가 만들고 AU-08·AU-09·AU-10 이 확장한다 (sp-docs/plan/phase1.md §2.3). 2차의 AU-16 이 가입 뒤 발급과
+ * 인증 메일 재발송·확인을 더했다 (sp-docs/plan/phase2-auth-member.md, sp-docs/requirements/member.md §11.2).
  *
  * <p><b>닉네임을 다루지 않는다.</b> 계정은 이메일·비밀번호·권한만 갖는다
  * (sp-docs/adr/0012-auth-as-separate-service.md).
@@ -48,12 +54,25 @@ public class AccountService {
 	 */
 	private final RefreshTokenRepository refreshTokenRepository;
 
+	/** 인증 메일의 발급 작업 — 가입과 재발송이 넘긴다 (AU-15, sp-docs/requirements/member.md §11.5). */
+	private final AccountTokenIssuer accountTokenIssuer;
+
+	/** 인증 확인의 사용 처리 (sp-docs/requirements/member.md §11.1). */
+	private final AccountTokenRepository accountTokenRepository;
+
+	/** 앱 시계. 토큰의 만료 판정과 인증 시각이 이 시계에서 나온다 — DB 의 {@code NOW()} 를 쓰지 않는다 (§11.1). */
+	private final Clock clock;
+
 	/**
 	 * 가입 1단계 — 계정 생성 (sp-docs/requirements/member.md §4).
 	 *
 	 * <p>이메일이 이미 쓰이고 있으면 {@code AU002}(409)다. <b>탈퇴한 계정도 여기에 걸린다</b> —
 	 * {@code deleted = true} 인 행이 남아 있고 {@code existsByEmail} 이 탈퇴 여부를 보지 않으므로
 	 * 재가입이 막힌다 (sp-docs/requirements/member.md §3 규칙 1).
+	 *
+	 * <p><b>계정 INSERT 가 커밋된 뒤에 인증 메일 발급을 넘긴다</b> (sp-docs/requirements/member.md §11.2).
+	 * 이 트랜잭션이 되돌려지면 넘기지 않으므로 메일도 없다. 요청·응답(201, 중복이면 409 {@code AU002})은 그대로다
+	 * (sp-docs/api-contract.md §2.2). 만든 계정은 인증 전에 로그인할 수 없다 (§3 규칙 11).
 	 */
 	@Transactional
 	public AccountResponse create(AccountCreateRequest request) {
@@ -68,15 +87,83 @@ public class AccountService {
 				// role 은 지정하지 않는다 — 기본값 USER 다 (sp-docs/domain-model.md §2.1)
 				.build();
 
+		Account saved;
 		try {
 			// saveAndFlush 다. save 만 하면 제약 위반이 커밋 시점(이 메서드 밖)에 터져
 			// DataIntegrityViolationException 이 500 C005 로 새어 나간다
-			return AccountResponse.from(this.accountRepository.saveAndFlush(account));
+			saved = this.accountRepository.saveAndFlush(account);
 		} catch (DataIntegrityViolationException e) {
 			// 위 검사와 INSERT 사이에 다른 요청이 같은 이메일을 선점한 경우다.
 			// uk_account_email 이 최종 방어선이고, 사용자에게는 중복과 같은 상황이므로 AU002 다
 			throw new BusinessException(ErrorCode.EMAIL_DUPLICATED);
 		}
+
+		// 이 트랜잭션에 거는 것이다 — 커밋되면 그때 발급 작업이 발송 실행기로 넘어가고, 되돌려지면 넘어가지 않는다.
+		// 바깥 트랜잭션에 참여한 호출이면 그 바깥의 커밋을 기다린다
+		this.accountTokenIssuer.requestAfterCommit(TokenPurpose.EMAIL_VERIFICATION, saved.getId());
+		return AccountResponse.from(saved);
+	}
+
+	/**
+	 * MR-14 — 인증 메일 재발송 (sp-docs/requirements/member.md §11.2, sp-docs/api-contract.md §2.4).
+	 *
+	 * <p><b>이 메서드는 DB 일을 하지 않는다.</b> 발급 작업을 발송 실행기에 넘기기만 하고, 계정 찾기·보낼 조건(활성이고
+	 * 미인증)·토큰·메일은 그 작업이 한다 — 응답 시간이 계정의 유무로 갈리지 않는다 (sp-docs/security.md §12). 할 DB 일이
+	 * 없으므로 {@code @Transactional} 을 두지 않는다.
+	 *
+	 * <p>계정이 없거나 탈퇴했거나 이미 인증됐어도 실패가 아니다 — 응답은 언제나 같은 202 다.
+	 *
+	 * @param email 요청에 실린 문자열. 메일은 이 표기가 아니라 계정에 저장된 주소로 간다 (§11.3)
+	 */
+	public void resendVerification(String email) {
+		this.accountTokenIssuer.request(TokenPurpose.EMAIL_VERIFICATION, email);
+	}
+
+	/**
+	 * MR-14 — 이메일 인증 확인 (sp-docs/requirements/member.md §11.2, sp-docs/api-contract.md §2.4).
+	 *
+	 * <p><b>한 트랜잭션이다.</b> 순서는 §11.2 를 따른다.
+	 * <ol>
+	 *   <li>토큰 사용 처리 — 조건부 UPDATE 하나가 판정한다. 0행이면 400 {@code AU007}</li>
+	 *   <li>그 계정이 탈퇴했으면 되돌린다 — 400 {@code AU007}. 예외가 이 트랜잭션을 되돌려 1의 사용 처리도 없던 일이
+	 *   된다</li>
+	 *   <li>{@code email_verified_at} 이 NULL 이면 지금 시각으로 채운다. 이미 인증됐으면 그대로 둔다</li>
+	 * </ol>
+	 *
+	 * <p>없음·만료·사용됨·목적 다름·탈퇴 계정을 가르지 않는다 — 모두 같은 {@code AU007} 이다 (§11.1). 토큰의 길이·문자가
+	 * 틀려도 형식 오류가 아니라 맞지 않는 토큰이다 (sp-docs/api-contract.md §2.4).
+	 *
+	 * <p><b>로그인하지 않는다.</b> 토큰(Access·Refresh)을 주지 않는다 — 화면이 로그인으로 안내한다 (§11.2).
+	 *
+	 * @param token 메일 링크의 토큰 원문. 받은 문자열을 해시해 찾는다 — 원문은 저장돼 있지 않다
+	 */
+	@Transactional
+	public void confirmEmailVerification(String token) {
+		String tokenHash = AccountTokens.hash(token);
+
+		// 1) 사용 처리. 읽어서 확인한 뒤 쓰지 않는다 — 같은 토큰의 동시 확인 둘이 모두 성공한다.
+		// 이 문장은 영속성 컨텍스트를 비운다. 그래서 계정은 이 문장 뒤에 처음 읽는다
+		if (this.accountTokenRepository.consume(tokenHash, TokenPurpose.EMAIL_VERIFICATION, this.clock) != 1) {
+			throw invalidLinkToken();
+		}
+
+		// 방금 이 트랜잭션이 사용 처리한 행이다. 없다면 판정이 아니라 불변식이 깨진 것이므로 숨기지 않는다
+		Long accountId = this.accountTokenRepository.findByTokenHash(tokenHash)
+				.map(AccountToken::getAccountId)
+				.orElseThrow(() -> new IllegalStateException("사용 처리한 토큰의 행이 없다"));
+
+		// 잠금 읽기다 — 인증 시각의 쓰기가 탈퇴 검사가 본 값 위에 놓인다. 이유는 AccountRepository#findByIdForUpdate 에 있다.
+		// 행은 있어야 한다 — fk_account_token_account(ON DELETE 절 없음, V7)가 토큰이 남은 계정의 삭제를 막는다
+		Account account = this.accountRepository.findByIdForUpdate(accountId)
+				.orElseThrow(() -> new IllegalStateException("토큰이 가리키는 계정의 행이 없다"));
+
+		// 2) 탈퇴 계정. 토큰 오류와 같은 응답이다. 닫힌 행에는 쓰지 않는다
+		if (!account.isActive()) {
+			throw invalidLinkToken();
+		}
+
+		// 3) 처음 인증한 시각이 남는다 — 이미 채워져 있으면 덮지 않는다 (Account#markEmailVerified)
+		account.markEmailVerified(this.clock);
 	}
 
 	/**
@@ -257,6 +344,11 @@ public class AccountService {
 
 		// 같은 트랜잭션이다. 멱등이므로 저장된 행이 없어도 지울 것이 없을 뿐이다
 		this.refreshTokenRepository.deleteByAccountId(accountId);
+	}
+
+	/** 링크 토큰의 실패가 모두 같은 예외를 쓴다. 사유를 구분해 내보내지 않는다 (sp-docs/requirements/member.md §11.1). */
+	private static BusinessException invalidLinkToken() {
+		return new BusinessException(ErrorCode.INVALID_LINK_TOKEN);
 	}
 
 }

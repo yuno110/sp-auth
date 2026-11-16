@@ -1,6 +1,7 @@
 package com.example.auth.account.controller;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.patch;
@@ -9,30 +10,46 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 import com.example.auth.account.entity.Account;
+import com.example.auth.account.entity.AccountToken;
 import com.example.auth.account.entity.Role;
+import com.example.auth.account.entity.TokenPurpose;
 import com.example.auth.account.repository.AccountRepository;
+import com.example.auth.account.repository.AccountTokenRepository;
+import com.example.auth.account.support.AccountTokens;
 import com.example.auth.auth.repository.RefreshTokenRepository;
+import com.example.auth.global.config.MailExecutorConfig;
 import com.example.auth.global.security.JwtTokenProvider;
+import com.example.auth.support.InMemoryMailer;
+import com.example.auth.support.MailExecutorDrain;
+import com.example.auth.support.MutableClock;
 import com.example.auth.support.TestRsaKeys;
 import com.jayway.jsonpath.JsonPath;
 import java.nio.charset.StandardCharsets;
+import java.time.Clock;
+import java.time.Duration;
 import java.time.LocalDateTime;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.test.context.bean.override.convention.TestBean;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.ResultActions;
 import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder;
@@ -79,9 +96,47 @@ class AccountControllerTest {
 	 */
 	private static final String CURRENT_PASSWORD_MESSAGE = "현재 비밀번호를 입력해주세요.";
 
+	/** AU-16. sp-docs/api-contract.md §8.4 {@code AU007}. */
+	private static final String INVALID_LINK_TOKEN_MESSAGE = "링크가 유효하지 않거나 만료되었습니다.";
+
+	/**
+	 * AU-16 — {@code token} 누락의 {@code fieldErrors} 메시지. 존재 메시지다({@code TokenConfirmRequest}).
+	 * {@link #CURRENT_PASSWORD_MESSAGE} 와 같은 이유로 상수를 참조하지 않는다.
+	 */
+	private static final String TOKEN_MESSAGE = "토큰을 입력해주세요.";
+
+	/** AU-16 — 202 의 본문. 계정의 상태와 상관없이 이것 하나다 (sp-docs/api-contract.md §2.4). */
+	private static final String ACCEPTED_BODY = "{\"success\":true,\"data\":null,\"error\":null}";
+
+	/**
+	 * AU-16 — {@code application-test.yml} 의 {@code mail.frontend-base-url}. 링크의 기준 주소는 이 설정에서만 온다
+	 * (sp-docs/security.md §12). 요청에는 이것과 다른 {@code Host} 를 싣는다.
+	 */
+	private static final String FRONTEND_BASE_URL = "http://localhost:3000";
+
+	/** AU-16 — 요청에 싣는 다른 {@code Host}. 링크에 나오면 안 된다. */
+	private static final String FORGED_HOST = "attacker.example.test";
+
+	private static final Pattern VERIFY_LINK =
+			Pattern.compile(Pattern.quote(FRONTEND_BASE_URL + "/verify-email#token=") + "(\\S+)");
+
+	/** AU-16 — 인증·만료를 정확한 시각으로 보려고 시계를 멈추는 시각. */
+	private static final LocalDateTime NOW = LocalDateTime.of(2026, 11, 13, 10, 0, 0);
+
+	/** AU-16 — 앱 시계를 바꿔 끼운다. 고정하지 않은 테스트에서는 시스템 시계다 ({@link MutableClock}). */
+	private static final MutableClock CLOCK = new MutableClock();
+
 	@DynamicPropertySource
 	static void jwtPrivateKey(DynamicPropertyRegistry registry) {
 		TestRsaKeys.registerPrivateKeyLocation(registry);
+	}
+
+	/** 애플리케이션의 {@code Clock} 빈을 {@link #CLOCK} 로 바꾼다 ({@code ClockConfig}). */
+	@TestBean
+	private Clock clock;
+
+	static Clock clock() {
+		return CLOCK;
 	}
 
 	@Autowired
@@ -104,6 +159,19 @@ class AccountControllerTest {
 	@Autowired
 	private JdbcTemplate jdbcTemplate;
 
+	/** AU-16 — 인증 링크 토큰. 가입·재발송이 다른 스레드에서 만들고, 확인이 사용 처리한다. */
+	@Autowired
+	private AccountTokenRepository accountTokenRepository;
+
+	/** AU-16 — 시험용 발송기 ({@code TestMailConfig}). 보낸 메일을 모은다. */
+	@Autowired
+	private InMemoryMailer inMemoryMailer;
+
+	/** AU-16 — 발급 작업과 발송이 도는 실행기. 정리와 「더 보낸 메일이 없다」 가 이것이 비기를 기다린다. */
+	@Autowired
+	@Qualifier(MailExecutorConfig.MAIL_EXECUTOR)
+	private ThreadPoolTaskExecutor mailExecutor;
+
 	/**
 	 * <b>seed 행은 남긴다.</b> H2 는 테스트 클래스 사이에 공유되므로
 	 * ({@code DB_CLOSE_DELAY=-1}, sp-docs/tech-stack.md §5.3) 여기서 지우면
@@ -111,9 +179,17 @@ class AccountControllerTest {
 	 *
 	 * <p>{@code fk_refresh_token_account} 가 있으므로 토큰을 먼저 지운다 — AU-08 의 테스트가
 	 * 로그인으로 {@code refresh_token} 행을 만든다.
+	 *
+	 * <p><b>AU-16 부터 가입이 다른 스레드에서 {@code account_token} 행과 메일을 만든다.</b> 그 작업이 끝나기를 먼저
+	 * 기다리고({@link MailExecutorDrain}) 메일을 버린 뒤 그 행을 지운다 — 남기면 계정 삭제가
+	 * {@code fk_account_token_account} 에 걸린다.
 	 */
 	@AfterEach
 	void 정리() {
+		CLOCK.reset();
+		MailExecutorDrain.drain(this.mailExecutor);
+		this.inMemoryMailer.clear();
+		this.accountTokenRepository.deleteAllInBatch();
 		this.refreshTokenRepository.deleteAll();
 		this.refreshTokenRepository.flush();
 		this.accountRepository.deleteAll(this.accountRepository.findAll().stream()
@@ -1036,11 +1112,18 @@ class AccountControllerTest {
 		return this.mockMvc.perform(get("/api/v1/accounts/check-email").param("email", email));
 	}
 
-	/** 계정을 만들고 로그인한다. 둘 다 실제 엔드포인트를 지나므로 픽스처에 해시를 적지 않는다. */
+	/**
+	 * 가입하고 로그인한다. 둘 다 실제 엔드포인트를 지나므로 픽스처에 해시를 적지 않는다.
+	 *
+	 * <p><b>AU-16 부터 그 사이에 인증을 채운다</b> — 미인증 계정의 로그인은 403 {@code AU006} 이다
+	 * (sp-docs/requirements/member.md §3 규칙 11). 이 헬퍼를 쓰는 테스트는 세션을 선행 상태로만 전제하므로 인증을
+	 * 엔터티로 채운다. 가입 메일의 링크로 인증하는 흐름은 {@link #확인_정상()} 이 본다.
+	 */
 	private IssuedTokens 계정과_세션을_만든다(String email) throws Exception {
 		this.mockMvc.perform(createRequest(
 						"{\"email\": \"" + email + "\", \"password\": \"" + RAW_PASSWORD + "\"}"))
 				.andExpect(status().isCreated());
+		인증을_채운다(email, LocalDateTime.now(CLOCK));
 
 		String body = this.mockMvc.perform(loginRequest(email, RAW_PASSWORD))
 				.andExpect(status().isOk())
@@ -1132,6 +1215,335 @@ class AccountControllerTest {
 				.build());
 		account.withdraw();
 		this.accountRepository.saveAndFlush(account);
+	}
+
+	// --- AU-16 이메일 인증 — 가입 뒤 발급·재발송·확인 (sp-docs/plan/phase2-auth-member.md AU-16 의 검증 표) ---
+
+	@Test
+	@DisplayName("가입은 201 이고 커밋 뒤 인증 메일이 한 통 간다 — 요청의 Host 가 달라도 링크의 기준 주소는 설정값이다")
+	void 가입은_인증_메일을_보낸다() throws Exception {
+		this.mockMvc.perform(createRequest("{\"email\": \"au16-signup@example.com\", \"password\": \""
+								+ RAW_PASSWORD + "\"}")
+						.header(HttpHeaders.HOST, FORGED_HOST))
+				.andExpect(status().isCreated())
+				.andExpect(jsonPath("$.data.email").value("au16-signup@example.com"));
+
+		InMemoryMailer.Sent sent = this.inMemoryMailer.next(Duration.ofSeconds(5));
+		assertThat(sent.mail().to()).isEqualTo("au16-signup@example.com");
+		assertThat(sent.mail().purpose()).isEqualTo(TokenPurpose.EMAIL_VERIFICATION.name());
+		assertThat(sent.mail().text()).doesNotContain(FORGED_HOST);
+		assertThat(링크의_토큰(sent)).isNotBlank();
+		더_보낸_메일이_없다();
+	}
+
+	@Test
+	@DisplayName("재발송은 계정이 없다·탈퇴했다·인증됐다·아니다 모두 202 와 같은 본문이고, 메일은 미인증일 때만 간다")
+	void 재발송은_언제나_202() throws Exception {
+		미인증_계정을_만든다("au16-resend-unverified@example.com");
+		Long verified = 미인증_계정을_만든다("au16-resend-verified@example.com");
+		인증을_채운다("au16-resend-verified@example.com", NOW);
+		탈퇴한_계정을_만든다("au16-resend-withdrawn@example.com");
+
+		List<String> bodies = new ArrayList<>();
+		for (String email : List.of("au16-resend-none@example.com", "au16-resend-withdrawn@example.com",
+				"au16-resend-verified@example.com", "au16-resend-unverified@example.com")) {
+			bodies.add(this.mockMvc.perform(resend("{\"email\": \"" + email + "\"}").header(HttpHeaders.HOST, FORGED_HOST))
+					.andExpect(status().isAccepted())
+					.andReturn().getResponse().getContentAsString(StandardCharsets.UTF_8));
+		}
+
+		assertThat(bodies).as("202 가 계정의 상태를 말하지 않는다 (sp-docs/api-contract.md §2.4)")
+				.containsOnly(ACCEPTED_BODY).hasSize(4);
+		InMemoryMailer.Sent sent = this.inMemoryMailer.next(Duration.ofSeconds(5));
+		assertThat(sent.mail().to()).isEqualTo("au16-resend-unverified@example.com");
+		assertThat(sent.mail().text()).doesNotContain(FORGED_HOST);
+		assertThat(링크의_토큰(sent)).isNotBlank();
+		더_보낸_메일이_없다();
+		assertThat(this.accountTokenRepository.findAll()).extracting(AccountToken::getAccountId)
+				.as("인증된 계정에는 토큰도 없다").doesNotContain(verified);
+	}
+
+	@ParameterizedTest(name = "{0}")
+	@ValueSource(strings = {
+			"{}",
+			"{\"email\": null}",
+			"{\"email\": \"\"}",
+			"{\"email\": \"not-an-email\"}",
+			// 101자. 형식은 맞고(라벨 셋이 31자씩) 최대 100자만 넘는다
+			"{\"email\": \"a@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.com\"}"
+	})
+	@DisplayName("재발송의 email 이 생성과 같은 규칙을 어기면 400 C001 이고 fieldErrors 에 email 이다")
+	void 재발송_형식_위반(String json) throws Exception {
+		this.mockMvc.perform(resend(json))
+				.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.success").value(false))
+				.andExpect(jsonPath("$.error.code").value("C001"))
+				.andExpect(jsonPath("$.error.fieldErrors.length()").value(1))
+				.andExpect(jsonPath("$.error.fieldErrors[0].field").value("email"))
+				.andExpect(jsonPath("$.error.fieldErrors[0].message").value(EMAIL_MESSAGE));
+	}
+
+	@Test
+	@DisplayName("재발송의 email 은 100자까지 받는다 — 길이 경계의 안쪽은 202 다")
+	void 재발송_100자() throws Exception {
+		String email = "a@" + "b".repeat(31) + "." + "b".repeat(31) + "." + "b".repeat(30) + ".com";
+		assertThat(email).hasSize(100);
+
+		this.mockMvc.perform(resend("{\"email\": \"" + email + "\"}"))
+				.andExpect(status().isAccepted());
+	}
+
+	@Test
+	@DisplayName("확인 — 가입 메일의 링크 토큰으로 204, 본문이 없고 email_verified_at 이 지금 시각으로 채워진다. 토큰을 주지 않는다")
+	void 확인_정상() throws Exception {
+		CLOCK.set(NOW);
+		this.mockMvc.perform(createRequest("{\"email\": \"au16-confirm@example.com\", \"password\": \""
+						+ RAW_PASSWORD + "\"}"))
+				.andExpect(status().isCreated());
+		String token = 링크의_토큰(this.inMemoryMailer.next(Duration.ofSeconds(5)));
+		Long id = this.accountRepository.findByEmail("au16-confirm@example.com").orElseThrow().getId();
+		CLOCK.set(NOW.plusHours(1));
+
+		String body = this.mockMvc.perform(confirm("{\"token\": \"" + token + "\"}"))
+				.andExpect(status().isNoContent())
+				.andReturn().getResponse().getContentAsString(StandardCharsets.UTF_8);
+
+		assertThat(body).as("본문이 없다 — Access·Refresh 를 주지 않는다").isEmpty();
+		assertThat(인증_시각(id)).isEqualTo(NOW.plusHours(1));
+		assertThat(this.refreshTokenRepository.findByAccountId(id)).as("세션을 만들지 않는다").isEmpty();
+	}
+
+	@Test
+	@DisplayName("확인 — 같은 토큰을 두 번 보내면 둘째가 400 AU007 이다")
+	void 확인_같은_토큰_두_번() throws Exception {
+		Long id = 미인증_계정을_만든다("au16-twice@example.com");
+		String token = 토큰을_심는다(id, TokenPurpose.EMAIL_VERIFICATION);
+
+		this.mockMvc.perform(confirm("{\"token\": \"" + token + "\"}"))
+				.andExpect(status().isNoContent());
+		링크_토큰_오류다(this.mockMvc.perform(confirm("{\"token\": \"" + token + "\"}")));
+	}
+
+	/**
+	 * 수명은 발급 작업이 정한 24시간이다 (sp-docs/requirements/member.md §11.1). 사용 처리가 {@code expires_at > now} 를
+	 * 보므로 발급 뒤 24시간에서 1초 모자라면 받고, 꼭 24시간이면 받지 않는다. 토큰은 재발송의 실제 발급으로 만든다 —
+	 * 수명을 이 테스트가 다시 적지 않는다.
+	 */
+	@Test
+	@DisplayName("확인 — 수명 경계: 발급 뒤 24시간에서 1초 모자라면 204, 꼭 24시간이면 400 AU007 이다")
+	void 확인_수명_경계() throws Exception {
+		CLOCK.set(NOW);
+		Long inside = 미인증_계정을_만든다("au16-expiry-inside@example.com");
+		Long boundary = 미인증_계정을_만든다("au16-expiry-boundary@example.com");
+		String insideToken = 재발송하고_토큰을_꺼낸다("au16-expiry-inside@example.com");
+		String boundaryToken = 재발송하고_토큰을_꺼낸다("au16-expiry-boundary@example.com");
+
+		CLOCK.set(NOW.plusHours(24).minusSeconds(1));
+		this.mockMvc.perform(confirm("{\"token\": \"" + insideToken + "\"}"))
+				.andExpect(status().isNoContent());
+
+		CLOCK.set(NOW.plusHours(24));
+		링크_토큰_오류다(this.mockMvc.perform(confirm("{\"token\": \"" + boundaryToken + "\"}")));
+
+		assertThat(인증_시각(inside)).isEqualTo(NOW.plusHours(24).minusSeconds(1));
+		assertThat(인증_시각(boundary)).isNull();
+		assertThat(사용_시각(boundaryToken)).isNull();
+	}
+
+	@Test
+	@DisplayName("확인 — 재설정 목적의 토큰은 400 AU007 이다. 그 토큰은 쓰이지 않는다")
+	void 확인_재설정_목적의_토큰() throws Exception {
+		Long id = 미인증_계정을_만든다("au16-reset-purpose@example.com");
+		String token = 토큰을_심는다(id, TokenPurpose.PASSWORD_RESET);
+
+		링크_토큰_오류다(this.mockMvc.perform(confirm("{\"token\": \"" + token + "\"}")));
+
+		assertThat(인증_시각(id)).isNull();
+		assertThat(사용_시각(token)).isNull();
+	}
+
+	@Test
+	@DisplayName("확인 — 탈퇴한 계정은 400 AU007 이다. email_verified_at 은 그대로이고 토큰의 사용 처리도 되돌려진다")
+	void 확인_탈퇴한_계정() throws Exception {
+		Long id = 미인증_계정을_만든다("au16-withdrawn@example.com");
+		String token = 토큰을_심는다(id, TokenPurpose.EMAIL_VERIFICATION);
+		탈퇴시킨다("au16-withdrawn@example.com");
+
+		링크_토큰_오류다(this.mockMvc.perform(confirm("{\"token\": \"" + token + "\"}")));
+
+		assertThat(인증_시각(id)).isNull();
+		assertThat(사용_시각(token)).as("사용 처리가 확인의 트랜잭션과 함께 되돌려진다").isNull();
+	}
+
+	/**
+	 * 탈퇴 검사가 「이미 인증됐으면 그대로 둔다」 보다 먼저다 (sp-docs/requirements/member.md §11.2 의 2 와 3) — 인증된
+	 * 계정이어도 탈퇴했으면 204 가 아니다. 인증된 계정에도 살아 있는 인증 토큰이 있을 수 있다: 같은 계정·같은 목적의 발급
+	 * 둘이 겹치면 둘 다 남을 수 있고(§11.1), 하나로 인증해도 다른 하나는 남는다.
+	 */
+	@Test
+	@DisplayName("확인 — 이미 인증된 계정도 탈퇴했으면 400 AU007 이다. email_verified_at 은 그대로이고 토큰의 사용 처리도 되돌려진다")
+	void 확인_인증된_뒤_탈퇴한_계정() throws Exception {
+		CLOCK.set(NOW);
+		Long id = 미인증_계정을_만든다("au16-verified-withdrawn@example.com");
+		인증을_채운다("au16-verified-withdrawn@example.com", NOW.minusDays(1));
+		String token = 토큰을_심는다(id, TokenPurpose.EMAIL_VERIFICATION);
+		탈퇴시킨다("au16-verified-withdrawn@example.com");
+
+		링크_토큰_오류다(this.mockMvc.perform(confirm("{\"token\": \"" + token + "\"}")));
+
+		assertThat(인증_시각(id)).as("처음 인증한 시각이 그대로다").isEqualTo(NOW.minusDays(1));
+		assertThat(사용_시각(token)).as("사용 처리가 확인의 트랜잭션과 함께 되돌려진다").isNull();
+	}
+
+	@Test
+	@DisplayName("확인 — 이미 인증된 계정은 204 이고 처음 인증한 시각이 남는다")
+	void 확인_이미_인증된_계정() throws Exception {
+		CLOCK.set(NOW);
+		Long id = 미인증_계정을_만든다("au16-already@example.com");
+		인증을_채운다("au16-already@example.com", NOW.minusDays(1));
+		String token = 토큰을_심는다(id, TokenPurpose.EMAIL_VERIFICATION);
+
+		this.mockMvc.perform(confirm("{\"token\": \"" + token + "\"}"))
+				.andExpect(status().isNoContent());
+
+		assertThat(인증_시각(id)).isEqualTo(NOW.minusDays(1));
+		assertThat(사용_시각(token)).as("토큰은 쓰였다").isEqualTo(NOW);
+	}
+
+	@ParameterizedTest(name = "{0}")
+	@ValueSource(strings = {
+			"{}",
+			"{\"token\": null}",
+			"{\"token\": \"\"}",
+			"{\"token\": \"   \"}"
+	})
+	@DisplayName("확인 — token 누락·null·빈 값은 400 C001 이고 fieldErrors 에 token 이다")
+	void 확인_token_누락(String json) throws Exception {
+		this.mockMvc.perform(confirm(json))
+				.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.success").value(false))
+				.andExpect(jsonPath("$.error.code").value("C001"))
+				.andExpect(jsonPath("$.error.fieldErrors.length()").value(1))
+				.andExpect(jsonPath("$.error.fieldErrors[0].field").value("token"))
+				.andExpect(jsonPath("$.error.fieldErrors[0].message").value(TOKEN_MESSAGE));
+	}
+
+	/**
+	 * 형식 검증을 걸지 않는다 (sp-docs/api-contract.md §2.4) — 길이·문자 집합이 틀린 토큰은 맞지 않는 토큰이고 400
+	 * {@code C001} 이 아니라 {@code AU007} 이다. 발급하는 토큰은 43자의 base64url 이다(AU-15).
+	 */
+	@ParameterizedTest(name = "{0}")
+	@ValueSource(strings = {
+			"a",
+			// 42자·44자 — 발급하는 길이의 바로 안팎
+			"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+			"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+			// 43자지만 base64url 밖의 문자
+			"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!",
+			"토큰",
+			"has space"
+	})
+	@DisplayName("확인 — 길이·문자가 틀린 token 은 C001 이 아니라 400 AU007 이다")
+	void 확인_형식이_틀린_token(String token) throws Exception {
+		링크_토큰_오류다(this.mockMvc.perform(confirm("{\"token\": \"" + token + "\"}")));
+	}
+
+	@Test
+	@DisplayName("확인 — 아주 긴 token 도 400 AU007 이다")
+	void 확인_아주_긴_token() throws Exception {
+		링크_토큰_오류다(this.mockMvc.perform(confirm("{\"token\": \"" + "A".repeat(10_000) + "\"}")));
+	}
+
+	// --- AU-16 도우미 ---
+
+	private static MockHttpServletRequestBuilder resend(String json) {
+		return post("/api/v1/accounts/email-verification")
+				.contentType(MediaType.APPLICATION_JSON)
+				.characterEncoding(StandardCharsets.UTF_8)
+				.content(json);
+	}
+
+	private static MockHttpServletRequestBuilder confirm(String json) {
+		return post("/api/v1/accounts/email-verification/confirm")
+				.contentType(MediaType.APPLICATION_JSON)
+				.characterEncoding(StandardCharsets.UTF_8)
+				.content(json);
+	}
+
+	/** 400 {@code AU007} — 없음·만료·사용됨·목적 다름·탈퇴 계정이 이 하나다 (sp-docs/requirements/member.md §11.1). */
+	private static void 링크_토큰_오류다(ResultActions result) throws Exception {
+		result.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.success").value(false))
+				.andExpect(jsonPath("$.data").isEmpty())
+				.andExpect(jsonPath("$.error.code").value("AU007"))
+				.andExpect(jsonPath("$.error.message").value(INVALID_LINK_TOKEN_MESSAGE))
+				.andExpect(jsonPath("$.error.fieldErrors").isEmpty());
+	}
+
+	/** 링크의 기준 주소가 설정값인지 보고 토큰을 꺼낸다. */
+	private static String 링크의_토큰(InMemoryMailer.Sent sent) {
+		Matcher matcher = VERIFY_LINK.matcher(sent.mail().text());
+		assertThat(matcher.find()).as("본문의 링크가 설정의 기준 주소로 시작한다: " + VERIFY_LINK.pattern()).isTrue();
+		return matcher.group(1);
+	}
+
+	/** 발송 실행기가 빈 뒤에 남은 메일이 없다. 빈 뒤에는 새 메일이 올 곳이 없으므로 기다리지 않고 본다. */
+	private void 더_보낸_메일이_없다() {
+		MailExecutorDrain.drain(this.mailExecutor);
+		assertThatThrownBy(() -> this.inMemoryMailer.next(Duration.ZERO))
+				.as("더 보낸 메일이 없다")
+				.isInstanceOf(AssertionError.class);
+	}
+
+	/** 재발송을 보내고 그 메일의 토큰을 꺼낸다. 계정은 활성·미인증이어야 한다. */
+	private String 재발송하고_토큰을_꺼낸다(String email) throws Exception {
+		this.mockMvc.perform(resend("{\"email\": \"" + email + "\"}"))
+				.andExpect(status().isAccepted());
+		InMemoryMailer.Sent sent = this.inMemoryMailer.next(Duration.ofSeconds(5));
+		assertThat(sent.mail().to()).isEqualTo(email);
+		return 링크의_토큰(sent);
+	}
+
+	/**
+	 * 가입({@code POST /accounts})을 거치지 않은 미인증 계정. 가입은 다른 스레드에서 토큰과 메일을 만들어, 이 테스트가
+	 * 심은 토큰을 지울 수 있다(같은 계정·목적의 앞 토큰 지우기). 비밀번호는 해시가 아니다 — 이 계정으로 로그인하지 않는다.
+	 */
+	private Long 미인증_계정을_만든다(String email) {
+		return this.accountRepository.saveAndFlush(Account.builder()
+				.email(email)
+				.password("test-not-a-hash-au16")
+				.build()).getId();
+	}
+
+	/**
+	 * 그 계정의 토큰 행을 앱 시계의 지금으로 심고 원문을 돌려준다. 수명은 목적과 상관없이 하루로 둔다 — 이 헬퍼로 만료를
+	 * 보지 않는다. 만료는 {@link #확인_수명_경계()} 가 실제 발급으로 본다.
+	 */
+	private String 토큰을_심는다(Long accountId, TokenPurpose purpose) {
+		String token = AccountTokens.generate();
+		this.accountTokenRepository.saveAndFlush(AccountToken.issue(accountId, purpose, AccountTokens.hash(token),
+				Duration.ofDays(1), CLOCK));
+		return token;
+	}
+
+	private void 인증을_채운다(String email, LocalDateTime verifiedAt) {
+		Account account = this.accountRepository.findByEmail(email).orElseThrow();
+		MutableClock at = new MutableClock();
+		at.set(verifiedAt);
+		account.markEmailVerified(at);
+		this.accountRepository.saveAndFlush(account);
+	}
+
+	/** 커밋된 {@code email_verified_at}. JPA 를 거치지 않는다. */
+	private LocalDateTime 인증_시각(Long accountId) {
+		return this.jdbcTemplate.queryForObject(
+				"select email_verified_at from account where id = ?", LocalDateTime.class, accountId);
+	}
+
+	/** 커밋된 {@code used_at}. 원문이 아니라 해시로 찾는다. */
+	private LocalDateTime 사용_시각(String token) {
+		return this.jdbcTemplate.queryForObject(
+				"select used_at from account_token where token_hash = ?", LocalDateTime.class, AccountTokens.hash(token));
 	}
 
 	/** seed 행을 뺀 수. 절대 개수로 단언하면 seed 유무에 따라 결과가 바뀐다. */

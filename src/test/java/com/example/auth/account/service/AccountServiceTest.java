@@ -8,25 +8,44 @@ import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.BDDMockito.given;
 import static org.mockito.BDDMockito.willAnswer;
+import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 
 import com.example.auth.account.dto.AccountCreateRequest;
 import com.example.auth.account.dto.AccountResponse;
 import com.example.auth.account.dto.PasswordChangeRequest;
 import com.example.auth.account.dto.WithdrawRequest;
 import com.example.auth.account.entity.Account;
+import com.example.auth.account.entity.AccountToken;
 import com.example.auth.account.entity.Role;
+import com.example.auth.account.entity.TokenPurpose;
 import com.example.auth.account.repository.AccountRepository;
+import com.example.auth.account.repository.AccountTokenRepository;
 import com.example.auth.account.support.AccountReader;
+import com.example.auth.account.support.AccountTokens;
 import com.example.auth.auth.entity.RefreshToken;
 import com.example.auth.auth.repository.RefreshTokenRepository;
 import com.example.auth.global.error.BusinessException;
 import com.example.auth.global.error.ErrorCode;
+import com.example.auth.global.config.MailExecutorConfig;
 import com.example.auth.global.security.JwtTokenProvider;
+import com.example.auth.support.MailExecutorDrain;
+import com.example.auth.support.RecordingStatementInspector;
 import com.example.auth.support.TestRsaKeys;
+import java.time.Clock;
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.regex.Pattern;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
@@ -34,17 +53,23 @@ import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.mockito.ArgumentCaptor;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.test.context.TestPropertySource;
+import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.TransactionStatus;
+import org.springframework.transaction.support.TransactionTemplate;
 
 /**
  * sp-docs/plan/phase1.md §4 AU-05·AU-08 의 "검증" 표 중 저장 쪽을 테스트로 옮긴 것이다.
@@ -91,6 +116,30 @@ class AccountServiceTest {
 	@Autowired
 	private JwtTokenProvider jwtTokenProvider;
 
+	/** AU-16 — 스텁 생성자에 넘긴다. 중복 경로는 발급까지 가지 않는다. */
+	@Autowired
+	private AccountTokenIssuer accountTokenIssuer;
+
+	/** AU-16 — 인증 링크 토큰. 확인이 사용 처리하는 행이고, 가입이 커밋 뒤에 만드는 행이다. */
+	@Autowired
+	private AccountTokenRepository accountTokenRepository;
+
+	/** AU-16 — 앱 시계. 이 클래스는 바꿔 끼우지 않는다(시스템 시계). 토큰 픽스처의 발급 시각을 정한다. */
+	@Autowired
+	private Clock clock;
+
+	/** AU-16 — 바깥 트랜잭션을 열고, 커밋된 행을 영속성 컨텍스트를 거치지 않고 읽는다. */
+	@Autowired
+	private PlatformTransactionManager transactionManager;
+
+	@Autowired
+	private JdbcTemplate jdbcTemplate;
+
+	/** AU-16 — 가입이 커밋 뒤에 넘긴 발급 작업이 도는 곳. 정리가 그 작업이 끝나기를 기다린다. */
+	@Autowired
+	@Qualifier(MailExecutorConfig.MAIL_EXECUTOR)
+	private ThreadPoolTaskExecutor mailExecutor;
+
 	/**
 	 * <b>seed 행은 남긴다.</b> H2 는 테스트 클래스 사이에 공유되므로
 	 * ({@code DB_CLOSE_DELAY=-1}, sp-docs/tech-stack.md §5.3) 여기서 지우면
@@ -98,9 +147,15 @@ class AccountServiceTest {
 	 *
 	 * <p>{@code fk_refresh_token_account} 가 있으므로 토큰을 먼저 지운다 — AU-08 의 테스트가
 	 * {@code refresh_token} 행을 만든다.
+	 *
+	 * <p><b>AU-16 부터 가입이 다른 스레드에서 {@code account_token} 행을 만든다.</b> 그 작업이 끝나기를 먼저
+	 * 기다리고({@link MailExecutorDrain}) 그 행을 지운다 — 남기면 계정 삭제가 {@code fk_account_token_account} 에
+	 * 걸린다.
 	 */
 	@AfterEach
 	void 정리() {
+		MailExecutorDrain.drain(this.mailExecutor);
+		this.accountTokenRepository.deleteAllInBatch();
 		this.refreshTokenRepository.deleteAll();
 		this.refreshTokenRepository.flush();
 		this.accountRepository.deleteAll(this.accountRepository.findAll().stream()
@@ -207,7 +262,8 @@ class AccountServiceTest {
 				.willThrow(new DataIntegrityViolationException("uk_account_email"));
 		// 나머지 협력자는 실제 빈이다. create 경로가 쓰지 않으므로 스텁할 것이 없다
 		AccountService service = new AccountService(
-				stub, this.passwordEncoder, this.accountReader, this.refreshTokenRepository);
+				stub, this.passwordEncoder, this.accountReader, this.refreshTokenRepository,
+				this.accountTokenIssuer, this.accountTokenRepository, this.clock);
 
 		assertThatThrownBy(() ->
 				service.create(new AccountCreateRequest("race@example.com", RAW_PASSWORD)))
@@ -819,6 +875,275 @@ class AccountServiceTest {
 					"select count(*) from refresh_token where account_id = ?", Long.class, accountId);
 		}
 
+	}
+
+	// --- AU-16 이메일 인증 확인 (sp-docs/requirements/member.md §11.2) ---
+
+	/**
+	 * 확인은 계정을 읽고 고쳐 쓴다. 그 사이에 다른 연결이 탈퇴({@code deleted = true})를 커밋하려 하면 <b>확인의 커밋을
+	 * 기다려야 한다</b> — 기다리지 않고 먼저 커밋되면 확인의 쓰기가 읽어 둔 {@code deleted = false} 로 그 행을 덮어 탈퇴한
+	 * 계정이 되살아난다. 「닫힌 행에는 쓰지 않는다」(sp-docs/requirements/member.md §11.4 의 같은 이유)를 지키는 것이
+	 * 계정의 잠금 읽기({@code AccountRepository.findByIdForUpdate})다.
+	 *
+	 * <p>확인을 바깥 트랜잭션 안에서 불러 그 커밋을 테스트가 쥔다 — 확인이 끝났고 아직 커밋하지 않은 때에 다른 연결의
+	 * 탈퇴를 시작한다. 탈퇴는 잠긴 행을 기다리고, 확인이 커밋한 뒤에 들어간다.
+	 */
+	@Test
+	@DisplayName("확인이 읽은 계정 행은 커밋까지 잠긴다 — 그 사이에 커밋하려는 탈퇴를 덮지 않는다")
+	void 확인_사이의_탈퇴를_덮지_않는다() throws Exception {
+		Long id = 미인증_계정을_만든다("au16-lock@example.com");
+		String token = 인증_토큰을_심는다(id);
+		TransactionTemplate outer = new TransactionTemplate(this.transactionManager);
+		ExecutorService otherConnection = Executors.newSingleThreadExecutor();
+		try {
+			List<Boolean> 확인_커밋_전에_끝났다 = new ArrayList<>();
+			Future<Integer> withdrawal = outer.execute(status -> {
+				this.accountService.confirmEmailVerification(token);
+				Future<Integer> started = otherConnection.submit(() ->
+						this.jdbcTemplate.update("update account set deleted = true where id = ?", id));
+				확인_커밋_전에_끝났다.add(끝났는가(started, 300));
+				return started;
+			});
+
+			assertThat(withdrawal.get(5, TimeUnit.SECONDS)).as("탈퇴는 확인이 커밋한 뒤에 들어간다").isOne();
+			assertThat(커밋된_탈퇴_여부(id)).as("확인의 쓰기가 탈퇴를 덮지 않았다").isTrue();
+			assertThat(커밋된_인증_시각(id)).as("확인은 탈퇴보다 먼저 커밋됐다").isNotNull();
+			assertThat(확인_커밋_전에_끝났다).as("탈퇴가 확인의 커밋을 기다렸다").containsExactly(false);
+		} finally {
+			otherConnection.shutdownNow();
+		}
+	}
+
+	/**
+	 * 확인의 트랜잭션 경계(sp-docs/process/review-policy.md §4.1)와 가입이 발급을 넘기는 때
+	 * (sp-docs/plan/phase2-auth-member.md AU-16 의 검증 표).
+	 *
+	 * <p>발송 실행기를 대역으로 바꾼다 — 받은 작업을 돌리지 않고 Mockito 가 받은 횟수와 작업을 남긴다. 그래서
+	 * 「트랜잭션이 열린 동안 받은 작업」을 기다림 없이 셀 수 있고, 받은 발급 작업은 테스트가 이 스레드에서 돌린다.
+	 *
+	 * <p>Hibernate 가 준비한 SQL 을 적는 기록기({@link RecordingStatementInspector})도 이 컨텍스트에 단다 — 확인이 계정을
+	 * 잠금 읽기로 읽는지를 SQL 로 본다. 실행기가 대역이라 받은 작업이 다른 스레드에서 SQL 을 내지 않는다.
+	 */
+	@Nested
+	@TestPropertySource(properties = "spring.jpa.properties.hibernate.session_factory.statement_inspector="
+			+ "com.example.auth.support.RecordingStatementInspector")
+	@DisplayName("인증 확인·가입 발급의 트랜잭션 경계")
+	class 인증_트랜잭션_경계 {
+
+		@DynamicPropertySource
+		static void jwtPrivateKey(DynamicPropertyRegistry registry) {
+			TestRsaKeys.registerPrivateKeyLocation(registry);
+		}
+
+		/** 커밋이 전부 지나는 곳. {@code isNewTransaction()} 이 참인 커밋만 센다. */
+		@MockitoSpyBean
+		private PlatformTransactionManager spyTransactionManager;
+
+		/** 발송 실행기의 대역. 받은 작업을 돌리지 않는다. */
+		@MockitoBean(name = MailExecutorConfig.MAIL_EXECUTOR)
+		private ThreadPoolTaskExecutor mailExecutorDouble;
+
+		/** 재발송을 부른 스레드가 계정을 찾지 않는지 본다. 나머지는 실제 빈에 위임된다. */
+		@MockitoSpyBean
+		private AccountRepository accountRepository;
+
+		/** 이 클래스의 대역들을 주입받은 쪽이다. 바깥 클래스의 것과 다른 인스턴스다. */
+		@Autowired
+		private AccountService accountService;
+
+		@Autowired
+		private AccountTokenRepository accountTokenRepository;
+
+		@Test
+		@DisplayName("가입을 바깥 트랜잭션 안에서 하면 열린 동안 넘긴 발급이 없고, 되돌리면 끝까지 없다")
+		void 가입이_되돌려지면_발급을_넘기지_않는다() {
+			TransactionTemplate outer = new TransactionTemplate(this.spyTransactionManager);
+
+			outer.executeWithoutResult(status -> {
+				this.accountService.create(new AccountCreateRequest("au16-signup-rollback@example.com", RAW_PASSWORD));
+				verify(this.mailExecutorDouble, never()).execute(any(Runnable.class));
+				status.setRollbackOnly();
+			});
+
+			verify(this.mailExecutorDouble, never()).execute(any(Runnable.class));
+			assertThat(this.accountRepository.existsByEmail("au16-signup-rollback@example.com")).isFalse();
+		}
+
+		@Test
+		@DisplayName("가입을 바깥 트랜잭션 안에서 하면 열린 동안 넘긴 발급이 없고, 커밋하면 그때 하나다")
+		void 가입이_커밋되면_그때_발급을_넘긴다() {
+			TransactionTemplate outer = new TransactionTemplate(this.spyTransactionManager);
+
+			outer.executeWithoutResult(status -> {
+				this.accountService.create(new AccountCreateRequest("au16-signup-commit@example.com", RAW_PASSWORD));
+				verify(this.mailExecutorDouble, never()).execute(any(Runnable.class));
+			});
+
+			verify(this.mailExecutorDouble, times(1)).execute(any(Runnable.class));
+		}
+
+		/**
+		 * 완료 기준 「요청 스레드는 DB 일을 하지 않는다」(sp-docs/security.md §12). 재발송을 부른 스레드는 계정을 찾지도
+		 * 트랜잭션을 열지도 않고 발급 작업 하나를 넘긴다. 계정 찾기는 그 작업이 한다 — 넘겨받은 작업을 돌리면 그때 찾는다.
+		 */
+		@Test
+		@DisplayName("재발송은 발급 작업을 넘기기만 한다 — 부른 스레드는 계정을 찾지도 트랜잭션을 열지도 않는다")
+		void 재발송은_작업을_넘기기만_한다() {
+			Long id = 미인증_계정을_만든다("au16-resend-handover@example.com");
+			clearInvocations(this.accountRepository, this.spyTransactionManager);
+
+			this.accountService.resendVerification("au16-resend-handover@example.com");
+
+			verifyNoInteractions(this.accountRepository);
+			verify(this.spyTransactionManager, never()).getTransaction(any());
+			ArgumentCaptor<Runnable> handedOver = ArgumentCaptor.forClass(Runnable.class);
+			verify(this.mailExecutorDouble).execute(handedOver.capture());
+
+			handedOver.getValue().run();
+			verify(this.accountRepository).findByEmail("au16-resend-handover@example.com");
+			assertThat(this.accountTokenRepository.findAll()).extracting(AccountToken::getAccountId)
+					.as("넘겨받은 작업이 토큰을 만든다").containsExactly(id);
+		}
+
+		/**
+		 * 완료 기준 「트랜잭션 경계를 관측한다 — 한 번의 확인에 커밋이 한 번이다」. 사용 처리·탈퇴 검사·인증 시각이 서로
+		 * 다른 트랜잭션으로 갈라지면(변이 C) 행위 단언으로는 가르지 못한다 (sp-docs/process/review-policy.md §4.1).
+		 */
+		@Test
+		@DisplayName("한 번의 확인에 물리 트랜잭션이 정확히 하나 커밋된다")
+		void 확인의_커밋이_정확히_한_번이다() {
+			Long id = 미인증_계정을_만든다("au16-confirm-boundary@example.com");
+			String token = 인증_토큰을_심는다(id);
+
+			List<TransactionStatus> 커밋된_물리_트랜잭션 = 커밋을_센다();
+			this.accountService.confirmEmailVerification(token);
+
+			assertThat(커밋된_물리_트랜잭션)
+					.as("확인은 한 트랜잭션이다 (sp-docs/requirements/member.md §11.2)")
+					.hasSize(1);
+			assertThat(커밋된_인증_시각(id)).as("그 한 번이 인증을 채웠다").isNotNull();
+		}
+
+		/**
+		 * 확인이 계정을 잠금 읽기({@code AccountRepository.findByIdForUpdate})로 읽는다 — 탈퇴 검사가 보는 값이 그 읽기이고,
+		 * 확인의 트랜잭션이 끝날 때까지 그 행의 다른 쓰기가 기다린다. 못박는 것은 결과가 아니라 이 구현이 고른 수단이다.
+		 *
+		 * <p>{@link AccountServiceTest#확인_사이의_탈퇴를_덮지_않는다()} 는 확인이 돌아온 뒤에 탈퇴를 시작하므로 읽기와 쓰기
+		 * 사이에 끼어들지 못한다. 일반 읽기 뒤 곧바로 {@code saveAndFlush} 하는 변이가 그 테스트를 지났다(AU-16 리뷰가 쟀다) —
+		 * 그 쓰기도 확인이 돌아오기 전에 행을 잠그기 때문이다. 그래서 확인이 낸 SQL 을 본다.
+		 */
+		@Test
+		@DisplayName("확인은 계정 행을 잠금 읽기(for update)로 읽는다")
+		void 확인은_계정을_잠금_읽기로_읽는다() {
+			Long id = 미인증_계정을_만든다("au16-confirm-lock-read@example.com");
+			String token = 인증_토큰을_심는다(id);
+			// account 테이블을 읽는 SELECT. account_token·account_id 는 뒤에 밑줄이 이어져 \b 에 걸리지 않는다
+			Pattern accountRead = Pattern.compile("(?is)^\\s*select\\b.*\\baccount\\b");
+
+			RecordingStatementInspector.clear();
+			this.accountService.confirmEmailVerification(token);
+
+			assertThat(RecordingStatementInspector.statements())
+					.filteredOn(sql -> accountRead.matcher(sql).find())
+					.as("확인이 account 행을 읽은 SELECT")
+					.isNotEmpty()
+					.allSatisfy(sql -> assertThat(sql).as("잠금 읽기다").containsPattern("(?i)\\bfor update\\b"));
+		}
+
+		/**
+		 * 가입이 넘긴 발급 작업 한 번 — 앞 토큰 지우기와 새 토큰 넣기가 한 트랜잭션이다 (AU-15 의 작업 순서,
+		 * sp-docs/requirements/member.md §11.5 마지막 문단). AU-15 리뷰가 그 경계를 못박는 테스트가 없다고 지적했다 — 같은
+		 * 관측으로 덮는다.
+		 */
+		@Test
+		@DisplayName("가입이 넘긴 발급 작업 한 번에 물리 트랜잭션이 정확히 하나 커밋된다 — 앞 토큰을 지우고 새 토큰을 넣는다")
+		void 발급_작업의_커밋이_정확히_한_번이다() {
+			Long id = this.accountService.create(
+					new AccountCreateRequest("au16-issue-boundary@example.com", RAW_PASSWORD)).accountId();
+			String 앞_토큰의_해시 = AccountTokens.hash(인증_토큰을_심는다(id));
+			ArgumentCaptor<Runnable> handedOver = ArgumentCaptor.forClass(Runnable.class);
+			verify(this.mailExecutorDouble).execute(handedOver.capture());
+
+			List<TransactionStatus> 커밋된_물리_트랜잭션 = 커밋을_센다();
+			handedOver.getValue().run();
+
+			assertThat(커밋된_물리_트랜잭션)
+					.as("앞 토큰 지우기와 새 토큰 넣기가 한 트랜잭션이다")
+					.hasSize(1);
+			List<String> 남은_해시 = this.accountTokenRepository.findAll().stream()
+					.filter(row -> row.getAccountId().equals(id))
+					.map(AccountToken::getTokenHash)
+					.toList();
+			assertThat(남은_해시).as("새 토큰 하나만 남는다").hasSize(1).doesNotContain(앞_토큰의_해시);
+			verify(this.mailExecutorDouble, times(2)).execute(any(Runnable.class));
+		}
+
+		/** 지금부터 커밋되는 물리 트랜잭션을 모은다. 준비가 끝난 뒤에 부른다. */
+		private List<TransactionStatus> 커밋을_센다() {
+			List<TransactionStatus> committed = new ArrayList<>();
+			willAnswer(invocation -> {
+				TransactionStatus status = invocation.getArgument(0);
+				if (status.isNewTransaction()) {
+					committed.add(status);
+				}
+				return invocation.callRealMethod();
+			}).given(this.spyTransactionManager).commit(any(TransactionStatus.class));
+			return committed;
+		}
+
+		private Long 미인증_계정을_만든다(String email) {
+			return this.accountRepository.saveAndFlush(Account.builder()
+					.email(email)
+					// 해시가 아니다. 확인은 비밀번호를 읽지 않는다 (sp-docs/requirements/member.md §10.2)
+					.password("test-not-a-hash-au16")
+					.build()).getId();
+		}
+
+		private String 인증_토큰을_심는다(Long accountId) {
+			String token = AccountTokens.generate();
+			this.accountTokenRepository.saveAndFlush(AccountToken.issue(accountId, TokenPurpose.EMAIL_VERIFICATION,
+					AccountTokens.hash(token), Duration.ofHours(24), AccountServiceTest.this.clock));
+			return token;
+		}
+
+	}
+
+	/** 시간 안에 끝났으면 참, 아니면 거짓. 끝나지 않은 작업을 취소하지 않는다. */
+	private static boolean 끝났는가(Future<?> future, long millis) {
+		try {
+			future.get(millis, TimeUnit.MILLISECONDS);
+			return true;
+		} catch (TimeoutException e) {
+			return false;
+		} catch (Exception e) {
+			throw new IllegalStateException(e);
+		}
+	}
+
+	/** 비밀번호를 쓰지 않는 미인증 계정. 가입({@code create})으로 만들지 않는다 — 가입은 다른 스레드에서 토큰을 만든다. */
+	private Long 미인증_계정을_만든다(String email) {
+		return this.accountRepository.saveAndFlush(Account.builder()
+				.email(email)
+				// 해시가 아니다. 확인은 비밀번호를 읽지 않는다 (sp-docs/requirements/member.md §10.2)
+				.password("test-not-a-hash-au16")
+				.build()).getId();
+	}
+
+	/** 그 계정의 인증 토큰 행을 심고 원문을 돌려준다. 저장은 해시뿐이다 (sp-docs/domain-model.md §2.4). */
+	private String 인증_토큰을_심는다(Long accountId) {
+		String token = AccountTokens.generate();
+		this.accountTokenRepository.saveAndFlush(AccountToken.issue(accountId, TokenPurpose.EMAIL_VERIFICATION,
+				AccountTokens.hash(token), Duration.ofHours(24), this.clock));
+		return token;
+	}
+
+	private boolean 커밋된_탈퇴_여부(Long accountId) {
+		return this.jdbcTemplate.queryForObject("select deleted from account where id = ?", Boolean.class, accountId);
+	}
+
+	private LocalDateTime 커밋된_인증_시각(Long accountId) {
+		return this.jdbcTemplate.queryForObject(
+				"select email_verified_at from account where id = ?", LocalDateTime.class, accountId);
 	}
 
 	/** seed 행을 뺀 수. 절대 개수로 단언하면 seed 유무에 따라 결과가 바뀐다. */

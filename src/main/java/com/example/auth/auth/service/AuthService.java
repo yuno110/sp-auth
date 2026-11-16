@@ -25,7 +25,8 @@ import org.springframework.util.StringUtils;
  * 세션·토큰 유스케이스. 정본: sp-docs/requirements/member.md §1 (MR-04·MR-05·MR-06) §6,
  * sp-docs/security.md §4, sp-docs/api-contract.md §2.1 §9.2.
  *
- * <p>AU-06 이 만들고 AU-07(재발급·로그아웃)이 확장했다 (sp-docs/plan/phase1.md §2.3).
+ * <p>AU-06 이 만들고 AU-07(재발급·로그아웃)이 확장했다 (sp-docs/plan/phase1.md §2.3). 2차의 AU-16 이 로그인에
+ * 미인증 차단(403 {@code AU006})을 더했다 (sp-docs/plan/phase2-auth-member.md).
  *
  * <p><b>프로필 존재를 보지 않는다.</b> "계정만 있고 프로필이 없는 상태"는 정상이며 그 상태에서
  * 로그인이 되어야 한다 (sp-docs/requirements/member.md §3 규칙 3). auth 는 프로필을 소유하지
@@ -98,7 +99,10 @@ public class AuthService {
 	}
 
 	/**
-	 * 이메일·비밀번호를 검증한다.
+	 * 이메일·비밀번호를 검증하고, 맞으면 이메일 인증 여부를 본다.
+	 *
+	 * <p><b>비밀번호가 맞고 미인증이면 403 {@code AU006} 이다</b> (2차 AU-16, sp-docs/requirements/member.md §3 규칙 11).
+	 * 그 판정은 비밀번호가 맞은 뒤에만 한다 (§12.1 의 5 가 4 뒤에 있다).
 	 *
 	 * <p><b>실패 이유를 구분해 내보내지 않는다.</b> 없는 이메일·비밀번호 불일치·탈퇴 계정이 모두
 	 * 같은 {@code AU003}(401, 같은 메시지)이다 (sp-docs/plan/phase1.md §4 AU-06). 구분하면 이메일
@@ -135,6 +139,14 @@ public class AuthService {
 
 		if (account == null || !matched) {
 			throw loginFailed();
+		}
+
+		// 미인증은 비밀번호가 맞은 뒤에만 드러낸다 — 403 AU006 이 알려주는 것(이 이메일과 비밀번호의 계정이
+		// 있다)은 비밀번호를 아는 사람만 얻는다. 틀린 비밀번호는 미인증이어도 loginFailed() 의 AU003 이다
+		// (sp-docs/requirements/member.md §3 규칙 11·§12.1 의 5, sp-docs/api-contract.md §2.1).
+		// 발급·저장보다 먼저 끝나므로 토큰을 주지 않고 Refresh Token 도 저장하지 않는다
+		if (account.getEmailVerifiedAt() == null) {
+			throw new BusinessException(ErrorCode.EMAIL_NOT_VERIFIED);
 		}
 		return account;
 	}
