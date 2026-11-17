@@ -14,10 +14,10 @@ public interface AccountRepository extends JpaRepository<Account, Long> {
 	Optional<Account> findByEmail(String email);
 
 	/**
-	 * 잠금 읽기({@code SELECT ... FOR UPDATE}). <b>링크 토큰의 확인이 계정을 읽을 때 쓴다</b>
-	 * (sp-docs/requirements/member.md §11.2·§11.4).
+	 * 잠금 읽기({@code SELECT ... FOR UPDATE}). 읽은 값이 그 트랜잭션의 커밋까지 그대로여야 할 때 쓴다.
 	 *
-	 * <p><b>읽은 행을 엔터티로 고쳐 쓰므로 잠금 읽기다.</b> 엔터티의 변경은 커밋 때 그 행을 읽어 둔 값으로 다시 쓴다
+	 * <p><b>링크 토큰의 확인(sp-docs/requirements/member.md §11.2·§11.4)은 읽은 행을 엔터티로 고쳐 쓰므로 잠금
+	 * 읽기다.</b> 엔터티의 변경은 커밋 때 그 행을 읽어 둔 값으로 다시 쓴다
 	 * ({@code Account} 에 바뀐 컬럼만 싣는 설정이 없다). 잠그지 않고 읽으면 읽기와 그 쓰기 사이에 커밋된 탈퇴의
 	 * {@code deleted} 를 읽어 둔 값으로 덮어 탈퇴한 계정이 되살아난다. 잠금 읽기는 최신 커밋 값을 읽고, 이 트랜잭션이
 	 * 끝날 때까지 그 행의 다른 쓰기를 기다리게 한다. 그래서 탈퇴 검사가 본 값이 쓰는 때까지 그대로다. 그 경합은

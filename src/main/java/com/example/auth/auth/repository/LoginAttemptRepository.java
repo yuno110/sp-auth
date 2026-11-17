@@ -52,4 +52,57 @@ public interface LoginAttemptRepository extends JpaRepository<LoginAttempt, Long
 			""")
 	int resetAt(@Param("emailKey") String emailKey, @Param("now") LocalDateTime now);
 
+	/**
+	 * 실패를 하나 센다. sp-docs/domain-model.md §2.5 「실패를 센다」 의 1) 이다 — 그 키의 행이 잠기지 않았을 때만 바꾸고,
+	 * 마지막 실패({@code updated_at})가 {@code windowStart} 이하이면 1부터 다시 센다. 바꾼 행은 이 트랜잭션이 끝날 때까지
+	 * 잠긴다 — {@link #lockIfReached} 의 판정이 그 행 락 아래에서 돈다.
+	 *
+	 * <p><b>SET 의 순서를 바꾸지 않는다.</b> MySQL 은 한 테이블 UPDATE 의 대입을 대개 왼쪽부터 하고, 뒤의 식은 앞에서 바뀐
+	 * 값을 읽는다(MySQL 8.0 Reference Manual 의 UPDATE 문). {@code updated_at} 을 먼저 바꾸면 {@code CASE} 가 새 시각을
+	 * 읽어 24시간이 지난 실패도 이어서 센다. H2 에서는 순서를 바꿔도 24시간 경계의 결과가 같다(AU-18 실측) — 그래서
+	 * {@code LoginAttemptRepositoryTest} 가 문장의 순서를 SQL 로 본다.
+	 *
+	 * <p>부르면 영속성 컨텍스트가 flush 되고 비워진다({@link #resetAt} 과 같은 설정).
+	 *
+	 * @param emailKey {@link LoginAttempt#emailKeyOf(String)} 로 만든 키
+	 * @param now 판정 시각. 앱 시계의 값을 초로 자른 것이다 (sp-docs/domain-model.md §2.5)
+	 * @param windowStart {@code now} 에서 24시간 전. 마지막 실패가 이 시각 이하이면 1부터 센다
+	 * @return 바꾼 행 수. 0 이면 행이 없거나 잠겨 있다 — 어느 쪽인지는 호출자가 행을 읽어 가른다
+	 */
+	@Modifying(flushAutomatically = true, clearAutomatically = true)
+	@Query("""
+			update LoginAttempt a
+			   set a.failedCount = case when a.updatedAt <= :windowStart then 1 else a.failedCount + 1 end,
+			       a.updatedAt = :now
+			 where a.emailKey = :emailKey
+			   and (a.lockedUntil is null or a.lockedUntil <= :now)
+			""")
+	int incrementFailure(@Param("emailKey") String emailKey, @Param("now") LocalDateTime now,
+			@Param("windowStart") LocalDateTime windowStart);
+
+	/**
+	 * 센 실패가 한도에 이르렀으면 잠그고 카운터를 0 으로 한다. sp-docs/domain-model.md §2.5 「실패를 센다」 의 2) 다.
+	 * {@link #incrementFailure} 가 1행을 바꾼 같은 트랜잭션에서 그 뒤에 부른다 — 증가가 잡은 행 락 아래에서 판정해야 같은
+	 * 키의 동시 실패 중 정확히 하나가 잠근다 (sp-docs/requirements/member.md §12.2).
+	 *
+	 * <p>부르면 영속성 컨텍스트가 flush 되고 비워진다({@link #resetAt} 과 같은 설정).
+	 *
+	 * @param emailKey {@link LoginAttempt#emailKeyOf(String)} 로 만든 키
+	 * @param threshold 잠그는 연속 실패 수
+	 * @param now 판정 시각. 앱 시계의 값을 초로 자른 것이다
+	 * @param lockedUntil 잠금이 풀리는 시각
+	 * @return 1 이면 이번 실패가 잠갔다. 0 이면 한도 전이다
+	 */
+	@Modifying(flushAutomatically = true, clearAutomatically = true)
+	@Query("""
+			update LoginAttempt a
+			   set a.lockedUntil = :lockedUntil,
+			       a.failedCount = 0,
+			       a.updatedAt = :now
+			 where a.emailKey = :emailKey
+			   and a.failedCount >= :threshold
+			""")
+	int lockIfReached(@Param("emailKey") String emailKey, @Param("threshold") int threshold,
+			@Param("now") LocalDateTime now, @Param("lockedUntil") LocalDateTime lockedUntil);
+
 }

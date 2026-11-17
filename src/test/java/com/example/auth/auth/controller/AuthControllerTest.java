@@ -1,7 +1,9 @@
 package com.example.auth.auth.controller;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.patch;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
@@ -13,8 +15,10 @@ import com.example.auth.account.entity.TokenPurpose;
 import com.example.auth.account.repository.AccountRepository;
 import com.example.auth.account.repository.AccountTokenRepository;
 import com.example.auth.account.support.AccountTokens;
+import com.example.auth.auth.entity.LoginAttempt;
 import com.example.auth.auth.entity.RefreshToken;
 import com.example.auth.auth.repository.RefreshTokenRepository;
+import com.example.auth.support.MutableClock;
 import com.example.auth.support.TestRsaKeys;
 import com.example.auth.support.TestTokens;
 import com.jayway.jsonpath.JsonPath;
@@ -24,6 +28,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.temporal.ChronoUnit;
+import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
@@ -40,6 +45,7 @@ import org.springframework.security.oauth2.jwt.JwtEncoder;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.test.context.bean.override.convention.TestBean;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
 import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder;
@@ -54,6 +60,10 @@ import org.springframework.transaction.support.TransactionTemplate;
  * <p>인가 필터를 포함한 전 구간을 지난다 — {@code login}·{@code reissue} 는 무인증,
  * {@code logout} 은 인증이다 (sp-docs/security.md §5.1). 그래서 필터 단계의
  * {@code A001}/{@code A002}/{@code A003} 구분도 여기서 본다.
+ *
+ * <p>2차 AU-18(로그인 잠금)의 검증 표 중 HTTP 쪽 — 상태·본문, 잠금 시각 너머의 200, 비밀번호 변경·탈퇴의 {@code AU004} —
+ * 도 여기 있다(sp-docs/plan/phase2-auth-member.md). 카운터의 값과 트랜잭션 경계는
+ * {@link com.example.auth.auth.service.AuthServiceTest}·{@link com.example.auth.auth.service.LoginAttemptServiceTest} 가 본다.
  */
 @SpringBootTest
 @AutoConfigureMockMvc
@@ -79,12 +89,38 @@ class AuthControllerTest {
 	/** AU-16. sp-docs/api-contract.md §8.4 {@code AU006}, §9.10. */
 	private static final String EMAIL_NOT_VERIFIED_MESSAGE = "이메일 인증이 필요합니다.";
 
+	/** AU-18. sp-docs/api-contract.md §8.4 {@code AU005}. */
+	private static final String LOGIN_LOCKED_MESSAGE = "로그인 시도가 많아 잠시 로그인할 수 없습니다.";
+
+	/** AU-18 — 비밀번호 변경의 새 비밀번호. 규칙(sp-docs/requirements/member.md §2)을 만족한다. */
+	private static final String NEW_PASSWORD = "NewPassw0rd!";
+
+	/**
+	 * AU-18 의 테스트가 시계를 멈추는 시각. 잠금(15분)은 이 시각에 리터럴로 더한다 — 카운터 빈의 상수를 읽어 기대값을 만들면
+	 * 상수를 바꾼 변이도 통과한다.
+	 */
+	private static final LocalDateTime LOCK_NOW = LocalDateTime.of(2026, 11, 13, 10, 0, 0);
+
 	/** sp-docs/security.md §1: Access 30분. */
 	private static final int ACCESS_TOKEN_SECONDS = 1800;
+
+	/**
+	 * AU-18 — 앱 시계를 바꿔 끼운다. 고정하지 않은 테스트에서는 시스템 시계다 ({@link MutableClock}). 토큰의 발급 시각은 이
+	 * 시계가 아니라 시스템 시계에서 온다({@code JwtTokenProvider#issue}) — 시계를 멈춰도 발급한 토큰은 그대로 검증된다.
+	 */
+	private static final MutableClock CLOCK = new MutableClock();
 
 	@DynamicPropertySource
 	static void jwtPrivateKey(DynamicPropertyRegistry registry) {
 		TestRsaKeys.registerPrivateKeyLocation(registry);
+	}
+
+	/** 애플리케이션의 {@code Clock} 빈을 {@link #CLOCK} 로 바꾼다 ({@code ClockConfig}). */
+	@TestBean
+	private Clock clock;
+
+	static Clock clock() {
+		return CLOCK;
 	}
 
 	@Autowired
@@ -122,9 +158,14 @@ class AuthControllerTest {
 	 *
 	 * <p>{@code fk_refresh_token_account} 가 있으므로 토큰을 먼저 지운다. AU-16 의 테스트가 만드는
 	 * {@code account_token} 행도 같은 이유로 먼저 지운다({@code fk_account_token_account}).
+	 *
+	 * <p>AU-18 부터 로그인 실패가 {@code login_attempt} 행을 커밋한다. 그 테이블은 계정을 참조하지 않지만 남기면 같은 이메일을
+	 * 쓰는 다음 테스트의 카운터가 이어진다 — 먼저 지운다.
 	 */
 	@AfterEach
 	void 정리() {
+		CLOCK.reset();
+		this.jdbcTemplate.update("delete from login_attempt");
 		this.accountTokenRepository.deleteAllInBatch();
 		this.refreshTokenRepository.deleteAll();
 		this.refreshTokenRepository.flush();
@@ -210,9 +251,12 @@ class AuthControllerTest {
 	 *
 	 * <p>표에 없는 케이스지만 <b>500 이 새지 않는지</b>를 함께 본다 —
 	 * {@code BCrypt.matches(null, ...)} 는 {@code IllegalArgumentException} 을 던진다.
+	 *
+	 * <p>AU-18 — 빈 값은 세지 않는다. 있는 이메일 + 빈 비밀번호도 {@code login_attempt} 행을 만들지 않는다
+	 * (sp-docs/requirements/member.md §12.1 의 1).
 	 */
 	@Test
-	@DisplayName("자격증명이 비어 있으면 500 이 아니라 401 AU003 이다")
+	@DisplayName("자격증명이 비어 있으면 500 이 아니라 401 AU003 이고 login_attempt 행이 생기지 않는다")
 	void 자격증명_누락() throws Exception {
 		계정을_만든다("blank@example.com");
 
@@ -220,12 +264,15 @@ class AuthControllerTest {
 				"{}",
 				"{\"email\": \"blank@example.com\"}",
 				"{\"email\": \"blank@example.com\", \"password\": \"\"}",
+				"{\"email\": \"blank@example.com\", \"password\": \"   \"}",
 				"{\"password\": \"" + RAW_PASSWORD + "\"}"
 		}) {
 			this.mockMvc.perform(loginRequest(json))
 					.andExpect(status().isUnauthorized())
 					.andExpect(jsonPath("$.error.code").value("AU003"));
 		}
+
+		assertThat(키들()).isEmpty();
 	}
 
 	/**
@@ -631,6 +678,191 @@ class AuthControllerTest {
 			this.jdbcTemplate.update("update account set password = ? where id = ?", seed.get("password"), seedId);
 		}
 	}
+
+	// --- AU-18 로그인 잠금 (sp-docs/requirements/member.md §12, sp-docs/api-contract.md §2.1·§8.4) ---
+
+	@Test
+	@DisplayName("같은 이메일로 틀린 비밀번호를 연속으로 넣으면 넷째까지 401 AU003, 다섯째가 401 AU005 다")
+	void 다섯째_실패는_401_AU005() throws Exception {
+		String email = "au18-http-five@example.com";
+		계정을_만든다(email);
+		CLOCK.set(LOCK_NOW);
+
+		네_번_실패한다(email);
+		this.mockMvc.perform(login(email, WRONG_PASSWORD))
+				.andExpect(status().isUnauthorized())
+				.andExpect(jsonPath("$.success").value(false))
+				.andExpect(jsonPath("$.data").isEmpty())
+				.andExpect(jsonPath("$.error.code").value("AU005"))
+				.andExpect(jsonPath("$.error.message").value(LOGIN_LOCKED_MESSAGE))
+				.andExpect(jsonPath("$.error.fieldErrors").isEmpty());
+	}
+
+	/**
+	 * 완료 기준 「잠긴 경로의 응답이 비밀번호와 무관하게 같다(상태·본문)」. 본문을 통째로 비교한다 — 잠긴 동안 맞는 비밀번호의
+	 * 응답이 갈리면 잠긴 동안에도 추측을 확인할 수 있다 (sp-docs/requirements/member.md §12.1).
+	 */
+	@Test
+	@DisplayName("잠긴 동안 맞는 비밀번호는 401 AU005 이고 틀린 비밀번호의 응답과 상태·본문이 같다")
+	void 잠긴_동안의_응답은_비밀번호와_무관하다() throws Exception {
+		String email = "au18-http-locked@example.com";
+		Account account = 계정을_만든다(email);
+		CLOCK.set(LOCK_NOW);
+		잠근다(email);
+
+		CLOCK.set(LOCK_NOW.plusMinutes(1));
+		MvcResult 맞는_비밀번호 = this.mockMvc.perform(login(email, RAW_PASSWORD))
+				.andExpect(status().isUnauthorized())
+				.andExpect(jsonPath("$.data").isEmpty())
+				.andExpect(jsonPath("$.error.code").value("AU005"))
+				.andExpect(jsonPath("$.error.message").value(LOGIN_LOCKED_MESSAGE))
+				.andReturn();
+		MvcResult 틀린_비밀번호 = this.mockMvc.perform(login(email, WRONG_PASSWORD)).andReturn();
+
+		assertThat(맞는_비밀번호.getResponse().getStatus()).isEqualTo(틀린_비밀번호.getResponse().getStatus());
+		assertThat(맞는_비밀번호.getResponse().getContentAsString(StandardCharsets.UTF_8))
+				.isEqualTo(틀린_비밀번호.getResponse().getContentAsString(StandardCharsets.UTF_8));
+		assertThat(this.refreshTokenRepository.findByAccountId(account.getId()))
+				.as("맞는 비밀번호도 세션을 받지 않았다").isEmpty();
+	}
+
+	/** 잠금은 15분 뒤 풀린다 (sp-docs/requirements/member.md §12.1). 풀리는 시각의 경계는 {@code AuthServiceTest} 가 본다. */
+	@Test
+	@DisplayName("잠금 시각 1초 전에는 맞는 비밀번호도 401 AU005, 잠금 시각 너머에는 200 이다")
+	void 잠금_시각_너머는_200() throws Exception {
+		String email = "au18-http-unlock@example.com";
+		계정을_만든다(email);
+		CLOCK.set(LOCK_NOW);
+		잠근다(email);
+
+		CLOCK.set(LOCK_NOW.plusMinutes(15).minusSeconds(1));
+		this.mockMvc.perform(login(email, RAW_PASSWORD))
+				.andExpect(status().isUnauthorized())
+				.andExpect(jsonPath("$.error.code").value("AU005"));
+
+		CLOCK.set(LOCK_NOW.plusMinutes(15).plusSeconds(1));
+		this.mockMvc.perform(login(email, RAW_PASSWORD))
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.data.accessToken").isNotEmpty());
+	}
+
+	/**
+	 * {@code AU005} 는 없는 이메일에도 똑같이 나온다 (sp-docs/api-contract.md §2.1) — 없는 이메일이 잠기지 않거나 잠긴 응답이
+	 * 갈리면 잠금이 계정의 존재를 알려준다.
+	 */
+	@Test
+	@DisplayName("없는 이메일로 연속 실패하면 다섯째가 401 AU005 이고, 있는 계정의 다섯째 응답과 상태·본문이 같다")
+	void 없는_이메일도_다섯째에_잠긴다() throws Exception {
+		String absent = "au18-http-nobody@example.com";
+		String existing = "au18-http-somebody@example.com";
+		계정을_만든다(existing);
+		CLOCK.set(LOCK_NOW);
+
+		네_번_실패한다(absent);
+		MvcResult 없는_이메일 = this.mockMvc.perform(login(absent, RAW_PASSWORD))
+				.andExpect(status().isUnauthorized())
+				.andExpect(jsonPath("$.error.code").value("AU005"))
+				.andReturn();
+		네_번_실패한다(existing);
+		MvcResult 있는_계정 = this.mockMvc.perform(login(existing, WRONG_PASSWORD)).andReturn();
+
+		assertThat(없는_이메일.getResponse().getStatus()).isEqualTo(있는_계정.getResponse().getStatus());
+		assertThat(없는_이메일.getResponse().getContentAsString(StandardCharsets.UTF_8))
+				.isEqualTo(있는_계정.getResponse().getContentAsString(StandardCharsets.UTF_8));
+	}
+
+	/**
+	 * 100자는 이메일의 최대 길이(sp-docs/requirements/member.md §2)이자 키 컬럼의 폭이다(§12.1). 넘으면 401 {@code AU003} 이고
+	 * 세지 않는다(sp-docs/api-contract.md §2.1).
+	 */
+	@Test
+	@DisplayName("이메일이 100자를 넘으면 401 AU003 이고 login_attempt 행이 생기지 않는다")
+	void 백자를_넘는_이메일은_세지_않는다() throws Exception {
+		String hundredOne = "a".repeat(89) + "@example.com";
+		assertThat(hundredOne).as("픽스처").hasSize(101);
+		CLOCK.set(LOCK_NOW);
+
+		this.mockMvc.perform(login(hundredOne, RAW_PASSWORD))
+				.andExpect(status().isUnauthorized())
+				.andExpect(jsonPath("$.error.code").value("AU003"))
+				.andExpect(jsonPath("$.error.message").value(LOGIN_FAILED_MESSAGE));
+
+		assertThat(키들()).isEmpty();
+	}
+
+	/**
+	 * 완료 기준 「{@code PATCH /me/password}·{@code DELETE /me} 의 {@code AU004} 는 세지 않는다」. 요청자는 이미 인증되어 있고
+	 * 틀린 것은 본문의 값이다 (sp-docs/api-contract.md §2.2). 카운터에 실패 둘을 쌓아 둔 뒤 둘 다 보낸다 — 세면 3·4 가 된다.
+	 */
+	@Test
+	@DisplayName("비밀번호 변경·탈퇴의 400 AU004 는 로그인 실패로 세지 않는다 — 카운터가 그대로다")
+	void 비밀번호_변경과_탈퇴의_AU004_는_세지_않는다() throws Exception {
+		String email = "au18-http-au004@example.com";
+		계정을_만든다(email);
+		IssuedTokens 세션 = 로그인한다(email);
+		CLOCK.set(LOCK_NOW);
+		for (int i = 0; i < 2; i++) {
+			this.mockMvc.perform(login(email, WRONG_PASSWORD)).andExpect(jsonPath("$.error.code").value("AU003"));
+		}
+		Counter 쌓인_카운터 = new Counter(2, null, LOCK_NOW);
+		assertThat(카운터(email)).as("픽스처").isEqualTo(쌓인_카운터);
+
+		CLOCK.set(LOCK_NOW.plusMinutes(1));
+		this.mockMvc.perform(patch("/api/v1/accounts/me/password")
+						.header(HttpHeaders.AUTHORIZATION, "Bearer " + 세션.accessToken())
+						.contentType(MediaType.APPLICATION_JSON)
+						.characterEncoding(StandardCharsets.UTF_8)
+						.content("{\"currentPassword\": \"" + WRONG_PASSWORD + "\", \"newPassword\": \"" + NEW_PASSWORD + "\"}"))
+				.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.error.code").value("AU004"));
+		this.mockMvc.perform(delete("/api/v1/accounts/me")
+						.header(HttpHeaders.AUTHORIZATION, "Bearer " + 세션.accessToken())
+						.contentType(MediaType.APPLICATION_JSON)
+						.characterEncoding(StandardCharsets.UTF_8)
+						.content("{\"password\": \"" + WRONG_PASSWORD + "\"}"))
+				.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.error.code").value("AU004"));
+
+		assertThat(카운터(email)).isEqualTo(쌓인_카운터);
+	}
+
+	/** AU-18 — 틀린 비밀번호로 네 번 실패한다. 넷 다 401 {@code AU003} 이다. */
+	private void 네_번_실패한다(String email) throws Exception {
+		for (int i = 1; i <= 4; i++) {
+			this.mockMvc.perform(login(email, WRONG_PASSWORD))
+					.andExpect(status().isUnauthorized())
+					.andExpect(jsonPath("$.error.code").value("AU003"))
+					.andExpect(jsonPath("$.error.message").value(LOGIN_FAILED_MESSAGE));
+		}
+	}
+
+	/** AU-18 — 실제 경로로 잠근다. 네 번의 {@code AU003} 뒤 다섯째가 {@code AU005} 다. */
+	private void 잠근다(String email) throws Exception {
+		네_번_실패한다(email);
+		this.mockMvc.perform(login(email, WRONG_PASSWORD))
+				.andExpect(status().isUnauthorized())
+				.andExpect(jsonPath("$.error.code").value("AU005"));
+	}
+
+	/** AU-18 — 그 이메일의 커밋된 {@code login_attempt} 행. 행이 없으면 실패한다. JPA 를 거치지 않는다. */
+	private Counter 카운터(String email) {
+		List<Counter> rows = this.jdbcTemplate.query(
+				"select failed_count, locked_until, updated_at from login_attempt where email_key = ?",
+				(rs, rowNum) -> new Counter(rs.getInt("failed_count"),
+						rs.getObject("locked_until", LocalDateTime.class),
+						rs.getObject("updated_at", LocalDateTime.class)),
+				LoginAttempt.emailKeyOf(email));
+		assertThat(rows).as("%s 의 login_attempt 행", email).hasSize(1);
+		return rows.get(0);
+	}
+
+	/** AU-18 — 커밋된 {@code login_attempt} 의 키 전부. */
+	private List<String> 키들() {
+		return this.jdbcTemplate.queryForList("select email_key from login_attempt order by email_key", String.class);
+	}
+
+	/** AU-18 — {@code login_attempt} 의 연속 실패 수·잠금 시각·마지막 갱신 시각. */
+	private record Counter(int failedCount, LocalDateTime lockedUntil, LocalDateTime updatedAt) { }
 
 	private IssuedTokens 로그인한다(String email) throws Exception {
 		String body = this.mockMvc.perform(login(email, RAW_PASSWORD))

@@ -7,10 +7,12 @@ import static org.assertj.core.api.Assertions.fail;
 import com.example.auth.account.entity.Account;
 import com.example.auth.account.entity.Role;
 import com.example.auth.account.repository.AccountRepository;
+import com.example.auth.account.repository.AccountTokenRepository;
 import com.example.auth.auth.dto.LoginRequest;
 import com.example.auth.auth.dto.LogoutRequest;
 import com.example.auth.auth.dto.ReissueRequest;
 import com.example.auth.auth.dto.TokenResponse;
+import com.example.auth.auth.entity.LoginAttempt;
 import com.example.auth.auth.entity.RefreshToken;
 import com.example.auth.auth.repository.RefreshTokenRepository;
 import com.example.auth.global.error.BusinessException;
@@ -26,6 +28,7 @@ import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.time.temporal.ChronoUnit;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -37,15 +40,19 @@ import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.http.HttpStatus;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.security.oauth2.jwt.JwtEncoder;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.context.bean.override.convention.TestBean;
+import org.springframework.transaction.PlatformTransactionManager;
 
 /**
  * sp-docs/plan/phase1.md §4 AU-06·AU-07 의 "검증" 표 중 저장·Claim·회전 쪽과, D-17 의 "검증" 표 중
@@ -62,12 +69,25 @@ import org.springframework.test.context.bean.override.convention.TestBean;
  * <p><b>여기서 만드는 것은 계정 행 하나뿐이다 — 프로필은 없다.</b> "계정만 있고 프로필이 없는
  * 상태"에서 로그인이 되어야 하므로(sp-docs/requirements/member.md §3 규칙 3) 이 테스트 전체가
  * 그 조건을 쓴다.
+ *
+ * <p>sp-docs/plan/phase2-auth-member.md AU-18 의 검증 표 중 응답과 카운터 값 쪽도 여기 있다(정본은
+ * sp-docs/requirements/member.md §12). 트랜잭션 경계·연결과, 다른 연결이 끼어드는 대역이 필요한 행은
+ * {@link LoginAttemptServiceTest} 가 본다. 카운터는 {@code JdbcTemplate} 으로 커밋된 값을 읽는다.
  */
 @SpringBootTest
 @ActiveProfiles("test")
 class AuthServiceTest {
 
 	private static final String RAW_PASSWORD = "Passw0rd!";
+
+	/** AU-18 의 테스트가 쓰는 틀린 비밀번호. AU-18 전에 쓴 테스트들은 같은 값을 리터럴로 적는다. */
+	private static final String WRONG_PASSWORD = "Other1!pw";
+
+	/**
+	 * AU-18 의 테스트가 시계를 맞추는 기준 시각. 한도(5)·잠금(15분)·24시간은 이 시각에 리터럴로 더한다 — 카운터 빈의 상수를
+	 * 읽어 기대값을 만들면 상수를 바꾼 변이도 통과한다.
+	 */
+	private static final LocalDateTime LOCK_NOW = LocalDateTime.of(2026, 11, 13, 10, 0, 0);
 
 	/** V3 seed 의 계정 (sp-docs/requirements/member.md §10.1). 테스트가 만든 것이 아니다. */
 	private static final String ADMIN_EMAIL = "admin@example.com";
@@ -107,6 +127,22 @@ class AuthServiceTest {
 	@Autowired
 	private JwtTokenProvider jwtTokenProvider;
 
+	/** AU-18 — 서비스를 직접 만드는 테스트가 넘긴다. 애플리케이션의 카운터 빈이다. */
+	@Autowired
+	private LoginAttemptService loginAttemptService;
+
+	/** 서비스를 직접 만드는 테스트가 넘긴다 — 로그인의 Refresh Token 저장 트랜잭션을 연다. 애플리케이션의 빈이다. */
+	@Autowired
+	private PlatformTransactionManager transactionManager;
+
+	/** AU-18 — 커밋된 {@code login_attempt} 를 영속성 컨텍스트를 거치지 않고 읽고 심는다. 이 스레드에는 트랜잭션이 없다. */
+	@Autowired
+	private JdbcTemplate jdbcTemplate;
+
+	/** 정리가 지운다 — 다른 클래스가 남긴 행이 계정 삭제를 {@code fk_account_token_account} 에 걸지 않게 한다. */
+	@Autowired
+	private AccountTokenRepository accountTokenRepository;
+
 	/**
 	 * 회전 전후를 비교할 픽스처를 만들 때 쓴다 ({@link #저장된_세션을_만든다}).
 	 *
@@ -121,11 +157,17 @@ class AuthServiceTest {
 	 * ({@code DB_CLOSE_DELAY=-1}, sp-docs/tech-stack.md §5.3) 여기서 지우면
 	 * {@code AdminSeedTest} 가 자기와 무관한 이유로 깨진다.
 	 *
-	 * <p>{@code fk_refresh_token_account} 가 있으므로 토큰을 먼저 지운다.
+	 * <p>{@code fk_refresh_token_account} 가 있으므로 토큰을 먼저 지운다. {@code account_token} 도 같은 이유로 먼저 지운다
+	 * ({@code fk_account_token_account}).
+	 *
+	 * <p>AU-18 부터 로그인 실패가 {@code login_attempt} 행을 커밋한다. 그 테이블은 계정을 참조하지 않지만 남기면 같은 이메일을
+	 * 쓰는 다음 테스트의 카운터가 이어진다 — 먼저 지운다.
 	 */
 	@AfterEach
 	void 정리() {
 		CLOCK.reset();
+		this.accountTokenRepository.deleteAllInBatch();
+		this.jdbcTemplate.update("delete from login_attempt");
 		this.refreshTokenRepository.deleteAll();
 		this.refreshTokenRepository.flush();
 		this.accountRepository.deleteAll(this.accountRepository.findAll().stream()
@@ -230,7 +272,7 @@ class AuthServiceTest {
 				.isInstanceOf(BusinessException.class);
 
 		assertThat(this.refreshTokenRepository.findAll())
-				.as("검증과 저장이 한 트랜잭션이므로 실패하면 아무것도 쓰이지 않는다")
+				.as("실패는 저장 전에 예외로 끝나므로 아무것도 쓰이지 않는다")
 				.isEmpty();
 
 		// 이미 로그인해 둔 세션을 실패한 로그인 시도가 지우지도 않는다
@@ -286,7 +328,7 @@ class AuthServiceTest {
 		CountingPasswordEncoder counting = new CountingPasswordEncoder(this.passwordEncoder);
 		// 더미 해시를 만드는 encode 는 생성자에서 한 번 일어난다 — matches 횟수는 0 에서 시작한다
 		AuthService service = new AuthService(this.accountRepository, this.refreshTokenRepository,
-				counting, this.jwtTokenProvider, this.clock);
+				counting, this.jwtTokenProvider, this.loginAttemptService, this.transactionManager, this.clock);
 
 		Map<String, LoginRequest> 실패_경로 = new LinkedHashMap<>();
 		실패_경로.put("없는 이메일", 로그인("nobody@example.com", RAW_PASSWORD));
@@ -401,6 +443,415 @@ class AuthServiceTest {
 
 		assertThat(tokens.accessToken()).isNotBlank();
 		assertThat(this.refreshTokenRepository.findByAccountId(account.getId())).isPresent();
+	}
+
+	// --- AU-18 로그인 잠금 (sp-docs/requirements/member.md §12, 갱신 문장은 sp-docs/domain-model.md §2.5) ---
+
+	@Test
+	@DisplayName("같은 이메일로 틀린 비밀번호를 연속으로 넣으면 넷째까지 AU003·카운터 1~4, 다섯째는 AU005 이고 15분 잠그며 0 이 된다")
+	void 다섯째_실패가_잠근다() {
+		String email = "au18-five@example.com";
+		계정을_만든다(email);
+
+		for (int i = 1; i <= 4; i++) {
+			LocalDateTime at = LOCK_NOW.plusMinutes(i);
+			CLOCK.set(at);
+			assertThat(로그인에_실패한다(email, WRONG_PASSWORD).getErrorCode())
+					.as("%d번째 실패", i).isEqualTo(ErrorCode.LOGIN_FAILED);
+			assertThat(카운터(email)).as("%d번째 실패 뒤", i).isEqualTo(new Counter(i, null, at));
+		}
+		LocalDateTime fifth = LOCK_NOW.plusMinutes(5);
+		CLOCK.set(fifth);
+		BusinessException thrown = 로그인에_실패한다(email, WRONG_PASSWORD);
+
+		assertThat(thrown.getErrorCode()).isEqualTo(ErrorCode.LOGIN_LOCKED);
+		assertThat(thrown.getErrorCode().getStatus()).isEqualTo(HttpStatus.UNAUTHORIZED);
+		assertThat(thrown.getErrorCode().getCode()).isEqualTo("AU005");
+		assertThat(카운터(email)).as("다섯째가 15분 잠그고 카운터를 0 으로 한다")
+				.isEqualTo(new Counter(0, fifth.plusMinutes(15), fifth));
+	}
+
+	/**
+	 * 잠긴 동안에는 맞는 비밀번호도 {@code AU005} 이고, 어느 쪽도 세지 않고 잠금을 늘리지 않는다 — 잠긴 동안의 시도가 잠금을
+	 * 늘리면 남이 잠금을 끝없이 이어 붙일 수 있다 (sp-docs/security.md §11). 시도는 잠금 직후와 풀리기 1초 전에 한다.
+	 */
+	@Test
+	@DisplayName("잠긴 동안의 시도는 비밀번호와 무관하게 AU005 이고 카운터·locked_until·updated_at 이 그대로다")
+	void 잠긴_동안의_시도는_세지_않는다() {
+		String email = "au18-locked-attempts@example.com";
+		Account account = 계정을_만든다(email);
+		잠근다(email, LOCK_NOW);
+		Counter locked = new Counter(0, LOCK_NOW.plusMinutes(15), LOCK_NOW);
+		assertThat(카운터(email)).as("픽스처 — 잠긴 행").isEqualTo(locked);
+
+		for (LocalDateTime at : List.of(LOCK_NOW.plusMinutes(1), LOCK_NOW.plusMinutes(15).minusSeconds(1))) {
+			CLOCK.set(at);
+			assertThat(로그인에_실패한다(email, WRONG_PASSWORD).getErrorCode())
+					.as("%s 틀린 비밀번호", at).isEqualTo(ErrorCode.LOGIN_LOCKED);
+			assertThat(로그인에_실패한다(email, RAW_PASSWORD).getErrorCode())
+					.as("%s 맞는 비밀번호", at).isEqualTo(ErrorCode.LOGIN_LOCKED);
+			assertThat(카운터(email)).as("%s 의 두 시도 뒤", at).isEqualTo(locked);
+		}
+		assertThat(this.refreshTokenRepository.findByAccountId(account.getId()))
+				.as("맞는 비밀번호도 토큰을 받지 않았다").isEmpty();
+	}
+
+	@Test
+	@DisplayName("잠금 시각 1초 전에는 맞는 비밀번호도 AU005 이고, 잠금 시각에는 로그인되며 카운터가 0 이 된다")
+	void 잠금은_잠금_시각에_풀린다() {
+		String email = "au18-unlock@example.com";
+		Account account = 계정을_만든다(email);
+		잠근다(email, LOCK_NOW);
+
+		CLOCK.set(LOCK_NOW.plusMinutes(15).minusSeconds(1));
+		assertThat(로그인에_실패한다(email, RAW_PASSWORD).getErrorCode()).isEqualTo(ErrorCode.LOGIN_LOCKED);
+
+		LocalDateTime unlockedAt = LOCK_NOW.plusMinutes(15);
+		CLOCK.set(unlockedAt);
+		TokenResponse tokens = this.authService.login(로그인(email, RAW_PASSWORD));
+
+		assertThat(tokens.accessToken()).isNotBlank();
+		assertThat(this.refreshTokenRepository.findByAccountId(account.getId())).isPresent();
+		assertThat(카운터(email)).isEqualTo(new Counter(0, null, unlockedAt));
+	}
+
+	/** 잠그는 문장이 카운터를 0 으로 했으므로 풀린 뒤의 첫 실패는 1 이다 — 그러지 않으면 6 이 되어 곧바로 다시 잠긴다. */
+	@Test
+	@DisplayName("잠금이 풀린 뒤의 실패는 AU003 이고 1부터 센다")
+	void 풀린_뒤의_실패는_1부터_센다() {
+		String email = "au18-after-unlock@example.com";
+		계정을_만든다(email);
+		잠근다(email, LOCK_NOW);
+
+		LocalDateTime after = LOCK_NOW.plusMinutes(15);
+		CLOCK.set(after);
+		assertThat(로그인에_실패한다(email, WRONG_PASSWORD).getErrorCode()).isEqualTo(ErrorCode.LOGIN_FAILED);
+
+		assertThat(카운터(email))
+				.as("1부터 센다. 증가 문장은 locked_until 을 바꾸지 않아 지난 잠금 시각이 남는다")
+				.isEqualTo(new Counter(1, after, after));
+	}
+
+	/**
+	 * 정본의 조건은 「마지막 실패에서 24시간이 지났으면 1부터」 다 (sp-docs/requirements/member.md §12.2). 갱신 문장은 그것을
+	 * {@code updated_at <= :now - 24h} 로 적는다(sp-docs/domain-model.md §2.5) — 정확히 24시간이면 1부터, 1초 모자라면 이어서
+	 * 센다. 두 이메일은 계정이 없다 — 없는 이메일도 같은 규칙으로 센다.
+	 */
+	@Test
+	@DisplayName("마지막 실패에서 24시간 뒤의 실패는 1부터 다시 센다 — 1초 모자라면 이어서 센다")
+	void 하루가_지난_실패는_1부터_센다() {
+		String restarts = "au18-window-restart@example.com";
+		String continues = "au18-window-continue@example.com";
+		CLOCK.set(LOCK_NOW);
+		for (int i = 0; i < 3; i++) {
+			로그인에_실패한다(restarts, WRONG_PASSWORD);
+			로그인에_실패한다(continues, WRONG_PASSWORD);
+		}
+
+		assertThat(카운터(restarts)).as("픽스처").isEqualTo(new Counter(3, null, LOCK_NOW));
+		assertThat(카운터(continues)).as("픽스처").isEqualTo(new Counter(3, null, LOCK_NOW));
+
+		LocalDateTime dayLater = LOCK_NOW.plusHours(24);
+		CLOCK.set(dayLater.minusSeconds(1));
+		assertThat(로그인에_실패한다(continues, WRONG_PASSWORD).getErrorCode()).isEqualTo(ErrorCode.LOGIN_FAILED);
+		CLOCK.set(dayLater);
+		assertThat(로그인에_실패한다(restarts, WRONG_PASSWORD).getErrorCode()).isEqualTo(ErrorCode.LOGIN_FAILED);
+
+		assertThat(카운터(continues)).isEqualTo(new Counter(4, null, dayLater.minusSeconds(1)));
+		assertThat(카운터(restarts)).isEqualTo(new Counter(1, null, dayLater));
+	}
+
+	/**
+	 * 키는 입력의 ASCII 대문자만 소문자로 바꾼 값이다 (sp-docs/requirements/member.md §12.1). H2 는 데이터를 대소문자를 구분해
+	 * 비교하므로 계정을 찾는 표기는 계정과 같은 표기 하나다 — 나머지는 없는 이메일로 센다. 어느 쪽이든 같은 키로 세어야 한다.
+	 * 그 밖의 표기(비ASCII 등)를 합치는지는 실 MySQL 측정 대상이다 (sp-docs/plan/phase2-auth-member.md §5.1).
+	 */
+	@Test
+	@DisplayName("ASCII 대소문자만 다른 이메일로 번갈아 실패하면 한 키로 센다 — 다섯째가 AU005 다")
+	void 대소문자만_다른_이메일은_한_키로_센다() {
+		String email = "au18-case@example.com";
+		계정을_만든다(email);
+		CLOCK.set(LOCK_NOW);
+
+		for (String spelling : List.of("AU18-Case@Example.com", email, "AU18-CASE@EXAMPLE.COM", "au18-cASE@example.Com")) {
+			assertThat(로그인에_실패한다(spelling, WRONG_PASSWORD).getErrorCode())
+					.as(spelling).isEqualTo(ErrorCode.LOGIN_FAILED);
+		}
+		assertThat(키들()).as("키는 하나다").containsExactly(email);
+		assertThat(카운터(email)).isEqualTo(new Counter(4, null, LOCK_NOW));
+
+		assertThat(로그인에_실패한다("Au18-Case@EXAMPLE.com", WRONG_PASSWORD).getErrorCode())
+				.isEqualTo(ErrorCode.LOGIN_LOCKED);
+	}
+
+	/**
+	 * 키 변환은 판정·세기·0 으로 하기가 모두 한다. 저장된 표기에 대문자가 든 계정은 그 표기로 계정을 찾고, 키는 소문자다 —
+	 * 판정이나 0 으로 하기가 변환을 빠뜨리면 H2 는 데이터를 대소문자를 구분해 비교하므로 그 키의 행을 찾지 못한다. 그러면
+	 * 잠긴 계정이 맞는 비밀번호로 로그인되거나, 성공 뒤에도 카운터가 남는다.
+	 */
+	@Test
+	@DisplayName("저장된 표기에 대문자가 든 계정 — 잠기면 그 표기의 맞는 비밀번호도 AU005, 풀린 뒤의 성공은 그 키를 0 으로 한다")
+	void 대문자가_든_계정의_판정과_0_으로_하기() {
+		String stored = "AU18-Upper@Example.com";
+		Account account = 계정을_만든다(stored);
+		잠근다(stored, LOCK_NOW);
+		assertThat(키들()).containsExactly("au18-upper@example.com");
+
+		CLOCK.set(LOCK_NOW.plusMinutes(1));
+		assertThat(로그인에_실패한다(stored, RAW_PASSWORD).getErrorCode()).isEqualTo(ErrorCode.LOGIN_LOCKED);
+		assertThat(this.refreshTokenRepository.findByAccountId(account.getId())).isEmpty();
+
+		LocalDateTime unlocked = LOCK_NOW.plusMinutes(15);
+		CLOCK.set(unlocked);
+		assertThat(로그인에_실패한다(stored, WRONG_PASSWORD).getErrorCode()).isEqualTo(ErrorCode.LOGIN_FAILED);
+		assertThat(카운터(stored)).as("픽스처 — 풀린 뒤의 실패 하나").isEqualTo(new Counter(1, unlocked, unlocked));
+
+		LocalDateTime success = unlocked.plusMinutes(1);
+		CLOCK.set(success);
+		this.authService.login(로그인(stored, RAW_PASSWORD));
+		assertThat(카운터(stored)).isEqualTo(new Counter(0, null, success));
+	}
+
+	/**
+	 * 완료 기준 「키는 AU-12 의 변환이다(ASCII 대문자만)」 의 비ASCII 쪽. 비ASCII 는 바꾸지 않는다 — {@code Locale.ROOT} 의
+	 * 소문자 변환은 U+0130 {@code İ} 를 {@code i} + U+0307 로 바꾼다 (sp-docs/requirements/member.md §12.1). 저장된 표기에
+	 * ASCII 대문자가 없으므로 키는 그 표기 그대로다 — ASCII 대문자 쪽은 {@link #대문자가_든_계정의_판정과_0_으로_하기()} 가
+	 * 본다. 세기·판정·0 으로 하기가 모두 그 키를 쓰는지 본다. 이 표기를 콜레이션이 계정 조회와 같은 키로 합치는지는 실
+	 * MySQL 측정 대상이다 (sp-docs/plan/phase2-auth-member.md §5.1).
+	 */
+	@Test
+	@DisplayName("비ASCII 대문자가 든 계정 — 키는 그 글자를 바꾸지 않고, 세기·판정·0 으로 하기가 모두 그 키를 쓴다")
+	void 비ASCII_대문자가_든_계정의_키() {
+		String stored = "au18-\u0130stanbul@example.com";
+		Account account = 계정을_만든다(stored);
+		잠근다(stored, LOCK_NOW);
+		assertThat(키들()).as("세기의 키 — 입력 그대로").containsExactly("au18-\u0130stanbul@example.com");
+
+		CLOCK.set(LOCK_NOW.plusMinutes(1));
+		assertThat(로그인에_실패한다(stored, RAW_PASSWORD).getErrorCode()).as("판정의 키").isEqualTo(ErrorCode.LOGIN_LOCKED);
+		assertThat(this.refreshTokenRepository.findByAccountId(account.getId())).isEmpty();
+
+		LocalDateTime success = LOCK_NOW.plusMinutes(15);
+		CLOCK.set(success);
+		this.authService.login(로그인(stored, RAW_PASSWORD));
+		assertThat(카운터(stored)).as("0 으로 하기의 키").isEqualTo(new Counter(0, null, success));
+	}
+
+	@Test
+	@DisplayName("실패를 쌓아 둔 뒤 성공하면 카운터 0 이 커밋된다")
+	void 성공은_카운터를_0_으로_한다() {
+		String email = "au18-success-reset@example.com";
+		계정을_만든다(email);
+		CLOCK.set(LOCK_NOW);
+		for (int i = 0; i < 3; i++) {
+			로그인에_실패한다(email, WRONG_PASSWORD);
+		}
+		assertThat(카운터(email)).as("픽스처").isEqualTo(new Counter(3, null, LOCK_NOW));
+
+		LocalDateTime later = LOCK_NOW.plusMinutes(1);
+		CLOCK.set(later);
+		this.authService.login(로그인(email, RAW_PASSWORD));
+
+		assertThat(카운터(email)).isEqualTo(new Counter(0, null, later));
+	}
+
+	/**
+	 * {@code AU006} 은 예외로 끝나는 응답이다 — 0 으로 하기가 그 예외로 되돌려지는 트랜잭션 안이면 함께 되돌려져 카운터가 3
+	 * 으로 남는다 (sp-docs/requirements/member.md §12.2).
+	 */
+	@Test
+	@DisplayName("실패를 쌓아 둔 뒤 미인증 계정의 맞는 비밀번호는 403 AU006 이고 카운터 0 이 커밋된다")
+	void 미인증의_맞는_비밀번호는_카운터를_0_으로_한다() {
+		String email = "au18-unverified-reset@example.com";
+		미인증_계정을_만든다(email);
+		CLOCK.set(LOCK_NOW);
+		for (int i = 0; i < 3; i++) {
+			로그인에_실패한다(email, WRONG_PASSWORD);
+		}
+		assertThat(카운터(email)).as("픽스처").isEqualTo(new Counter(3, null, LOCK_NOW));
+
+		LocalDateTime later = LOCK_NOW.plusMinutes(1);
+		CLOCK.set(later);
+		assertThat(로그인에_실패한다(email, RAW_PASSWORD).getErrorCode()).isEqualTo(ErrorCode.EMAIL_NOT_VERIFIED);
+
+		assertThat(카운터(email)).isEqualTo(new Counter(0, null, later));
+	}
+
+	/**
+	 * 실패 응답은 예외로 끝난다. 이 스레드에는 트랜잭션이 없어 {@link #카운터} 는 커밋된 값을 읽는다 — 그 예외로 되돌려지는
+	 * 트랜잭션에서 셌다면 행이 없다.
+	 */
+	@Test
+	@DisplayName("실패 응답 뒤에 login_attempt 행이 커밋되어 있다 — 응답이 예외로 끝나도 남는다")
+	void 실패의_카운트가_커밋되어_있다() {
+		String email = "au18-committed@example.com";
+		계정을_만든다(email);
+		CLOCK.set(LOCK_NOW);
+
+		assertThat(로그인에_실패한다(email, WRONG_PASSWORD).getErrorCode()).isEqualTo(ErrorCode.LOGIN_FAILED);
+
+		assertThat(카운터(email)).isEqualTo(new Counter(1, null, LOCK_NOW));
+	}
+
+	/**
+	 * 판정 시각은 앱 시계의 값을 초로 자른 것이다 (sp-docs/domain-model.md §2.5). 자르지 않으면 H2 는 소수부를 남기고
+	 * MySQL 의 {@code DATETIME} 은 반올림해 두 DB 의 저장값이 갈린다 (§1.1). 시계에 소수부를 주고 증가와 잠금이 쓴 시각을
+	 * 본다.
+	 */
+	@Test
+	@DisplayName("시계에 소수부가 있어도 증가와 잠금이 쓰는 시각은 초로 자른 값이다")
+	void 판정_시각은_초로_자른_값이다() {
+		String email = "au18-truncated-now@example.com";
+		CLOCK.set(LOCK_NOW.plusNanos(700_000_000));
+
+		로그인에_실패한다(email, WRONG_PASSWORD);
+		로그인에_실패한다(email, WRONG_PASSWORD);
+		assertThat(카운터(email)).as("증가").isEqualTo(new Counter(2, null, LOCK_NOW));
+
+		for (int i = 3; i <= 5; i++) {
+			로그인에_실패한다(email, WRONG_PASSWORD);
+		}
+		assertThat(카운터(email)).as("잠금").isEqualTo(new Counter(0, LOCK_NOW.plusMinutes(15), LOCK_NOW));
+	}
+
+	/**
+	 * 100자는 이메일의 최대 길이(sp-docs/requirements/member.md §2)이자 키 컬럼의 폭이다(§12.1). 100자는 세고 101자는
+	 * 세지 않는다.
+	 */
+	@Test
+	@DisplayName("이메일이 100자를 넘으면 AU003 이고 세지 않는다. 100자 이메일은 센다")
+	void 백자를_넘는_이메일은_세지_않는다() {
+		String hundred = "a".repeat(88) + "@example.com";
+		String hundredOne = "a".repeat(89) + "@example.com";
+		assertThat(hundred).as("픽스처").hasSize(100);
+		assertThat(hundredOne).as("픽스처").hasSize(101);
+		CLOCK.set(LOCK_NOW);
+
+		assertThat(로그인에_실패한다(hundredOne, RAW_PASSWORD).getErrorCode()).isEqualTo(ErrorCode.LOGIN_FAILED);
+		assertThat(키들()).as("101자는 세지 않는다").isEmpty();
+
+		assertThat(로그인에_실패한다(hundred, RAW_PASSWORD).getErrorCode()).isEqualTo(ErrorCode.LOGIN_FAILED);
+		assertThat(카운터(hundred)).as("100자는 센다").isEqualTo(new Counter(1, null, LOCK_NOW));
+	}
+
+	@Test
+	@DisplayName("이메일 또는 비밀번호가 비면 AU003 이고 세지 않는다 — 있는 이메일 + 빈 비밀번호도 같다")
+	void 빈_값은_세지_않는다() {
+		String email = "au18-blank@example.com";
+		계정을_만든다(email);
+		CLOCK.set(LOCK_NOW);
+
+		for (LoginRequest blank : Arrays.asList(
+				로그인(null, RAW_PASSWORD), 로그인("", RAW_PASSWORD), 로그인("   ", RAW_PASSWORD),
+				로그인(email, null), 로그인(email, ""), 로그인(email, "   "))) {
+			assertThatThrownBy(() -> this.authService.login(blank))
+					.as("%s", blank)
+					.isInstanceOf(BusinessException.class)
+					.extracting(e -> ((BusinessException) e).getErrorCode())
+					.isEqualTo(ErrorCode.LOGIN_FAILED);
+		}
+
+		assertThat(키들()).isEmpty();
+	}
+
+	/**
+	 * 잠긴 경로도 BCrypt 를 정확히 한 번 한다 — 응답 시간으로 계정의 존재를 드러내지 않는 규칙(sp-docs/security.md §4.1)이
+	 * 이 경로에도 적용된다(sp-docs/requirements/member.md §12.1 「잠긴 경로도 BCrypt 를 한 번 한다」). 횟수는
+	 * {@link #세_실패_경로가_matches_를_한_번씩_한다} 와 같은 방법으로 센다. 잠긴 행은 SQL 로 심는다.
+	 */
+	@Test
+	@DisplayName("잠긴 경로도 matches 를 정확히 한 번 한다 — 있는 계정의 맞는·틀린 비밀번호, 탈퇴 계정, 없는 이메일")
+	void 잠긴_경로가_matches_를_한_번씩_한다() {
+		String active = "au18-bcrypt@example.com";
+		String withdrawn = "au18-bcrypt-withdrawn@example.com";
+		String absent = "au18-bcrypt-none@example.com";
+		계정을_만든다(active);
+		탈퇴한_계정을_만든다(withdrawn);
+		CLOCK.set(LOCK_NOW);
+		for (String email : List.of(active, withdrawn, absent)) {
+			카운터를_심는다(email, new Counter(0, LOCK_NOW.plusMinutes(10), LOCK_NOW.minusMinutes(5)));
+		}
+		CountingPasswordEncoder counting = new CountingPasswordEncoder(this.passwordEncoder);
+		AuthService service = new AuthService(this.accountRepository, this.refreshTokenRepository,
+				counting, this.jwtTokenProvider, this.loginAttemptService, this.transactionManager, this.clock);
+
+		Map<String, LoginRequest> 잠긴_경로 = new LinkedHashMap<>();
+		잠긴_경로.put("맞는 비밀번호", 로그인(active, RAW_PASSWORD));
+		잠긴_경로.put("틀린 비밀번호", 로그인(active, WRONG_PASSWORD));
+		잠긴_경로.put("탈퇴 계정", 로그인(withdrawn, RAW_PASSWORD));
+		잠긴_경로.put("없는 이메일", 로그인(absent, RAW_PASSWORD));
+
+		잠긴_경로.forEach((이름, request) -> {
+			counting.reset();
+			assertThatThrownBy(() -> service.login(request))
+					.as(이름)
+					.isInstanceOf(BusinessException.class)
+					.extracting(e -> ((BusinessException) e).getErrorCode())
+					.isEqualTo(ErrorCode.LOGIN_LOCKED);
+			assertThat(counting.matchesCalls())
+					.as("%s — 0 이면 잠긴 경로가 비교를 건너뛴 것이고 시간으로 드러난다", 이름)
+					.isEqualTo(1);
+		});
+	}
+
+	/**
+	 * 판정의 축을 맞세운다 — 계정 상태(활성·미인증·탈퇴·없음) × 비밀번호(맞음·틀림) × 잠금(잠김·안잠김). 기대값은 조합마다
+	 * 적는다 (sp-docs/requirements/member.md §12.1, sp-docs/api-contract.md §2.1 의 표).
+	 *
+	 * <p>잠기지 않은 카운터는 2 로 심는다 — 세면 3, 0 으로 하면 0 이 되어 둘이 갈린다. 잠긴 카운터는 그대로여야 한다. 다른
+	 * 이메일의 카운터는 한도 하나 전(4)으로 심는다 — 어느 조합도 그것을 바꾸지 않는다. 기대 카운터의 {@code 그대로} 는 심은
+	 * 값이고, 숫자는 그 수와 판정 시각(잠금 없음)이다.
+	 */
+	@ParameterizedTest(name = "{0} · 비밀번호 {1} · {2} → {3}, 카운터 {4}")
+	@CsvSource({
+			"활성,   맞음, 안잠김, 성공,  0",
+			"활성,   틀림, 안잠김, AU003, 3",
+			"미인증, 맞음, 안잠김, AU006, 0",
+			"미인증, 틀림, 안잠김, AU003, 3",
+			"탈퇴,   맞음, 안잠김, AU003, 3",
+			"탈퇴,   틀림, 안잠김, AU003, 3",
+			"없음,   맞음, 안잠김, AU003, 3",
+			"없음,   틀림, 안잠김, AU003, 3",
+			"활성,   맞음, 잠김,   AU005, 그대로",
+			"활성,   틀림, 잠김,   AU005, 그대로",
+			"미인증, 맞음, 잠김,   AU005, 그대로",
+			"미인증, 틀림, 잠김,   AU005, 그대로",
+			"탈퇴,   맞음, 잠김,   AU005, 그대로",
+			"탈퇴,   틀림, 잠김,   AU005, 그대로",
+			"없음,   맞음, 잠김,   AU005, 그대로",
+			"없음,   틀림, 잠김,   AU005, 그대로"
+	})
+	@DisplayName("계정 상태 × 비밀번호 × 잠금의 응답과 카운터 — 다른 이메일의 카운터는 그대로다")
+	void 판정의_축(String 상태, String 비밀번호, String 잠금, String 기대_응답, String 기대_카운터) {
+		String email = "au18-axis@example.com";
+		String other = "au18-axis-other@example.com";
+		switch (상태) {
+			case "활성" -> 계정을_만든다(email);
+			case "미인증" -> 미인증_계정을_만든다(email);
+			case "탈퇴" -> 탈퇴한_계정을_만든다(email);
+			case "없음" -> { }
+			default -> fail("픽스처의 계정 상태: " + 상태);
+		}
+		Counter 심은_카운터 = "잠김".equals(잠금)
+				? new Counter(0, LOCK_NOW.plusMinutes(10), LOCK_NOW.minusMinutes(5))
+				: new Counter(2, null, LOCK_NOW.minusMinutes(1));
+		Counter 다른_카운터 = new Counter(4, null, LOCK_NOW.minusMinutes(1));
+		카운터를_심는다(email, 심은_카운터);
+		카운터를_심는다(other, 다른_카운터);
+		CLOCK.set(LOCK_NOW);
+		LoginRequest request = 로그인(email, "맞음".equals(비밀번호) ? RAW_PASSWORD : WRONG_PASSWORD);
+
+		if ("성공".equals(기대_응답)) {
+			assertThat(this.authService.login(request).accessToken()).isNotBlank();
+		} else {
+			BusinessException thrown = 로그인에_실패한다(email, request.password());
+			assertThat(thrown.getErrorCode().getCode()).isEqualTo(기대_응답);
+		}
+
+		assertThat(카운터(email)).isEqualTo("그대로".equals(기대_카운터)
+				? 심은_카운터
+				: new Counter(Integer.parseInt(기대_카운터), null, LOCK_NOW));
+		assertThat(카운터(other)).as("다른 이메일").isEqualTo(다른_카운터);
 	}
 
 	/**
@@ -739,9 +1190,9 @@ class AuthServiceTest {
 	 * 유일한 방어선인 상태를 만든다. 검사가 없으면 탈퇴 계정이 14일간 토큰을 갱신한다
 	 * (sp-docs/requirements/member.md §3 규칙 5, §6).
 	 *
-	 * <p><b>AU-06 이 남긴 경합이 여기서 닫힌다.</b> 로그인이 {@code authenticate()} 뒤에 커밋된
-	 * 탈퇴와 겹쳐 탈퇴 계정 행을 INSERT 하더라도, 이 검사가 있는 한 그 행으로 재발급받을 수 없다
-	 * (sp-docs/plan/phase1.md §4 AU-07).
+	 * <p>로그인의 저장은 계정을 잠금 읽기로 다시 읽어 그때 탈퇴한 계정이면 저장하지 않는다
+	 * ({@code AuthService#storeRefreshToken}). 이 검사는 그것에 기대지 않는다 — 탈퇴 계정에 행이 남아도 이 검사가 있는 한
+	 * 그 행으로 재발급받을 수 없다 (sp-docs/plan/phase1.md §4 AU-07).
 	 */
 	@Test
 	@DisplayName("탈퇴 계정의 유효한 Refresh Token 으로는 재발급받을 수 없다")
@@ -938,6 +1389,43 @@ class AuthServiceTest {
 		this.accountRepository.saveAndFlush(account);
 	}
 
+	/**
+	 * AU-18 — 실제 경로로 잠근다. {@code at} 에 틀린 비밀번호로 다섯 번 실패하고, 넷째까지 {@code AU003}·다섯째가
+	 * {@code AU005} 인지 본다. 잠긴 행의 값은 부른 쪽이 본다.
+	 */
+	private void 잠근다(String email, LocalDateTime at) {
+		CLOCK.set(at);
+		for (int i = 1; i <= 5; i++) {
+			assertThat(로그인에_실패한다(email, WRONG_PASSWORD).getErrorCode())
+					.as("잠그는 %d번째 실패", i)
+					.isEqualTo((i < 5) ? ErrorCode.LOGIN_FAILED : ErrorCode.LOGIN_LOCKED);
+		}
+	}
+
+	/** AU-18 — 그 이메일의 {@code login_attempt} 행을 SQL 로 심는다. 키는 AU-12 의 변환으로 만든다. */
+	private void 카운터를_심는다(String email, Counter counter) {
+		this.jdbcTemplate.update(
+				"insert into login_attempt (email_key, failed_count, locked_until, updated_at) values (?, ?, ?, ?)",
+				LoginAttempt.emailKeyOf(email), counter.failedCount(), counter.lockedUntil(), counter.updatedAt());
+	}
+
+	/** AU-18 — 그 이메일의 커밋된 {@code login_attempt} 행. 행이 없으면 실패한다. JPA 를 거치지 않는다. */
+	private Counter 카운터(String email) {
+		List<Counter> rows = this.jdbcTemplate.query(
+				"select failed_count, locked_until, updated_at from login_attempt where email_key = ?",
+				(rs, rowNum) -> new Counter(rs.getInt("failed_count"),
+						rs.getObject("locked_until", LocalDateTime.class),
+						rs.getObject("updated_at", LocalDateTime.class)),
+				LoginAttempt.emailKeyOf(email));
+		assertThat(rows).as("%s 의 login_attempt 행", email).hasSize(1);
+		return rows.get(0);
+	}
+
+	/** AU-18 — 커밋된 {@code login_attempt} 의 키 전부. */
+	private List<String> 키들() {
+		return this.jdbcTemplate.queryForList("select email_key from login_attempt order by email_key", String.class);
+	}
+
 	/** 세 번 재서 가장 짧은 값을 쓴다. 최소값은 위로 튀는 잡음(GC·스케줄링)에 둔감하다. */
 	private static long 최소_소요시간(Runnable action) {
 		long min = Long.MAX_VALUE;
@@ -993,6 +1481,10 @@ class AuthServiceTest {
 			this.matchesCalls = 0;
 		}
 
+	}
+
+	/** AU-18 — {@code login_attempt} 의 연속 실패 수·잠금 시각·마지막 갱신 시각. */
+	private record Counter(int failedCount, LocalDateTime lockedUntil, LocalDateTime updatedAt) {
 	}
 
 }

@@ -1,5 +1,6 @@
 package com.example.auth.auth.service;
 
+import com.example.auth.account.dto.AccountCreateRequest;
 import com.example.auth.account.entity.Account;
 import com.example.auth.account.repository.AccountRepository;
 import com.example.auth.auth.dto.LoginRequest;
@@ -18,7 +19,9 @@ import java.time.temporal.ChronoUnit;
 import java.util.UUID;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.util.StringUtils;
 
 /**
@@ -26,7 +29,8 @@ import org.springframework.util.StringUtils;
  * sp-docs/security.md §4, sp-docs/api-contract.md §2.1 §9.2.
  *
  * <p>AU-06 이 만들고 AU-07(재발급·로그아웃)이 확장했다 (sp-docs/plan/phase1.md §2.3). 2차의 AU-16 이 로그인에
- * 미인증 차단(403 {@code AU006})을 더했다 (sp-docs/plan/phase2-auth-member.md).
+ * 미인증 차단(403 {@code AU006})을, AU-18 이 로그인 잠금(sp-docs/requirements/member.md §12)을 더했다
+ * (sp-docs/plan/phase2-auth-member.md).
  *
  * <p><b>프로필 존재를 보지 않는다.</b> "계정만 있고 프로필이 없는 상태"는 정상이며 그 상태에서
  * 로그인이 되어야 한다 (sp-docs/requirements/member.md §3 규칙 3). auth 는 프로필을 소유하지
@@ -51,6 +55,18 @@ public class AuthService {
 	private final JwtTokenProvider jwtTokenProvider;
 
 	/**
+	 * 로그인 잠금의 카운터. 이 서비스와 다른 빈이고, 판정·세기·0 으로 하기를 저마다 새 트랜잭션에서 곧바로 커밋한다
+	 * (sp-docs/conventions.md §1.1, sp-docs/requirements/member.md §12.2).
+	 */
+	private final LoginAttemptService loginAttemptService;
+
+	/**
+	 * 로그인의 저장 트랜잭션 — 계정을 다시 읽어 검증 때와 견주고, 발급한 Refresh Token 을 저장한다. 로그인 전체가 아니라 그
+	 * 일만 감싼다 — 이유는 {@link #login} 에 있다. 이름은 {@code @Transactional} 이 메서드에 붙이는 이름의 모양을 따른다.
+	 */
+	private final TransactionTemplate storeTransaction;
+
+	/**
 	 * 계정이 없거나 탈퇴했을 때 비교 대상으로 쓰는 더미 해시. 결과는 쓰지 않고 버린다
 	 * (sp-docs/security.md §4.1).
 	 *
@@ -71,12 +87,17 @@ public class AuthService {
 			RefreshTokenRepository refreshTokenRepository,
 			PasswordEncoder passwordEncoder,
 			JwtTokenProvider jwtTokenProvider,
+			LoginAttemptService loginAttemptService,
+			PlatformTransactionManager transactionManager,
 			Clock clock) {
 
 		this.accountRepository = accountRepository;
 		this.refreshTokenRepository = refreshTokenRepository;
 		this.passwordEncoder = passwordEncoder;
 		this.jwtTokenProvider = jwtTokenProvider;
+		this.loginAttemptService = loginAttemptService;
+		this.storeTransaction = new TransactionTemplate(transactionManager);
+		this.storeTransaction.setName(AuthService.class.getName() + ".storeRefreshToken");
 		this.clock = clock;
 		// 맞출 평문이 없는 값이어야 한다. 기동마다 달라도 무해하다 — 비교 시간만 필요하다
 		this.dummyPasswordHash = passwordEncoder.encode(UUID.randomUUID().toString());
@@ -85,50 +106,77 @@ public class AuthService {
 	/**
 	 * MR-04 — 로그인 (sp-docs/security.md §4).
 	 *
-	 * <p>검증과 저장이 <b>한 트랜잭션</b>이다. 그래서 인증에 실패하면 {@code refresh_token} 에
-	 * 행이 생기지 않는다 — 실패 경로는 {@link #authenticate} 에서 예외로 끝나고, 롤백이 두 번째
-	 * 방어선이다.
+	 * <p><b>로그인 전체를 한 트랜잭션으로 감싸지 않는다.</b> 검증({@link #authenticate})은 트랜잭션 밖에서 하고, 계정을 다시 읽어
+	 * 견주는 일과 발급한 Refresh Token 의 저장만 {@link #storeTransaction} 으로 짧게 연다. 검증의 BCrypt 비교 동안 트랜잭션이
+	 * 연결을 쥐고 있으면, 비교 뒤의 잠금 판정·세기가 {@link LoginAttemptService} 의 새 트랜잭션으로 연결을 하나 더 얻어 로그인
+	 * 하나가 연결 둘을 쥔다. 2026-11-16 AU-18 리뷰가 그 구조를 H2 에서 쟀다 — 풀 2·대기 3초에서 BCrypt 뒤에 맞춘 동시 로그인
+	 * 둘이 서로 쥔 연결을 기다리다 둘 다 연결을 얻지 못했고(500 {@code C005}), 실패를 하나도 세지 못했다. 계정 조회는 트랜잭션
+	 * 밖의 리포지터리 호출이라 조회가 끝나면 연결을 돌려준다 — {@code spring.jpa.open-in-view} 가 꺼져 있어(application.yml)
+	 * 요청이 영속성 컨텍스트와 그 연결을 붙들지 않는다. {@code LoginConnectionPoolTest} 가 BCrypt 뒤에 빌려 간 연결이 없는 것을
+	 * 본다.
+	 *
+	 * <p><b>검증과 저장이 다른 트랜잭션이라 저장이 계정을 다시 읽는다</b>({@link #storeRefreshToken}). 그 사이에 비밀번호
+	 * 변경·재설정·탈퇴가 커밋될 수 있다. 2026-11-17 AU-18 리뷰가 H2 에서 로그인을 BCrypt 비교 뒤에 세워 두고 그 사이에
+	 * 비밀번호 변경을 커밋했더니, 다시 읽지 않는 저장이 옛 비밀번호의 로그인에 200 을 주고 {@code refresh_token} 에 행을
+	 * 넣었고 그 토큰으로 재발급도 됐다 — 비밀번호를 바꾸면 새 세션은 만들 수 없어야 한다 (sp-docs/security.md §5.3).
+	 *
+	 * <p>인증에 실패하면 저장 전에 예외로 끝나므로 {@code refresh_token} 에 행이 생기지 않는다.
+	 *
+	 * <p><b>잠금 카운터는 이 저장과도 다른 트랜잭션이다.</b> 판정·세기·0 으로 하기는 {@link LoginAttemptService} 가 연 새
+	 * 트랜잭션에서 곧바로 커밋된다 — 실패·잠금·미인증의 응답이 예외로 끝나도 센 것과 0 으로 한 것이 남는다
+	 * (sp-docs/requirements/member.md §12.2). 저장 트랜잭션은 검증이 끝난 뒤에 열리므로 그 트랜잭션들과 겹치지 않는다.
 	 */
-	@Transactional
 	public TokenResponse login(LoginRequest request) {
 		Account account = authenticate(request);
 
 		TokenResponse tokens = this.jwtTokenProvider.issue(account.getId(), account.getRole());
-		storeRefreshToken(account.getId(), tokens.refreshToken());
+		this.storeTransaction.executeWithoutResult(status -> storeRefreshToken(account, tokens.refreshToken()));
 		return tokens;
 	}
 
 	/**
-	 * 이메일·비밀번호를 검증하고, 맞으면 이메일 인증 여부를 본다.
+	 * 이메일·비밀번호를 검증한다. 판정 순서는 sp-docs/requirements/member.md §12.1 의 1~6 이고 각 단계 앞의 주석이 그
+	 * 번호를 단다.
+	 *
+	 * <p><b>잠금은 비밀번호 비교 뒤이고 인증 여부보다 앞이다.</b> 잠겨 있으면 비밀번호가 맞든 틀리든, 계정이 있든 없든
+	 * 401 {@code AU005} 하나다 — 잠금 응답이 비밀번호로 갈리면 잠긴 동안 추측을 확인하는 수단이 된다(§12.1). 잠긴 동안에는
+	 * 맞는 비밀번호로도 {@code AU006} 을 보지 못한다.
 	 *
 	 * <p><b>비밀번호가 맞고 미인증이면 403 {@code AU006} 이다</b> (2차 AU-16, sp-docs/requirements/member.md §3 규칙 11).
 	 * 그 판정은 비밀번호가 맞은 뒤에만 한다 (§12.1 의 5 가 4 뒤에 있다).
 	 *
 	 * <p><b>실패 이유를 구분해 내보내지 않는다.</b> 없는 이메일·비밀번호 불일치·탈퇴 계정이 모두
 	 * 같은 {@code AU003}(401, 같은 메시지)이다 (sp-docs/plan/phase1.md §4 AU-06). 구분하면 이메일
-	 * 존재 여부를 알려주는 열거 취약점이 된다. 그래서 <b>로그도 남기지 않는다</b> — 정본은 로그인
-	 * 실패의 로깅을 요구하지 않고(sp-docs/nfr.md §5, sp-docs/conventions.md §8), 실패 5회 잠금은
-	 * 2차 범위다(sp-docs/requirements/member.md §3 규칙 9). {@code GlobalExceptionHandler} 가
-	 * 남기는 것은 에러 코드 하나이므로 세 경로가 로그에서도 구분되지 않는다.
+	 * 존재 여부를 알려주는 열거 취약점이 된다. 셋 다 그 이메일의 키로 똑같이 세어 잠금도 같다 — 없는 이메일이 잠기지 않으면
+	 * 잠금 여부가 계정의 존재를 알려준다(§12.1). 그래서 <b>로그로도 가르지 않는다</b> — 정본은 로그인 실패의 로깅을
+	 * 요구하지 않고(sp-docs/nfr.md §5, sp-docs/conventions.md §8), {@code GlobalExceptionHandler} 가 남기는 것은 에러
+	 * 코드 하나다. 카운터가 세지 못한 실패에 남기는 WARN 에도 이메일·계정이 없다.
 	 *
 	 * <p><b>응답 시간으로도 구분되지 않는다</b> (sp-docs/security.md §4.1). 계정이 없거나
 	 * 탈퇴했을 때 BCrypt 비교를 건너뛰면 그 경로만 48ms 빨라져 이메일 존재 여부가 드러난다.
-	 * 그래서 <b>세 실패 경로가 모두 {@code matches} 를 정확히 한 번 수행한다</b> — 비교 대상이
+	 * 그래서 <b>세 실패 경로와 잠긴 경로가 모두 {@code matches} 를 정확히 한 번 수행한다</b> — 비교 대상이
 	 * 없을 때는 {@link #dummyPasswordHash} 를 쓰고 결과를 버린다. 불일치와 정상이 구분되지 않는
 	 * 것은 BCrypt 비교 자체가 보장한다.
 	 */
 	private Account authenticate(LoginRequest request) {
-		// 자격증명이 비어 있으면 조회하지 않는다. matches() 에 null 을 넘기면
-		// IllegalArgumentException 이 500 C005 로 새어 나간다.
-		// 이 경로는 계정에 대해 아무것도 알려주지 않으므로 시간을 맞출 대상이 아니다
-		if (!StringUtils.hasText(request.email()) || !StringUtils.hasText(request.password())) {
+		String email = request.email();
+
+		// 1) 자격증명이 비었거나 이메일이 100자를 넘으면 계정을 조회하지 않고 세지 않는다.
+		// matches() 에 null 을 넘기면 IllegalArgumentException 이 500 C005 로 새어 나간다.
+		// 100자는 이메일의 최대 길이이자 잠금 키 컬럼의 폭이다 — 키는 입력과 길이가 같다. 넘는 입력은 콜레이션이 같게
+		// 보는 표기로만 계정에 닿고, 그 길로 닿으면서 세지 않으면 잠금 없이 추측할 수 있다(§12.1). 길이는 가입의
+		// @Size 와 같은 단위(UTF-16)로 잰다 — 그 길이 이하의 키는 문자 수로 재는 컬럼에 들어간다.
+		// 이 경로는 입력만 보고 계정에 대해 아무것도 알려주지 않으므로 시간을 맞출 대상이 아니다
+		if (!StringUtils.hasText(email) || !StringUtils.hasText(request.password())
+				|| email.length() > AccountCreateRequest.EMAIL_MAX_LENGTH) {
 			throw loginFailed();
 		}
 
+		// 2) 계정 조회(활성만) + BCrypt 비교 정확히 한 번.
 		// 탈퇴 계정을 "없음"과 같은 자리에 둔다. 여기서 갈라 비교를 건너뛰면 "그 이메일은
 		// 존재하되 탈퇴했다"가 시간으로 드러난다 (sp-docs/security.md §4.1).
 		// 탈퇴 계정 거부 자체는 sp-docs/requirements/member.md §3 규칙 5 가 요구한다
-		Account account = this.accountRepository.findByEmail(request.email())
+		Account account = this.accountRepository.findByEmail(email)
 				.filter(Account::isActive)
 				.orElse(null);
 
@@ -137,12 +185,22 @@ public class AuthService {
 				request.password(),
 				(account != null) ? account.getPassword() : this.dummyPasswordHash);
 
-		if (account == null || !matched) {
-			throw loginFailed();
+		// 3) 잠겨 있으면 비밀번호와 무관하게 AU005. 세지 않는다. 판정은 BCrypt 비교 뒤의 최신 커밋 값을 읽는다 — 읽는 방법은
+		// LoginAttemptService#isLocked 에 있다
+		if (this.loginAttemptService.isLocked(email)) {
+			throw loginLocked();
 		}
 
-		// 미인증은 비밀번호가 맞은 뒤에만 드러낸다 — 403 AU006 이 알려주는 것(이 이메일과 비밀번호의 계정이
-		// 있다)은 비밀번호를 아는 사람만 얻는다. 틀린 비밀번호는 미인증이어도 loginFailed() 의 AU003 이다
+		// 4) 계정 없음·탈퇴·비밀번호 불일치 — 센다. 이번 실패로 잠갔거나 그 사이 다른 시도가 잠갔으면 AU005
+		if (account == null || !matched) {
+			throw this.loginAttemptService.countFailure(email) ? loginLocked() : loginFailed();
+		}
+
+		// 5)·6) 비밀번호가 맞았다 — 카운터를 0 으로. 미인증의 AU006 도 이 뒤라 0 이 된다(§12.2)
+		this.loginAttemptService.reset(email);
+
+		// 5) 미인증은 비밀번호가 맞은 뒤에만 드러낸다 — 403 AU006 이 알려주는 것(이 이메일과 비밀번호의 계정이
+		// 있다)은 비밀번호를 아는 사람만 얻는다. 틀린 비밀번호는 미인증이어도 4) 의 AU003 이다
 		// (sp-docs/requirements/member.md §3 규칙 11·§12.1 의 5, sp-docs/api-contract.md §2.1).
 		// 발급·저장보다 먼저 끝나므로 토큰을 주지 않고 Refresh Token 도 저장하지 않는다
 		if (account.getEmailVerifiedAt() == null) {
@@ -160,9 +218,9 @@ public class AuthService {
 	 * 로그인용으로 만든 것이고, 여기서는 저장된 행 자체가 자격증명이므로 "옛 행이 있어야 쓸 수
 	 * 있다"는 조건이 WHERE 에 있어야 한다 (sp-docs/plan/phase1.md §4 AU-07).
 	 *
-	 * <p><b>AU-06 이 남긴 경합이 여기서 닫힌다.</b> 로그인은 {@code authenticate()} 뒤에 탈퇴가
-	 * 커밋되면 탈퇴 계정 행을 INSERT 할 수 있다. 재발급이 {@code deleted} 를 같은 트랜잭션에서
-	 * 검사하는 한 그 행으로는 아무것도 할 수 없다.
+	 * <p><b>탈퇴 계정의 행이 남아도 여기서 막힌다.</b> 로그인의 저장은 계정을 잠금 읽기로 다시 읽어 그때 탈퇴한 계정이면
+	 * 저장하지 않는다({@link #storeRefreshToken}). 재발급은 그것에 기대지 않는다 — {@code deleted} 를 같은
+	 * 트랜잭션에서 검사하는 한 탈퇴 계정의 행으로는 아무것도 할 수 없다.
 	 *
 	 * <p><b>직전 토큰에는 회전 뒤 10초의 유예가 있다</b> (sp-docs/requirements/member.md §6.3).
 	 * 회전이 0행이고 제시된 토큰이 직전 토큰이며 유예 안이면, 다시 회전하지 않고 새 Access Token
@@ -271,8 +329,19 @@ public class AuthService {
 	}
 
 	/**
-	 * 발급한 Refresh Token 을 {@code sp_auth} 에 저장한다. <b>계정당 1행이다</b>
-	 * (sp-docs/domain-model.md §2.2). 재로그인하면 행이 늘지 않고 값이 교체된다 —
+	 * 검증한 계정이 그대로이면 발급한 Refresh Token 을 {@code sp_auth} 에 저장한다. {@link #storeTransaction} 안에서 부른다.
+	 *
+	 * <p><b>계정을 잠금 읽기로 다시 읽어 검증 때와 견준다</b>({@link AccountRepository#findByIdForUpdate}). 비밀번호 해시가
+	 * 검증에 쓴 것과 같고 탈퇴하지 않았을 때만 저장한다 — 검증 뒤에 커밋된 비밀번호 변경·재설정은 해시를, 탈퇴는
+	 * {@code deleted} 를 바꾼다. 잠금 읽기는 최신 커밋 값을 읽고, 이 트랜잭션이 끝날 때까지 그 행의 다른 쓰기를 기다리게
+	 * 한다 — 견준 값이 저장의 커밋까지 그대로다. 잠금은 계정을 잡은 뒤에 {@code refresh_token} 을 잡는다.
+	 *
+	 * <p>어긋나면 401 {@code AU003} 이다 — 실패 응답과 같은 모양이라 계정의 상태를 드러내지 않는다. 행이 없으면 탈퇴한 계정과
+	 * 같이 다룬다 — 검증의 조회({@link #authenticate})와 같다. 예외가 이 트랜잭션을 되돌리므로 저장한 것이 없다. <b>잠금
+	 * 카운터에 세지 않는다</b>(2026-11-17 오케스트레이터 결정, 정본 미정) — 비교한 때에는 비밀번호가 맞았으므로 추측이 아니고,
+	 * 다음 시도는 바뀐 해시와 비교되어 세진다.
+	 *
+	 * <p><b>계정당 1행이다</b> (sp-docs/domain-model.md §2.2). 재로그인하면 행이 늘지 않고 값이 교체된다 —
 	 * 그것을 최종적으로 보장하는 것은 {@code uk_refresh_account_id} 다 (§2.3).
 	 *
 	 * <p><b>조건부 UPDATE({@code rotate})를 쓰지 않는다.</b> 정본이 조건부 UPDATE 와 "0행이면
@@ -284,7 +353,8 @@ public class AuthService {
 	 * <p><b>기존 행을 찾아 갱신한다. 지우고 다시 넣지 않는다.</b> 재삽입은 로그인마다
 	 * {@code refresh_token.id} 를 AUTO_INCREMENT 로 올리고 인덱스를 흔든다 —
 	 * 재로그인 후에도 {@code id} 가 같아야 한다 (sp-docs/plan/phase1.md §4 AU-06).
-	 * 영속 상태의 엔티티를 바꾸면 더티 체킹이 커밋 시점에 UPDATE 를 보낸다.
+	 * 영속 상태의 엔티티를 바꾸면 더티 체킹이 커밋 시점에 UPDATE 를 보낸다. <b>그래서 {@link #storeTransaction} 안에서
+	 * 부른다</b> — 트랜잭션 밖에서 읽은 행은 준영속이라 바꿔도 저장되지 않는다.
 	 *
 	 * <p><b>직전 토큰과 회전 시각을 비운다</b>({@link RefreshToken#renew}) — 새 세션이므로 옛 세션의
 	 * 토큰이 유예로 새 세션을 얻지 못한다 (sp-docs/requirements/member.md §6.3).
@@ -292,7 +362,13 @@ public class AuthService {
 	 * <p>{@code expires_at} 은 Refresh Token 만료(14일)다 (sp-docs/security.md §1). 시간대는
 	 * 실행 환경이 정한다 (sp-docs/adr/0011).
 	 */
-	private void storeRefreshToken(Long accountId, String refreshToken) {
+	private void storeRefreshToken(Account verified, String refreshToken) {
+		Long accountId = verified.getId();
+		this.accountRepository.findByIdForUpdate(accountId)
+				.filter(Account::isActive)
+				.filter(current -> current.getPassword().equals(verified.getPassword()))
+				.orElseThrow(AuthService::loginFailed);
+
 		LocalDateTime expiresAt = refreshTokenExpiresAt();
 
 		this.refreshTokenRepository.findByAccountId(accountId).ifPresentOrElse(
@@ -315,9 +391,14 @@ public class AuthService {
 		return LocalDateTime.now().plus(this.jwtTokenProvider.getRefreshTokenValidity());
 	}
 
-	/** 세 실패 경로가 같은 예외를 쓴다. 분기마다 만들면 언젠가 메시지가 갈린다. */
+	/** {@code AU003} 으로 끝나는 로그인의 경로가 이 예외를 함께 쓴다. 분기마다 만들면 언젠가 메시지가 갈린다. */
 	private static BusinessException loginFailed() {
 		return new BusinessException(ErrorCode.LOGIN_FAILED);
+	}
+
+	/** 잠긴 경로가 같은 예외를 쓴다 — 3) 에서 본 잠금과 4) 의 세기가 알린 잠금이 응답에서 갈리지 않는다. */
+	private static BusinessException loginLocked() {
+		return new BusinessException(ErrorCode.LOGIN_LOCKED);
 	}
 
 	/** 재발급의 거부 경로가 모두 같은 예외를 쓴다. 사유를 구분해 내보내지 않는다. */
