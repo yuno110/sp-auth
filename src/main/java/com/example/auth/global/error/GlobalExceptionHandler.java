@@ -2,9 +2,11 @@ package com.example.auth.global.error;
 
 import com.example.auth.global.common.ApiResponse;
 import com.example.auth.global.common.ErrorResponse;
+import com.example.auth.global.ratelimit.RateLimitExceededException;
 import java.util.List;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
@@ -197,6 +199,22 @@ public class GlobalExceptionHandler {
 	public ResponseEntity<ApiResponse<Void>> handleMissingServletRequestPart(MissingServletRequestPartException e) {
 		log.warn("missing request part: {}", e.getRequestPartName());
 		return toResponse(ErrorCode.INVALID_INPUT_VALUE);
+	}
+
+	/**
+	 * 요청 수 제한을 넘었다. <b>429 {@code C009} 와 {@code Retry-After}(창이 끝날 때까지 남은 초)이고 {@code fieldErrors}
+	 * 는 빈 배열이다</b> (sp-docs/security.md §10, sp-docs/api-contract.md §8.1 의 {@code C009} 문단). 헤더가 하나 더 붙어
+	 * {@link BusinessException} 의 일반 경로로 보내지 않는다 (sp-docs/conventions.md §6.1). 로그는 다른 클라이언트 오류와
+	 * 같은 {@code warn} 이고, 센 키(주소·이메일)는 남기지 않는다.
+	 */
+	@ExceptionHandler(RateLimitExceededException.class)
+	public ResponseEntity<ApiResponse<Void>> handleRateLimitExceeded(RateLimitExceededException e) {
+		log.warn("rate limit exceeded: {}", e.getRule().key());
+		ErrorCode errorCode = ErrorCode.TOO_MANY_REQUESTS;
+		ErrorResponse error = new ErrorResponse(errorCode.getCode(), errorCode.getMessage(), List.of());
+		return ResponseEntity.status(errorCode.getStatus())
+				.header(HttpHeaders.RETRY_AFTER, Long.toString(e.getRetryAfterSeconds()))
+				.body(ApiResponse.failure(error));
 	}
 
 	/** 마지막 그물. 여기까지 온 것은 예상하지 못한 예외이므로 서버 로그에만 원인을 남긴다. */

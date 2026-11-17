@@ -45,6 +45,20 @@ mail:
 cors:
   allowed-origins: http://localhost:3000
 
+# 요청 수 제한의 한도를 크게 덮는다 (sp-docs/security.md §10). @SpringBootTest 는 캐시된 컨텍스트의 제한기 하나를
+# 여러 테스트가 나눠 쓰고 MockMvc 의 요청 주소가 하나라, 운영 한도로는 제한과 무관한 테스트가 429 를 맞는다.
+# 창·버킷 수는 application.yml 의 값을 그대로 쓴다. 정본 값은 RateLimitConfigTest 가 application.yml 에서 읽어 보고,
+# 제한의 동작은 한도를 작게 다시 덮은 테스트가 본다 (RateLimitControllerTest)
+rate-limit:
+  rules:
+    check-email:          { limit: 100000 }
+    signup:               { limit: 100000 }
+    password-reset-ip:    { limit: 100000 }
+    password-reset-email: { limit: 100000 }
+    verification-ip:      { limit: 100000 }
+    verification-email:   { limit: 100000 }
+    login:                { limit: 100000 }
+
 # jwt.private-key-location 은 여기에 두지 않는다. 개인키를 저장소에 넣지 않기 위해
 # 테스트가 실행 시점에 임시 키 페어를 만들어 경로를 주입한다
 # (com.example.auth.support.TestRsaKeys)

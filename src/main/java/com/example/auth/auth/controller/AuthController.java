@@ -35,8 +35,9 @@ public class AuthController {
 	/**
 	 * 로그인. 200 과 {@code TokenResponse} (sp-docs/api-contract.md §2.1 §9.2).
 	 *
-	 * <p>{@code @Valid} 를 붙이지 않는다 — 이유는 {@link LoginRequest} 에 있다. 실패는 모두
-	 * 401 {@code AU003} 이며 {@code GlobalExceptionHandler} 가 공통 형식으로 변환한다.
+	 * <p>{@code @Valid} 를 붙이지 않는다 — 이유는 {@link LoginRequest} 에 있다. 실패의 응답은
+	 * sp-docs/api-contract.md §2.1 의 「로그인의 응답」 표가 정하고 {@code GlobalExceptionHandler} 가 공통 형식으로
+	 * 변환한다. 그 IP 의 요청이 한도를 넘은 429 {@code C009} 는 {@code RateLimitInterceptor} 가 이 메서드 앞에서 던진다.
 	 */
 	@PostMapping("/login")
 	public ApiResponse<TokenResponse> login(@RequestBody LoginRequest request) {

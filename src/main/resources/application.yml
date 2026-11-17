@@ -39,6 +39,10 @@ spring:
 
 server:
   port: 8083
+  # 요청 수 제한의 IP 키는 remoteAddr 다. X-Forwarded-For·X-Real-IP 로 바꾸지 않는다 — 클라이언트가 임의로 쓰는
+  # 헤더라 믿으면 요청마다 주소를 바꿔 제한을 비켜 간다 (sp-docs/security.md §10, sp-docs/tech-stack.md §4.6).
+  # 게이트웨이를 들이면 sp-docs/adr/0015 를 다시 본다
+  forward-headers-strategy: none
 
 # health 만 노출한다. 그 밖의 actuator 경로는 노출 자체를 막는다
 # (sp-docs/security.md §5.1.1). 인가 쪽 차단은 SecurityConfig 가 한다
@@ -86,3 +90,20 @@ mail:
   frontend-base-url: ${FRONTEND_BASE_URL}
   executor:
     queue-capacity: 100
+
+# 요청 수 제한 (sp-docs/security.md §10, sp-docs/tech-stack.md §4.6). 대상·키·한도는 security.md §10 의 표에서 auth 의
+# 줄이다. 한도·창·버킷 수는 정본이 숫자를 정한 정본 값이라 환경에서 받지 않는다. 빠졌거나 양수가 아니면 기동이 실패한다
+# (com.example.auth.global.ratelimit.RateLimiter). 창은 시계의 분·시 경계에 맞춘다.
+# 로컬 템플릿(application-local.yml.example)은 한도를 크게 덮는다
+#   buckets-per-rule  규칙마다 둘 카운터 배열의 크기. 버킷은 기동마다 새로 만든 비밀의 HMAC 으로 고른다 — 그 비밀은
+#                     설정이 아니다
+rate-limit:
+  buckets-per-rule: 16384
+  rules:
+    check-email:          { limit: 20, window: PT1M }
+    signup:               { limit: 10, window: PT1H }
+    password-reset-ip:    { limit: 5,  window: PT1H }
+    password-reset-email: { limit: 3,  window: PT1H }
+    verification-ip:      { limit: 5,  window: PT1H }
+    verification-email:   { limit: 3,  window: PT1H }
+    login:                { limit: 30, window: PT1M }

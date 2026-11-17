@@ -108,6 +108,22 @@ cp src/main/resources/application-local.yml.example src/main/resources/applicati
 
 메일 설정(`spring.mail.*`, `mail.*`)은 템플릿의 Mailpit 값을 그대로 쓴다. **이미 `application-local.yml`이 있으면 템플릿에서 그 줄을 옮긴다** — 메일 설정이 없으면 기동 가드에 걸려 `local`로 뜨지 않는다 (`sp-docs/tech-stack.md` §4.7).
 
+요청 수 제한(`rate-limit.*`)은 템플릿이 한도를 크게 덮는다 (`sp-docs/tech-stack.md` §4.6). 실제 서비스 e2e는 `local`로 띄운 서비스를 한 주소에서 치며 가입·로그인을 여러 번 하므로, `application.yml`의 운영 한도로는 e2e가 스스로 429 `C009`를 맞는다. **이미 `application-local.yml`이 있으면 템플릿의 `rate-limit` 블록을 옮긴다** — 없어도 기동은 되지만 운영 한도로 뜬다. 창·버킷 수는 `application.yml`의 값을 그대로 쓴다. 옮길 줄은 이렇다.
+
+```yaml
+rate-limit:
+  rules:
+    check-email:          { limit: 100000 }
+    signup:               { limit: 100000 }
+    password-reset-ip:    { limit: 100000 }
+    password-reset-email: { limit: 100000 }
+    verification-ip:      { limit: 100000 }
+    verification-email:   { limit: 100000 }
+    login:                { limit: 100000 }
+```
+
+이 덮음 때문에 e2e는 제한을 검증하지 않는다. 제한은 서비스의 테스트가 시계를 움직여 본다.
+
 ### 5. Mailpit — 로컬의 SMTP
 
 로컬은 Mailpit으로 메일을 받는다 (`sp-docs/tech-stack.md` §4.7.1). **Docker 없이 실행 파일 하나다.** 버전은 **v1.33.1**로 고정한다 — 템플릿(`application-local.yml.example`)의 주석과 같다.

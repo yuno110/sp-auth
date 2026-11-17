@@ -11,12 +11,15 @@ import com.example.auth.account.dto.TokenConfirmRequest;
 import com.example.auth.account.dto.WithdrawRequest;
 import com.example.auth.account.service.AccountService;
 import com.example.auth.global.common.ApiResponse;
+import com.example.auth.global.ratelimit.RateLimitRule;
+import com.example.auth.global.ratelimit.RateLimiter;
 import com.example.auth.global.security.CurrentAccount;
 import com.example.auth.global.security.LoginAccount;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.Email;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Size;
+import java.util.Locale;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.HttpStatus;
 import org.springframework.web.bind.annotation.DeleteMapping;
@@ -32,11 +35,14 @@ import org.springframework.web.bind.annotation.RestController;
 /**
  * 계정 API. 정본: sp-docs/api-contract.md §2.2.
  *
- * <p>AU-05 가 만들고 AU-08·AU-09·AU-10 이 확장한다 (sp-docs/plan/phase1.md §2.3). 2차의 AU-16 이 인증 메일
- * 재발송·확인을, AU-17 이 비밀번호 재설정 요청·확인을 더했다 (sp-docs/plan/phase2-auth-member.md).
+ * <p>여러 작업 항목이 확장하는 공유 지점이다 — 이 파일을 고치는 항목은 계획의 표가 적는다(sp-docs/plan/phase1.md §2.3,
+ * sp-docs/plan/phase2-auth-member.md §1.2). 어느 항목이 무엇을 더했는지는 git 이력이 답한다.
  *
  * <p>경로별 인가는 AU-04 의 {@code SecurityConfig} 가 선반영했다 — {@code POST /api/v1/accounts}
  * 는 무인증이다 (sp-docs/security.md §5.1).
+ *
+ * <p>요청 수 제한의 IP 키는 여기서 세지 않는다 — {@code RateLimitInterceptor} 가 핸들러 앞에서 센다
+ * (sp-docs/security.md §10).
  */
 @RestController
 @RequiredArgsConstructor
@@ -44,6 +50,9 @@ import org.springframework.web.bind.annotation.RestController;
 public class AccountController {
 
 	private final AccountService accountService;
+
+	/** 재발송·재설정 요청의 이메일 키를 센다 (sp-docs/security.md §10). */
+	private final RateLimiter rateLimiter;
 
 	/**
 	 * 가입 1단계. 201 과 {@code {accountId, email}} (sp-docs/api-contract.md §9.1). 계정 INSERT 가 커밋된 뒤 인증 메일이
@@ -62,10 +71,15 @@ public class AccountController {
 	 * <p><b>202 가 계정의 상태를 말하지 않는다.</b> 계정이 없다·탈퇴했다·인증됐다·아니다 어느 경우든 같은 상태와
 	 * 본문이다 — 메일이 나가는지는 뒤의 발급 작업이 정한다. 202 가 아닌 응답은 sp-docs/api-contract.md §2.4 의 표가
 	 * 정한다 — {@code email} 의 형식 위반은 400 {@code C001} 이다 ({@link EmailRequest}).
+	 *
+	 * <p><b>이메일 키는 본문 검증 뒤·발급 작업 앞에서 센다</b> (sp-docs/security.md §10). 형식 위반은 이 메서드에 닿지 않아
+	 * 이메일 키로 세지 않는다. 한도를 넘으면 429 {@code C009} 이고 발급 작업을 넘기지 않는다. 키는 계정을 찾지 않고 요청의
+	 * 이메일만으로 정하므로 429 도 계정의 상태로 갈리지 않는다.
 	 */
 	@PostMapping("/email-verification")
 	@ResponseStatus(HttpStatus.ACCEPTED)
 	public ApiResponse<Void> resendVerification(@Valid @RequestBody EmailRequest request) {
+		this.rateLimiter.consume(RateLimitRule.VERIFICATION_EMAIL, emailKeyOf(request.email()));
 		this.accountService.resendVerification(request.email());
 		return ApiResponse.success(null);
 	}
@@ -91,11 +105,12 @@ public class AccountController {
 	 * <p>{@link #resendVerification} 과 같은 모양이다 — 202 가 계정의 상태를 말하지 않는다. 계정이 없다·탈퇴했다·인증됐다·
 	 * 아니다 어느 경우든 같은 상태와 본문이고, 메일이 나가는지는 뒤의 발급 작업이 정한다. {@code email} 의 형식 위반은
 	 * 400 {@code C001} 이다 ({@link EmailRequest}). 요청만으로는 세션·잠금·비밀번호가 바뀌지 않는다
-	 * (sp-docs/requirements/member.md §11.3).
+	 * (sp-docs/requirements/member.md §11.3). 이메일 키도 재발송과 같은 자리에서 센다 — 규칙만 다르다.
 	 */
 	@PostMapping("/password-reset")
 	@ResponseStatus(HttpStatus.ACCEPTED)
 	public ApiResponse<Void> requestPasswordReset(@Valid @RequestBody EmailRequest request) {
+		this.rateLimiter.consume(RateLimitRule.PASSWORD_RESET_EMAIL, emailKeyOf(request.email()));
 		this.accountService.requestPasswordReset(request.email());
 		return ApiResponse.success(null);
 	}
@@ -203,6 +218,15 @@ public class AccountController {
 			@Valid @RequestBody WithdrawRequest request) {
 
 		this.accountService.withdraw(loginAccount.accountId(), request);
+	}
+
+	/**
+	 * 요청 수 제한의 이메일 키 — 본문 검증을 지난 이메일을 {@link Locale#ROOT} 로 소문자로 바꾼 값이다
+	 * (sp-docs/security.md §10). 로그인 잠금의 키({@code LoginAttempt#emailKeyOf}, ASCII 만 바꾼다)와 다른 변환이다 — 섞어
+	 * 쓰지 않는다 (sp-docs/plan/phase2-auth-member.md AU-19).
+	 */
+	private static String emailKeyOf(String email) {
+		return email.toLowerCase(Locale.ROOT);
 	}
 
 }

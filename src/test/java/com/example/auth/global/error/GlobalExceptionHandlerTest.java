@@ -7,6 +7,7 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.multipart;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
@@ -15,22 +16,30 @@ import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
 import com.example.auth.global.common.ApiResponse;
+import com.example.auth.global.config.ClockConfig;
+import com.example.auth.global.ratelimit.RateLimitConfig;
+import com.example.auth.global.ratelimit.RateLimitExceededException;
+import com.example.auth.global.ratelimit.RateLimitRule;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.Email;
 import jakarta.validation.constraints.NotBlank;
 import java.util.List;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
 import org.springframework.context.annotation.Import;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -58,9 +67,13 @@ import org.springframework.web.multipart.MultipartFile;
  * {@code @WebMvcTest} 는 업무 컨트롤러를 <i>전부</i> 올리면서 그 의존(서비스)은 올리지 않으므로,
  * AU-05 이후 컨트롤러가 생길 때마다 이 컨텍스트가 기동에 실패한다. 검증 대상은 예외 변환이고
  * 업무 컨트롤러는 그 대상이 아니다.
+ *
+ * <p><b>요청 수 제한기를 만드는 설정을 함께 올린다</b> (AU-19). {@code WebConfig} 와 그것이 등록하는 인터셉터는 슬라이스에
+ * 들지만 그 인터셉터가 쓰는 제한기는 일반 {@code @Configuration} 이 만들어 슬라이스에 들지 않는다 (2026-11-17 AU-19 가
+ * spring-boot-test-autoconfigure 3.5.16 의 {@code WebMvcTypeExcludeFilter} 로 읽었다). 제한기는 시각을 앱 시계에서 읽는다.
  */
 @WebMvcTest(controllers = GlobalExceptionHandlerTest.ExceptionTestController.class)
-@Import(GlobalExceptionHandlerTest.ExceptionTestController.class)
+@Import({GlobalExceptionHandlerTest.ExceptionTestController.class, RateLimitConfig.class, ClockConfig.class})
 @AutoConfigureMockMvc(addFilters = false)
 @ActiveProfiles("test")
 class GlobalExceptionHandlerTest {
@@ -342,6 +355,52 @@ class GlobalExceptionHandlerTest {
 	}
 
 	/**
+	 * 요청 수 제한을 넘은 요청 — {@code RateLimitExceededException} (sp-docs/security.md §10, sp-docs/api-contract.md §8.1 의
+	 * {@code C009} 문단). 남은 초는 제한기가 정해 예외에 싣고 핸들러는 그 값을 {@code Retry-After} 로 옮긴다 — 그래서 두 값으로
+	 * 본다. 남은 초를 정하는 법은 {@code RateLimiterTest} 가 본다.
+	 */
+	@ParameterizedTest(name = "Retry-After {0}")
+	@ValueSource(longs = {37, 3600})
+	@DisplayName("요청 수 제한 초과는 429 C009 이고 Retry-After 가 예외의 초이며 fieldErrors 가 빈 배열이다")
+	void 요청_수_제한_초과는_C009(long seconds) throws Exception {
+		mockMvc.perform(get("/test/error/rate-limited/" + seconds))
+				.andExpect(status().isTooManyRequests())
+				.andExpect(header().string(HttpHeaders.RETRY_AFTER, Long.toString(seconds)))
+				.andExpect(jsonPath("$.success").value(false))
+				.andExpect(jsonPath("$.data").doesNotExist())
+				.andExpect(jsonPath("$.error.code").value("C009"))
+				.andExpect(jsonPath("$.error.message").value("요청이 너무 많습니다. 잠시 후 다시 시도해 주세요."))
+				.andExpect(jsonPath("$.error.fieldErrors", hasSize(0)));
+	}
+
+	/**
+	 * 요청 수 제한 초과는 클라이언트가 보낸 양의 문제라 {@code warn} 이다 (sp-docs/plan/phase2-auth-member.md AU-19 의 완료
+	 * 기준). 마지막 그물에 떨어지면 ERROR 다 — 그쪽은 {@code multipart_예외는_WARN_이고_마지막_그물은_ERROR_다} 가 단언한다.
+	 */
+	@Test
+	@DisplayName("요청 수 제한 초과는 WARN 로그 하나만 남긴다")
+	void 요청_수_제한_초과는_WARN_이다() throws Exception {
+		Logger handlerLogger = (Logger) LoggerFactory.getLogger(GlobalExceptionHandler.class);
+		ListAppender<ILoggingEvent> appender = new ListAppender<>();
+		appender.start();
+		Level original = handlerLogger.getLevel();
+		// 수집 결과가 주변 설정에 좌우되지 않게 수준을 이 테스트 안에서 정한다
+		handlerLogger.setLevel(Level.TRACE);
+		handlerLogger.addAppender(appender);
+		try {
+			mockMvc.perform(get("/test/error/rate-limited/37"));
+		} finally {
+			handlerLogger.detachAppender(appender);
+			handlerLogger.setLevel(original);
+			appender.stop();
+		}
+
+		assertThat(수집한_수준(appender))
+				.as("핸들러에 걸려야 한다. 비어 있으면 로그 수집이 안 된 것이다")
+				.containsExactly(Level.WARN);
+	}
+
+	/**
 	 * <b>상태 코드보다 로그가 더 문제다</b> (sp-docs/api-contract.md §8.1). 마지막 그물은
 	 * {@code log.error} 로 스택트레이스를 남기므로, 미디어 타입 예외가 거기로 떨어지면 흔한
 	 * 클라이언트 실수가 ERROR 경보를 만들고 원인이 서버에 있는 500 과 구별되지 않는다.
@@ -422,6 +481,11 @@ class GlobalExceptionHandlerTest {
 		@PostMapping("/multipart/part")
 		ApiResponse<Payload> multipartPart(@RequestPart("file") MultipartFile file) {
 			return ApiResponse.success(new Payload("ok"));
+		}
+
+		@GetMapping("/error/rate-limited/{seconds}")
+		void rateLimited(@PathVariable long seconds) {
+			throw new RateLimitExceededException(RateLimitRule.LOGIN, seconds);
 		}
 
 		record Payload(String value) { }

@@ -2,7 +2,7 @@
 #   cp application-local.yml.example application-local.yml
 # application-local.yml 은 .gitignore 에 있어 커밋되지 않는다.
 # 이미 application-local.yml 이 있으면 템플릿에 새로 생긴 줄을 옮긴다 — 메일 설정(spring.mail.*, mail.*)이
-# 없으면 기동 가드에 걸려 local 로 뜨지 않는다.
+# 없으면 기동 가드에 걸려 local 로 뜨지 않는다. 요청 수 제한의 덮음(rate-limit.*)이 없으면 운영 한도로 뜬다.
 
 spring:
   datasource:
@@ -48,6 +48,20 @@ cors:
 mail:
   from: no-reply@localhost
   frontend-base-url: http://localhost:3000
+
+# 요청 수 제한의 한도를 크게 덮는다 (sp-docs/tech-stack.md §4.6). 실제 서비스 e2e 는 local 로 띄운 서비스를 한 주소에서
+# 치며 가입·로그인을 여러 번 하므로, 운영 한도(application.yml)로는 e2e 가 스스로 429 를 맞는다.
+# 기준은 「운영 한도보다 e2e 의 요청 수가 넉넉히 들어가게」 다. 창·버킷 수는 application.yml 의 값을 그대로 쓴다.
+# 이 덮음 때문에 e2e 는 제한을 검증하지 않는다 — 제한은 서비스의 테스트가 시계를 움직여 본다
+rate-limit:
+  rules:
+    check-email:          { limit: 100000 }
+    signup:               { limit: 100000 }
+    password-reset-ip:    { limit: 100000 }
+    password-reset-email: { limit: 100000 }
+    verification-ip:      { limit: 100000 }
+    verification-email:   { limit: 100000 }
+    login:                { limit: 100000 }
 
 logging:
   level:
