@@ -589,13 +589,15 @@ class AccountServiceTest {
 	 * <caption>{@code changePassword} 변이별 실패 (실측)</caption>
 	 * <tr><th>변이</th><th>무엇이 깨지나</th><th>겨누는 테스트</th></tr>
 	 * <tr><td><b>A</b> — {@code @Transactional} 제거</td><td>트랜잭션이 아예 없다</td>
-	 * <td>정상 경로 테스트들. 파생 삭제가 활성 트랜잭션을 요구해 거기서 즉시 터진다</td></tr>
+	 * <td>정상 경로 테스트들과 비밀번호가 틀린 경우까지. 맨 앞의 잠금 읽기({@code getByIdForUpdate})가 진행 중인 트랜잭션을
+	 * 요구해 거기서 즉시 터진다 — 400 이 아니라 500 이다 (AU-22 뒤 실측, 2026-11-18. 그 전에는 파생 삭제에서 터졌다)</td></tr>
 	 * <tr><td><b>B</b> — {@code @Transactional(noRollbackFor = …)}</td>
 	 * <td>트랜잭션은 있고 원자성만 깨진다</td>
 	 * <td>{@link #둘_다_롤백된다()} <b>하나뿐</b></td></tr>
 	 * <tr><td><b>C</b> — 연산마다 자기 {@code @Transactional}</td>
 	 * <td><b>독립적으로 커밋되는 트랜잭션 둘</b></td>
-	 * <td>{@link #커밋이_정확히_한_번이다()} — 커밋 <b>3회</b>가 센다</td></tr>
+	 * <td>{@link #커밋이_정확히_한_번이다()} — 커밋 <b>3회</b>가 센다 (AU-08 때 잰 값, 2026-10-12. 이 모양은 AU-22 뒤로 다시
+	 * 재지 않았다 — AU-22 가 돌린 C 는 변경과 지우기를 두 트랜잭션으로 나눈 모양이고 커밋 2회로 잡혔다, 2026-11-18)</td></tr>
 	 * </table>
 	 *
 	 * <p><b>C 를 행위 단언으로 잡을 수는 없다</b>(§4.1). 정상 경로는 두 효과가 여전히 둘 다
@@ -759,13 +761,15 @@ class AccountServiceTest {
 	 * <caption>{@code withdraw} 변이별 실패 (실측)</caption>
 	 * <tr><th>변이</th><th>무엇이 깨지나</th><th>겨누는 테스트</th></tr>
 	 * <tr><td><b>A</b> — {@code @Transactional} 제거</td><td>트랜잭션이 아예 없다</td>
-	 * <td>정상 경로 테스트들. 파생 삭제가 활성 트랜잭션을 요구해 거기서 터진다</td></tr>
+	 * <td>정상 경로 테스트들과 비밀번호가 틀린 경우까지. 맨 앞의 잠금 읽기({@code getByIdForUpdate})가 진행 중인 트랜잭션을
+	 * 요구해 거기서 터진다 — 400 이 아니라 500 이다 (AU-22 뒤 실측, 2026-11-18. 그 전에는 파생 삭제에서 터졌다)</td></tr>
 	 * <tr><td><b>B</b> — {@code @Transactional(noRollbackFor = …)}</td>
 	 * <td>트랜잭션은 있고 원자성만 깨진다</td>
 	 * <td>{@link #둘_다_롤백된다()} <b>하나뿐</b></td></tr>
 	 * <tr><td><b>C</b> — 연산마다 자기 {@code @Transactional}</td>
 	 * <td><b>독립적으로 커밋되는 트랜잭션 둘</b></td>
-	 * <td>{@link #커밋이_정확히_한_번이다()} — 커밋 <b>3회</b>가 센다</td></tr>
+	 * <td>{@link #커밋이_정확히_한_번이다()} — 커밋 <b>3회</b>가 센다 (AU-09 때 잰 값, 2026-10-12. 이 모양은 AU-22 뒤로 다시
+	 * 재지 않았다 — AU-22 가 돌린 C 는 탈퇴와 지우기를 두 트랜잭션으로 나눈 모양이고 커밋 2회로 잡혔다, 2026-11-18)</td></tr>
 	 * </table>
 	 *
 	 * <p><b>이 셋이 잡힌다는 것은 아무것도 증명하지 않는다</b>(§4.1). 변이 테스트는 반증
@@ -1281,7 +1285,7 @@ class AccountServiceTest {
 		/**
 		 * 완료 기준 「중간 실패가 §11.4 의 변경을 모두 되돌린다. 변경마다 반증 가능한 단언이다」
 		 * (sp-docs/plan/phase2-auth-member.md AU-17, sp-docs/process/review-policy.md §4.1). 실패는 6 이 계정을 다시 읽는 자리에
-		 * 넣는다 — 1·3·4·5 가 실제로 돈 뒤다. 3·4 는 5 의 문장이 flush 했다. 그 자리는 확인 안의 두 번째
+		 * 넣는다 — 1·3·4·5 가 실제로 돈 뒤다. 3 은 4 의 문장이 flush 했다. 그 자리는 확인 안의 두 번째
 		 * {@code findByIdForUpdate} 호출이다. 계정을 그 메서드로 두 번 읽지 않는 구현에서는 실패가 들어가지 않아, 이 테스트는
 		 * 예외가 나지 않았다는 이유로 실패한다 — 롤백을 관측한 실패가 아니다(AU-17 실측).
 		 *

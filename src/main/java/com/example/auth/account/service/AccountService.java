@@ -213,6 +213,11 @@ public class AccountService {
 	 * 일부만 커밋되면 비밀번호는 바뀌었는데 옛 Refresh Token 이 살거나, 토큰은 쓰였는데 비밀번호가 그대로인 상태가 남는다
 	 * (§11.4).
 	 *
+	 * <p><b>잠금은 1 의 토큰 행 → 계정 → 4 의 {@code refresh_token} → 5 의 {@code login_attempt} 차례로 잡는다.</b> 계정은 2 의
+	 * 검사 전에 잠금 읽기로 읽는다. 계정을 잡은 뒤 {@code refresh_token} 을 잡는 것은 로그인의 저장({@code AuthService})과 같은
+	 * 순서이고, 그 저장은 이 트랜잭션이 계정을 잡은 동안 오면 이 트랜잭션이 끝나기를 기다렸다가 커밋된 값과 견준다
+	 * (sp-docs/plan/phase2-auth-member.md AU-22).
+	 *
 	 * <p>없음·만료·사용됨·목적 다름·탈퇴 계정을 가르지 않는다 — 모두 같은 {@code AU007} 이다 (§11.1). 토큰의 길이·문자가
 	 * 틀려도 형식 오류가 아니라 맞지 않는 토큰이다 (sp-docs/api-contract.md §2.4).
 	 *
@@ -250,15 +255,15 @@ public class AccountService {
 		// 3) 평문을 저장하지 않는다. 해싱은 서비스 계층의 몫이다
 		account.changePassword(this.passwordEncoder.encode(newPassword));
 
-		// 4) 같은 트랜잭션이다. 멱등이므로 저장된 행이 없어도 지울 것이 없을 뿐이다
+		// 4) 같은 트랜잭션이다. 멱등이므로 저장된 행이 없어도 지울 것이 없을 뿐이다. 이 문장은 3 을 flush 한 뒤 영속성
+		// 컨텍스트를 비운다 — 여기부터 account 는 준영속이다
 		this.refreshTokenRepository.deleteByAccountId(accountId);
 
 		// 5) 키는 계정에 저장된 이메일을 AU-12 의 키 변환으로 바꾼 값이다. 그 키의 행이 없으면 0행이고 실패가 아니다 —
-		// 잠기지 않은 것과 결과가 같다 (LoginAttemptRepository#reset). 이 문장은 3·4 를 flush 한 뒤 영속성 컨텍스트를
-		// 비운다 — 여기부터 account 는 준영속이다
+		// 잠기지 않은 것과 결과가 같다 (LoginAttemptRepository#reset)
 		this.loginAttemptRepository.reset(LoginAttempt.emailKeyOf(account.getEmail()), this.clock);
 
-		// 6) 5 가 비운 뒤라 다시 읽어서 바꾼다 — 준영속인 account 를 바꾸면 저장되지 않는다. 이 트랜잭션이 이미 그 행을
+		// 6) 4 가 비운 뒤라 다시 읽어서 바꾼다 — 준영속인 account 를 바꾸면 저장되지 않는다. 이 트랜잭션이 이미 그 행을
 		// 잠갔으므로 기다리지 않는다. 처음 인증한 시각이 남는다 — 이미 채워져 있으면 덮지 않는다 (Account#markEmailVerified)
 		this.accountRepository.findByIdForUpdate(accountId)
 				.orElseThrow(() -> new IllegalStateException("토큰이 가리키는 계정의 행이 없다"))
@@ -321,6 +326,12 @@ public class AccountService {
 	 * 비밀번호는 바뀌었는데 옛 Refresh Token 이 14일간 살아 있거나, 세션만 끊기고 비밀번호는
 	 * 그대로이거나.
 	 *
+	 * <p><b>계정을 잠금 읽기로 먼저 읽는다</b>({@link AccountReader#getByIdForUpdate}). 탈퇴 검사·비밀번호 비교·쓰기·
+	 * {@code refresh_token} 지우기가 그 잠금 아래에 있다 — 잠그지 않고 읽으면 이 읽기 뒤에 커밋된 탈퇴를 이 쓰기가 읽어 둔
+	 * {@code deleted = false} 로 덮는다. 잠금은 계정을 잡은 뒤 {@code refresh_token} 을 잡는다 — 로그인의
+	 * 저장({@code AuthService})과 같은 순서다. 그 저장은 같은 계정을 잠금 읽기로 다시 읽으므로, 이 트랜잭션이 계정을 잡은 동안
+	 * 오면 이 트랜잭션이 끝나기를 기다렸다가 커밋된 값과 견준다 (sp-docs/plan/phase2-auth-member.md AU-22).
+	 *
 	 * <p><b>Access Token 은 지울 수 없다.</b> 이미 발급된 것은 만료까지 보호 경로를 통과한다 —
 	 * "비밀번호를 바꿨으니 안전하다"는 최대 31분 뒤부터 참이다. 즉시 차단은 1차 범위 밖이고
 	 * 탈퇴·권한 회수와 같은 포기 목록에 있다 (sp-docs/security.md §5.3).
@@ -352,7 +363,8 @@ public class AccountService {
 	 */
 	@Transactional
 	public void changePassword(Long accountId, PasswordChangeRequest request) {
-		Account account = this.accountReader.getById(accountId);
+		// 잠금 읽기다 — 쓰기와 지우기가 탈퇴 검사·비교가 본 값 위에 놓인다. 이유는 AccountRepository#findByIdForUpdate 에 있다
+		Account account = this.accountReader.getByIdForUpdate(accountId);
 
 		// 탈퇴한 계정은 없는 계정과 같이 다룬다 (sp-docs/api-contract.md §2.2).
 		// 비밀번호 비교보다 먼저다 — 틀린 비밀번호로 와도 AU001 이어야 닫힌 행에
@@ -398,6 +410,12 @@ public class AccountService {
 	 * (sp-docs/requirements/member.md §3 규칙 4). 둘로 나누면 <b>{@code deleted = true} 가
 	 * 커밋되고 토큰이 살아남는</b> 상태가 가능해지고, 그러면 탈퇴한 계정이 14일간 토큰을 갱신한다.
 	 *
+	 * <p><b>계정을 잠금 읽기로 먼저 읽는다</b>({@link AccountReader#getByIdForUpdate}). 이미 탈퇴했는지의 검사·비밀번호 비교·
+	 * 쓰기·{@code refresh_token} 지우기가 그 잠금 아래에 있다 — 잠그지 않고 읽으면 이 읽기 뒤에 커밋된 비밀번호 변경을 이 쓰기가
+	 * 읽어 둔 해시로 덮는다. 잠금은 계정을 잡은 뒤 {@code refresh_token} 을 잡는다 — 로그인의 저장({@code AuthService})과 같은
+	 * 순서다. 그 저장은 같은 계정을 잠금 읽기로 다시 읽으므로, 이 트랜잭션이 계정을 잡은 동안 오면 이 트랜잭션이 끝나기를
+	 * 기다렸다가 커밋된 값과 견준다 (sp-docs/plan/phase2-auth-member.md AU-22).
+	 *
 	 * <p><b>행을 지우지 않는다.</b> {@code Account.withdraw()} 의 Soft Delete 다 — 행이 남고
 	 * {@code uk_account_email} 이 UNIQUE 이므로 탈퇴한 이메일은 재가입에 재사용되지 않는다
 	 * (§3 규칙 1).
@@ -422,7 +440,8 @@ public class AccountService {
 	 */
 	@Transactional
 	public void withdraw(Long accountId, WithdrawRequest request) {
-		Account account = this.accountReader.getById(accountId);
+		// 잠금 읽기다 — 쓰기와 지우기가 탈퇴 검사·비교가 본 값 위에 놓인다. 이유는 AccountRepository#findByIdForUpdate 에 있다
+		Account account = this.accountReader.getByIdForUpdate(accountId);
 
 		// 멱등이다 — 이미 탈퇴한 계정은 비밀번호를 검증하지 않고 아무것도 바꾸지 않는다
 		// (sp-docs/api-contract.md §2.2). 검사가 비교보다 먼저이므로 비밀번호가 틀려도

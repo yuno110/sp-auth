@@ -92,10 +92,20 @@ public interface RefreshTokenRepository extends JpaRepository<RefreshToken, Long
 	int deleteSession(@Param("accountId") Long accountId, @Param("refreshToken") String refreshToken);
 
 	/**
-	 * 그 계정의 행을 대조 없이 지운다. <b>그 계정의 모든 세션을 끝내는 동작이 쓴다</b> — 예: 비밀번호 변경·계정 탈퇴
-	 * (sp-docs/api-contract.md §2.2), 비밀번호 재설정 확인(sp-docs/requirements/member.md §11.4). 로그아웃은 쓰지 않는다 —
+	 * 그 계정의 행을 대조 없이 지운다. <b>그 계정의 모든 세션을 끝내는 동작이 쓴다.</b> 로그아웃은 쓰지 않는다 —
 	 * {@link #deleteSession}.
+	 *
+	 * <p><b>계정을 조건으로 거는 DELETE 하나다.</b> 지울 때 있는 그 계정의 행이 대상이다. 행을 먼저 읽고 읽은 행을 id 로 지우면
+	 * 읽은 뒤에 커밋된 행 — 예: 그 사이에 저장을 끝낸 로그인의 세션 — 이 남는다 (sp-docs/plan/phase2-auth-member.md AU-22).
+	 *
+	 * <p><b>이 문장은 영속성 컨텍스트를 flush 하고 비운다.</b> 같은 트랜잭션이 앞서 바꾼 엔터티(예: 계정의 비밀번호·
+	 * {@code deleted})는 이 DELETE 보다 먼저 나간다 — flush 없이 비우면 그 변경이 저장되지 않는다(AU-22 실측). 앞서 읽은
+	 * 엔터티는 준영속이 되어 그 뒤의 변경이 저장되지 않는다 — 이 문장 뒤에 엔터티를 바꾸려면 다시 읽는다.
+	 *
+	 * @return 지운 행 수. 0 이면 지울 행이 없었다 — 실패가 아니다
 	 */
-	void deleteByAccountId(Long accountId);
+	@Modifying(flushAutomatically = true, clearAutomatically = true)
+	@Query("delete from RefreshToken r where r.accountId = :accountId")
+	int deleteByAccountId(@Param("accountId") Long accountId);
 
 }

@@ -29,4 +29,13 @@ public class AccountReader {
 				.orElseThrow(() -> new BusinessException(ErrorCode.ACCOUNT_NOT_FOUND));
 	}
 
+	/**
+	 * {@link #getById} 를 잠금 읽기로 한다({@link AccountRepository#findByIdForUpdate}). 트랜잭션 안에서만 부른다 — 잠금은
+	 * 그 트랜잭션이 끝날 때 풀린다.
+	 */
+	public Account getByIdForUpdate(Long id) {
+		return accountRepository.findByIdForUpdate(id)
+				.orElseThrow(() -> new BusinessException(ErrorCode.ACCOUNT_NOT_FOUND));
+	}
+
 }
