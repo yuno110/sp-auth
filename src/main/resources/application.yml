@@ -91,6 +91,11 @@ mail:
   executor:
     queue-capacity: 100
 
+# 만료된 account_token·오래된 login_attempt 의 정리 주기 (sp-docs/tech-stack.md §4.7, sp-docs/domain-model.md §2.4·§2.5).
+# 편의값이다 — 판정에 영향이 없고, 정리가 늦은 만큼 행이 더 머문다. 첫 실행도 기동 뒤 이만큼 늦춘다 (AccountCleanup)
+account-cleanup:
+  interval: PT1H
+
 # 요청 수 제한 (sp-docs/security.md §10, sp-docs/tech-stack.md §4.6). 대상·키·한도는 security.md §10 의 표에서 auth 의
 # 줄이다. 한도·창·버킷 수는 정본이 숫자를 정한 정본 값이라 환경에서 받지 않는다. 빠졌거나 양수가 아니면 기동이 실패한다
 # (com.example.auth.global.ratelimit.RateLimiter). 창은 시계의 분·시 경계에 맞춘다.

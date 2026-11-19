@@ -282,6 +282,35 @@ class LoginAttemptRepositoryTest {
 		행이_이렇다(other, 5, null, earlier);
 	}
 
+	/**
+	 * AU-21 검증표 「24시간 안·밖의 잠금 행 → 밖만 지워진다」·「지금 잠겨 있는 행 → 남는다」 의 문장 쪽
+	 * (sp-docs/domain-model.md §2.5). 인자는 리터럴로 준다 — 24시간을 고르는 것은 정리 작업의 일이고 그 값은
+	 * {@code AccountCleanupTest} 가 본다. 경계({@code updated_at = cutoff})의 행은 「이른」 행이 아니라 남는다.
+	 */
+	@Test
+	@DisplayName("오래된 행 지우기 — updated_at 이 cutoff 보다 이른 행만 지우고 경계·안쪽·지금 잠긴 행은 남긴다")
+	void 오래된_행만_지운다() {
+		LocalDateTime cutoff = NOW.minusHours(24);
+		String outside = LoginAttempt.emailKeyOf("au21-outside@example.com");
+		String boundary = LoginAttempt.emailKeyOf("au21-boundary@example.com");
+		String inside = LoginAttempt.emailKeyOf("au21-inside@example.com");
+		String locked = LoginAttempt.emailKeyOf("au21-locked@example.com");
+		행을_심는다(outside, 3, null, cutoff.minusSeconds(1));
+		행을_심는다(boundary, 3, null, cutoff);
+		행을_심는다(inside, 3, null, cutoff.plusSeconds(1));
+		// 지금 잠겨 있는 행 — 잠그는 문장이 updated_at 을 잠근 시각으로 쓰므로 그 값은 지금에서 15분 안이다
+		행을_심는다(locked, 0, NOW.plusMinutes(10), NOW.minusMinutes(5));
+
+		// 지운 행 수는 보지 않는다 — 공유 H2 에 다른 클래스가 남긴 오래된 행이 함께 지워질 수 있다
+		this.loginAttemptRepository.deleteUpdatedBefore(cutoff);
+		this.em.clear();
+
+		assertThat(this.loginAttemptRepository.findByEmailKey(outside)).as("24시간 밖").isEmpty();
+		행이_이렇다(boundary, 3, null, cutoff);
+		행이_이렇다(inside, 3, null, cutoff.plusSeconds(1));
+		행이_이렇다(locked, 0, NOW.plusMinutes(10), NOW.minusMinutes(5));
+	}
+
 	/** 행 하나를 값 그대로 SQL 로 넣는다 — 실패를 세는 경로를 거치지 않고 이 테스트가 행의 상태를 정한다. */
 	private void 행을_심는다(String key, int failedCount, LocalDateTime lockedUntil, LocalDateTime updatedAt) {
 		this.em.getEntityManager()

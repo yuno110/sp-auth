@@ -81,4 +81,21 @@ public interface AccountTokenRepository extends JpaRepository<AccountToken, Long
 	int deleteByAccountIdAndPurpose(@Param("accountId") Long accountId,
 			@Param("purpose") TokenPurpose purpose);
 
+	/**
+	 * 만료된 행을 지운다 — 정리 작업의 문장이다 (sp-docs/domain-model.md §2.4). 만료는 사용 처리({@link #consumeAt})의
+	 * {@code expires_at > now} 가 아닌 것, 곧 {@code expires_at <= now} 다. 지우는 행은 사용 처리가 이미 0행으로 보는
+	 * 행뿐이므로 지운 행과 남은 만료 행의 확인 결과가 같다({@code AU007}). 쓰였는지는 보지 않는다 — 쓰였어도 만료 전이면
+	 * 남긴다.
+	 *
+	 * <p>{@code now} 는 앱 시계의 값을 초로 자른 것이다. 트랜잭션 안에서 부른다.
+	 *
+	 * @return 지운 행 수
+	 */
+	@Modifying(flushAutomatically = true, clearAutomatically = true)
+	@Query("""
+			delete from AccountToken t
+			 where t.expiresAt <= :now
+			""")
+	int deleteExpiredAt(@Param("now") LocalDateTime now);
+
 }

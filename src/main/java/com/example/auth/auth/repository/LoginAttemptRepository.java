@@ -105,4 +105,22 @@ public interface LoginAttemptRepository extends JpaRepository<LoginAttempt, Long
 	int lockIfReached(@Param("emailKey") String emailKey, @Param("threshold") int threshold,
 			@Param("now") LocalDateTime now, @Param("lockedUntil") LocalDateTime lockedUntil);
 
+	/**
+	 * 마지막으로 바뀐 시각이 {@code cutoff} 보다 이른 행을 지운다 — 정리 작업의 문장이다 (sp-docs/domain-model.md §2.5).
+	 *
+	 * <p>{@code cutoff} 는 판정 시각에서 24시간 전이다. 그보다 이른 행은 {@link #incrementFailure} 의 {@code CASE} 가
+	 * 1부터 다시 세는 행({@code updated_at <= windowStart})이고, 잠금(15분)도 이미 풀렸다 — 지운 행과 결과가 같다. 경계에
+	 * 놓인 행({@code updated_at = cutoff})은 남긴다. 그 행도 1부터 다시 세지만 「이른」 행이 아니다.
+	 *
+	 * <p>트랜잭션 안에서 부른다.
+	 *
+	 * @return 지운 행 수
+	 */
+	@Modifying(flushAutomatically = true, clearAutomatically = true)
+	@Query("""
+			delete from LoginAttempt a
+			 where a.updatedAt < :cutoff
+			""")
+	int deleteUpdatedBefore(@Param("cutoff") LocalDateTime cutoff);
+
 }

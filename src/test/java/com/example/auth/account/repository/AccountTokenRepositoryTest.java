@@ -168,6 +168,37 @@ class AccountTokenRepositoryTest {
 	}
 
 	/**
+	 * AU-21 검증표 「만료 전·만료 뒤의 토큰 → 뒤만 지워진다」 의 문장 쪽 (sp-docs/domain-model.md §2.4). 경계는 사용 처리와
+	 * 맞물린다 — 만료 시각과 같은 순간은 이미 만료다({@link #사용_처리_만료()}). 그래서 만료 시각이 꼭 지금인 행도 지우고,
+	 * 1초 남은 행은 남긴다. 쓰였어도 만료 전이면 남긴다.
+	 */
+	@Test
+	@DisplayName("만료 행 지우기 — expires_at 이 지금 이하인 행만 지우고 1초 남은 행·쓰인 만료 전 행은 남긴다")
+	void 만료된_행만_지운다() {
+		Long accountId = 계정("cleanup-expiry@example.com");
+		this.clock.set(ISSUED_AT.minusSeconds(1));
+		String expiredBefore = 발급(accountId, TokenPurpose.EMAIL_VERIFICATION);
+		this.clock.set(ISSUED_AT);
+		String expiresNow = 발급(accountId, TokenPurpose.EMAIL_VERIFICATION);
+		this.clock.set(ISSUED_AT.plusSeconds(1));
+		String oneSecondLeft = 발급(accountId, TokenPurpose.EMAIL_VERIFICATION);
+		String usedButLive = 발급(accountId, TokenPurpose.PASSWORD_RESET);
+		assertThat(this.accountTokenRepository.consume(usedButLive, TokenPurpose.PASSWORD_RESET, this.clock))
+				.as("픽스처 — 쓰인 토큰")
+				.isEqualTo(1);
+		LocalDateTime now = ISSUED_AT.plus(VERIFICATION_LIFETIME);
+
+		// 지운 행 수는 보지 않는다 — H2 는 테스트 클래스 사이에 공유되어(sp-docs/tech-stack.md §5.3) 다른 클래스가 남긴
+		// 만료 행이 함께 지워질 수 있다. 이 테스트의 행만 본다
+		this.accountTokenRepository.deleteExpiredAt(now);
+
+		assertThat(this.accountTokenRepository.findByTokenHash(expiredBefore)).as("1초 전에 만료").isEmpty();
+		assertThat(this.accountTokenRepository.findByTokenHash(expiresNow)).as("꼭 지금 만료").isEmpty();
+		assertThat(this.accountTokenRepository.findByTokenHash(oneSecondLeft)).as("1초 남음").isPresent();
+		assertThat(this.accountTokenRepository.findByTokenHash(usedButLive)).as("쓰였지만 만료 전").isPresent();
+	}
+
+	/**
 	 * 길이 제약이 의미를 갖는 컬럼은 실제 최대 길이로 본다 (sp-docs/conventions.md §9.2). 해시는
 	 * 정본의 생성 규칙으로 만들고, 목적은 열거 값 중 이름이 가장 긴 것을 고른다 — 열거 값이 늘어도
 	 * 이 테스트가 따라간다.

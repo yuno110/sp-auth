@@ -42,8 +42,12 @@ public class LoginAttemptService {
 	/** 잠금의 길이 (sp-docs/requirements/member.md §12.1). */
 	private static final Duration LOCK_DURATION = Duration.ofMinutes(15);
 
-	/** 마지막 실패에서 이만큼 지난 실패는 1부터 다시 센다 (sp-docs/requirements/member.md §12.2). */
-	private static final Duration FAILURE_WINDOW = Duration.ofHours(24);
+	/**
+	 * 마지막 실패에서 이만큼 지난 실패는 1부터 다시 센다 (sp-docs/requirements/member.md §12.2). 오래된 행의 정리
+	 * ({@code AccountCleanup})가 같은 창을 쓴다 — 이 창보다 이른 행만 지워 지운 행과 남은 행의 다음 실패가 같게 한다
+	 * (sp-docs/domain-model.md §2.5).
+	 */
+	public static final Duration FAILURE_WINDOW = Duration.ofHours(24);
 
 	private static final Logger log = LoggerFactory.getLogger(LoginAttemptService.class);
 

@@ -59,6 +59,13 @@ rate-limit:
     verification-email:   { limit: 100000 }
     login:                { limit: 100000 }
 
+# 정리 작업(AccountCleanup)이 테스트 도중에 스스로 돌지 않게 주기를 하루로 늘린다. 첫 실행도 기동 뒤 이 주기만큼 늦으므로
+# 테스트 실행 동안 스케줄러가 부르지 않는다 — 스스로 돌면 다른 스레드에서 테스트가 바꿔 끼운 시계를 읽어 그 테스트의 행을
+# 지울 수 있다. 정리는 테스트가 직접 부르고, 주기의 등록은 AccountCleanupTest 가 다른 값으로 덮어 본다.
+# 운영 값(PT1H)은 application.yml 에 있다
+account-cleanup:
+  interval: P1D
+
 # jwt.private-key-location 은 여기에 두지 않는다. 개인키를 저장소에 넣지 않기 위해
 # 테스트가 실행 시점에 임시 키 페어를 만들어 경로를 주입한다
 # (com.example.auth.support.TestRsaKeys)
