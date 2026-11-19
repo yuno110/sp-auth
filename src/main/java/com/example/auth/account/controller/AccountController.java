@@ -3,20 +3,26 @@ package com.example.auth.account.controller;
 import com.example.auth.account.dto.AccountCreateRequest;
 import com.example.auth.account.dto.AccountMeResponse;
 import com.example.auth.account.dto.AccountResponse;
+import com.example.auth.account.dto.AccountSearchCondition;
+import com.example.auth.account.dto.AccountSortType;
+import com.example.auth.account.dto.AccountSummaryResponse;
 import com.example.auth.account.dto.CheckResponse;
 import com.example.auth.account.dto.EmailRequest;
 import com.example.auth.account.dto.PasswordChangeRequest;
 import com.example.auth.account.dto.PasswordResetConfirmRequest;
 import com.example.auth.account.dto.TokenConfirmRequest;
 import com.example.auth.account.dto.WithdrawRequest;
+import com.example.auth.account.entity.Role;
 import com.example.auth.account.service.AccountService;
 import com.example.auth.global.common.ApiResponse;
+import com.example.auth.global.common.PageResponse;
 import com.example.auth.global.ratelimit.RateLimitRule;
 import com.example.auth.global.ratelimit.RateLimiter;
 import com.example.auth.global.security.CurrentAccount;
 import com.example.auth.global.security.LoginAccount;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.Email;
+import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Size;
 import java.util.Locale;
@@ -127,6 +133,31 @@ public class AccountController {
 	@ResponseStatus(HttpStatus.NO_CONTENT)
 	public void confirmPasswordReset(@Valid @RequestBody PasswordResetConfirmRequest request) {
 		this.accountService.confirmPasswordReset(request.token(), request.newPassword());
+	}
+
+	/**
+	 * MR-13 — 계정 목록 (ADMIN). 200 과 §7.1 의 페이징 모양 (sp-docs/api-contract.md §2.5 §9.12).
+	 *
+	 * <p><b>인증이 필요하다</b> — 경로 인가는 AU-04 의 {@code SecurityConfig} 가 {@code GET /api/v1/accounts} 로 선반영했고 토큰
+	 * 없는 접근은 401 {@code A001} 이다. ADMIN 판정은 Service 가 한다(아니면 403 {@code A004}).
+	 *
+	 * <p>{@code page} 음수·{@code size} 1 미만·{@code email} {@value AccountSearchCondition#EMAIL_MAX_LENGTH}자 초과는 여기의
+	 * 파라미터 제약이 400 {@code C001}·{@code fieldErrors} 1건으로 거른다 — 담을 파라미터 이름을 아는 자리이고,
+	 * {@code PageRequest.of} 보다 앞이다. {@code sort}·{@code role}·{@code deleted} 의 틀린 값은 바인딩 실패라 400
+	 * {@code C002} 다. 이 검증은 ADMIN 판정보다 먼저 돈다 — 정본이 그 순서를 받아들인다(§2.5).
+	 */
+	@GetMapping
+	public ApiResponse<PageResponse<AccountSummaryResponse>> getList(
+			@CurrentAccount LoginAccount loginAccount,
+			@RequestParam(required = false) @Min(AccountSearchCondition.MIN_PAGE) Integer page,
+			@RequestParam(required = false) @Min(AccountSearchCondition.MIN_SIZE) Integer size,
+			@RequestParam(required = false) AccountSortType sort,
+			@RequestParam(required = false) @Size(max = AccountSearchCondition.EMAIL_MAX_LENGTH) String email,
+			@RequestParam(required = false) Role role,
+			@RequestParam(required = false) Boolean deleted) {
+
+		return ApiResponse.success(this.accountService.getList(
+				loginAccount, AccountSearchCondition.of(page, size, sort, email, role, deleted)));
 	}
 
 	/**

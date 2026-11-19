@@ -24,6 +24,7 @@ import com.example.auth.account.entity.Account;
 import com.example.auth.account.entity.AccountToken;
 import com.example.auth.account.entity.Role;
 import com.example.auth.account.entity.TokenPurpose;
+import com.example.auth.account.repository.AccountQueryRepository;
 import com.example.auth.account.repository.AccountRepository;
 import com.example.auth.account.repository.AccountTokenRepository;
 import com.example.auth.account.support.AccountReader;
@@ -32,6 +33,7 @@ import com.example.auth.auth.entity.LoginAttempt;
 import com.example.auth.auth.entity.RefreshToken;
 import com.example.auth.auth.repository.LoginAttemptRepository;
 import com.example.auth.auth.repository.RefreshTokenRepository;
+import com.example.auth.auth.service.LoginAttemptService;
 import com.example.auth.global.error.BusinessException;
 import com.example.auth.global.error.ErrorCode;
 import com.example.auth.global.config.MailExecutorConfig;
@@ -135,6 +137,14 @@ class AccountServiceTest {
 	/** AU-17 — 스텁 생성자에 넘긴다. 재설정 확인이 잠금을 푸는 곳이다. */
 	@Autowired
 	private LoginAttemptRepository loginAttemptRepository;
+
+	/** AU-20 — 스텁 생성자에 넘긴다. create 경로는 쓰지 않는다. */
+	@Autowired
+	private AccountQueryRepository accountQueryRepository;
+
+	/** AU-20 — 스텁 생성자에 넘긴다. create 경로는 쓰지 않는다. */
+	@Autowired
+	private LoginAttemptService loginAttemptService;
 
 	/** AU-16 — 앱 시계. 이 클래스는 바꿔 끼우지 않는다(시스템 시계). 토큰 픽스처의 발급 시각을 정한다. */
 	@Autowired
@@ -278,7 +288,8 @@ class AccountServiceTest {
 		// 나머지 협력자는 실제 빈이다. create 경로가 쓰지 않으므로 스텁할 것이 없다
 		AccountService service = new AccountService(
 				stub, this.passwordEncoder, this.accountReader, this.refreshTokenRepository,
-				this.accountTokenIssuer, this.accountTokenRepository, this.loginAttemptRepository, this.clock);
+				this.accountTokenIssuer, this.accountTokenRepository, this.loginAttemptRepository, this.clock,
+				this.accountQueryRepository, this.loginAttemptService, this.transactionManager);
 
 		assertThatThrownBy(() ->
 				service.create(new AccountCreateRequest("race@example.com", RAW_PASSWORD)))

@@ -3,12 +3,16 @@ package com.example.auth.account.service;
 import com.example.auth.account.dto.AccountCreateRequest;
 import com.example.auth.account.dto.AccountMeResponse;
 import com.example.auth.account.dto.AccountResponse;
+import com.example.auth.account.dto.AccountSearchCondition;
+import com.example.auth.account.dto.AccountSummaryResponse;
 import com.example.auth.account.dto.CheckResponse;
 import com.example.auth.account.dto.PasswordChangeRequest;
 import com.example.auth.account.dto.WithdrawRequest;
 import com.example.auth.account.entity.Account;
 import com.example.auth.account.entity.AccountToken;
+import com.example.auth.account.entity.Role;
 import com.example.auth.account.entity.TokenPurpose;
+import com.example.auth.account.repository.AccountQueryRepository;
 import com.example.auth.account.repository.AccountRepository;
 import com.example.auth.account.repository.AccountTokenRepository;
 import com.example.auth.account.support.AccountReader;
@@ -16,14 +20,20 @@ import com.example.auth.account.support.AccountTokens;
 import com.example.auth.auth.entity.LoginAttempt;
 import com.example.auth.auth.repository.LoginAttemptRepository;
 import com.example.auth.auth.repository.RefreshTokenRepository;
+import com.example.auth.auth.service.LoginAttemptService;
+import com.example.auth.global.common.PageResponse;
 import com.example.auth.global.error.BusinessException;
 import com.example.auth.global.error.ErrorCode;
+import com.example.auth.global.security.LoginAccount;
 import java.time.Clock;
 import lombok.RequiredArgsConstructor;
 import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.data.domain.Page;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 
 /**
  * 계정 유스케이스. 정본: sp-docs/requirements/member.md §1 §2 §4,
@@ -74,6 +84,18 @@ public class AccountService {
 
 	/** 앱 시계. 판정과 기록의 시각이 이 시계에서 나온다 — DB 의 {@code NOW()} 를 쓰지 않는다 (§11.1). */
 	private final Clock clock;
+
+	/** 계정 목록의 조건·정렬·페이징 (AU-20, sp-docs/api-contract.md §2.5). */
+	private final AccountQueryRepository accountQueryRepository;
+
+	/**
+	 * 계정 목록의 {@code locked} — 로그인이 쓰는 잠금 판정 그대로다 (AU-20). 키는 AU-12 의 변환, 시각은 주입한 {@code Clock} 이고
+	 * 둘 다 그 빈이 갖는다.
+	 */
+	private final LoginAttemptService loginAttemptService;
+
+	/** 계정 목록의 읽기 전용 트랜잭션 (AU-20) — {@code getList} 가 목록과 개수만 그 안에서 읽는다. */
+	private final PlatformTransactionManager transactionManager;
 
 	/**
 	 * 가입 1단계 — 계정 생성 (sp-docs/requirements/member.md §4).
@@ -467,6 +489,38 @@ public class AccountService {
 	/** 링크 토큰의 실패가 모두 같은 예외를 쓴다. 사유를 구분해 내보내지 않는다 (sp-docs/requirements/member.md §11.1). */
 	private static BusinessException invalidLinkToken() {
 		return new BusinessException(ErrorCode.INVALID_LINK_TOKEN);
+	}
+
+	/**
+	 * MR-13 — 계정 목록 (ADMIN). sp-docs/api-contract.md §2.5, sp-docs/requirements/member.md §13.
+	 *
+	 * <p><b>ADMIN 판정은 여기서 Claim 의 {@code role} 값으로 한다</b> — {@code ADMIN} 과 같을 때만 허용하고 아니면 403
+	 * {@code A004} 다 (sp-docs/security.md §5.1). {@code GrantedAuthority}·{@code hasRole} 로 판정하지 않는다. 「USER 이면
+	 * 거부」 로 적지 않는다 — 모르는 값이 허용 분기로 가면 안 된다 (sp-docs/tech-stack.md §2.1). 판정이 조회보다 먼저다.
+	 *
+	 * <p><b>{@code locked} 는 원소마다 {@link LoginAttemptService#isLocked} 로 읽는다.</b> 로그인과 같은 판정(키 변환·시계·
+	 * 시각 비교)을 한 곳에 두기 위해서다. 한 번의 {@code IN} 으로 읽어 자바에서 키를 맞추면, 키 컬럼의 콜레이션이 같다고 보는 다른
+	 * 표기(ASCII 밖의 대소문자)를 놓친다 (sp-docs/domain-model.md §2.5) — 원소별 조회는 그 비교를 DB 가 한다. 한 페이지는
+	 * 많아야 {@value AccountSearchCondition#MAX_SIZE} 건이다.
+	 *
+	 * <p><b>목록과 개수만 읽기 전용 트랜잭션 하나로 읽고, {@code locked} 는 그 트랜잭션이 끝난 뒤에 읽는다.</b> 조회는
+	 * {@code readOnly} 트랜잭션이다 (sp-docs/conventions.md §5) — 목록과 개수가 한 스냅샷이다. {@code isLocked} 는 읽기마다
+	 * 자기 트랜잭션을 연다 — 바깥 트랜잭션 안에서 부르면 한 요청이 커넥션을 둘 잡으므로 그 밖에서 부른다. 같은 빈 안의 호출이라
+	 * 애노테이션이 먹지 않아 {@link TransactionTemplate} 으로 연다. 그래서 {@code locked} 는 목록보다 조금 뒤의 시점이다 —
+	 * 관리 화면의 표시라 받아들인다 (sp-docs/requirements/member.md §13).
+	 *
+	 * @param loginAccount 검증된 Access Token 의 주체
+	 */
+	public PageResponse<AccountSummaryResponse> getList(LoginAccount loginAccount, AccountSearchCondition condition) {
+		if (loginAccount.role() != Role.ADMIN) {
+			throw new BusinessException(ErrorCode.ACCESS_DENIED);
+		}
+		TransactionTemplate readOnly = new TransactionTemplate(this.transactionManager);
+		readOnly.setReadOnly(true);
+		Page<Account> accounts = readOnly.execute(status -> this.accountQueryRepository.search(condition));
+		return PageResponse.of(accounts
+				.map(account -> AccountSummaryResponse.of(
+						account, this.loginAttemptService.isLocked(account.getEmail()))));
 	}
 
 }
