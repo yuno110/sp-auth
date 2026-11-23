@@ -528,7 +528,7 @@ class AuthServiceTest {
 		assertThat(로그인에_실패한다(email, WRONG_PASSWORD).getErrorCode()).isEqualTo(ErrorCode.LOGIN_FAILED);
 
 		assertThat(카운터(email))
-				.as("1부터 센다. 증가 문장은 locked_until 을 바꾸지 않아 지난 잠금 시각이 남는다")
+				.as("1부터 센다. 세는 문장은 잠그지 않는 실패에서 locked_until 을 바꾸지 않아 지난 잠금 시각이 남는다")
 				.isEqualTo(new Counter(1, after, after));
 	}
 

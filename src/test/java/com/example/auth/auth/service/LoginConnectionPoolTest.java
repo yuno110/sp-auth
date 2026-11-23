@@ -53,8 +53,8 @@ import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilde
  * 줄인다 — 결함이 되돌아오면 기본 대기만큼 기다리지 않고 실패한다.
  *
  * <p>두 요청은 실제 스레드에서 HTTP 로 보낸다. 둘 다 BCrypt 비교를 마친 자리에서 서로를 기다렸다가 함께 잠금 판정·세기로
- * 들어간다. 둘이 모인 순간에 풀이 빌려 준 연결 수를 잰다. 세는 행은 미리 심는다 — 두 세기가 같은 행의 UPDATE 가 되어 UNIQUE
- * 충돌의 다시 하기와 섞이지 않는다.
+ * 들어간다. 둘이 모인 순간에 풀이 빌려 준 연결 수를 잰다. 세는 행은 미리 심는다 — 두 세기가 모두 있는 행을 갱신하는 같은 모양이
+ * 되어, 새 키를 넣는 쪽과 갱신하는 쪽이 섞이지 않는다.
  */
 @SpringBootTest
 @AutoConfigureMockMvc

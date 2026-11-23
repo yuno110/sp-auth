@@ -76,6 +76,7 @@ import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMock
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.dao.CannotAcquireLockException;
 import org.springframework.dao.DataAccessResourceFailureException;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.dao.PessimisticLockingFailureException;
 import org.springframework.http.MediaType;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -97,8 +98,9 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 /**
  * 로그인 잠금 카운터 빈({@link LoginAttemptService})을 로그인 경로 안에서 본다. sp-docs/plan/phase2-auth-member.md AU-18 의
- * 완료 기준 중 트랜잭션 경계(커밋 분리·최신 커밋 읽기), 세기의 문장과 시각, 다시 하기와 WARN, 세지 않는 경로가 내는
- * 문장이고, 검증 표 중 대역이 필요한 행이다. 정본은 sp-docs/requirements/member.md §12.2 와 sp-docs/domain-model.md §2.5
+ * 완료 기준 중 트랜잭션 경계(커밋 분리·최신 커밋 읽기), 세기의 문장과 시각, 락 경합의 WARN, 세지 않는 경로가 내는
+ * 문장이고, 검증 표 중 대역이 필요한 행이다. AU-23 이 세기를 한 문장 upsert 와 같은 트랜잭션의 행 읽기로 바꾸고 다시 하는
+ * 자리를 걷었다 — 그 검증표의 세기·트랜잭션·제약 위반 줄도 여기서 본다. 정본은 sp-docs/requirements/member.md §12.2 와 sp-docs/domain-model.md §2.5
  * 다. 응답과 카운터 값의 행은 {@link AuthServiceTest} 가 본다.
  *
  * <p>로그인의 저장 트랜잭션도 여기서 본다 — 검증 뒤에 커밋된 비밀번호 변경·재설정·탈퇴를 저장이 보고 세지 않는 것, 그
@@ -112,10 +114,10 @@ import org.springframework.transaction.support.TransactionTemplate;
  *
  * <p><b>다른 연결의 커밋</b>은 트랜잭션이 묶이지 않은 다른 스레드의 {@link JdbcTemplate} 으로 한다 — 곧바로 커밋된다.
  * 끼어드는 자리마다 그 문장이 바꾼 행 수를 본다 — 대역이 아무것도 바꾸지 않으면 그 테스트는 아무것도 보지 않는다.
- * H2 에서는 세기의 트랜잭션이 0행 UPDATE 를 낸 뒤에도 다른 연결의 같은 키 INSERT 가 기다리지 않고 커밋된다(AU-18
- * 실측). MySQL 의 반복 읽기에서는 없는 행을 찾는 그 UPDATE 가 간격 락을 잡을 수 있고 같은 키의 동시 첫 실패가 교착할 수
- * 있다(sp-docs/domain-model.md §2.5 — 교착은 추정이고 실 MySQL 측정 대상이다). 이 클래스의 끼어들기는 간격 락이 없는
- * 격리 수준(예: READ COMMITTED)의 모양이다(정본 §2.5).
+ *
+ * <p><b>동시 첫 실패의 교착은 여기서 보지 않는다</b>(AU-23 완료 기준 (c)). H2 는 InnoDB 의 간격 락을 재현하지 않는다 —
+ * AU-18 의 앞 판 순서도 H2 에서는 녹색인 채 실 MySQL 에서 교착했다(sp-docs/domain-model.md §2.5 의 블록인용). 그 회귀는
+ * 앱으로 실 MySQL 에서 잰다(sp-docs I-13).
  */
 @SpringBootTest
 @AutoConfigureMockMvc
@@ -302,9 +304,7 @@ class LoginAttemptServiceTest {
 	 * 카운터 빈은 부른 쪽에 트랜잭션이 있어도 판정·세기·0 으로 하기를 저마다 새 트랜잭션에서 커밋한다({@link LoginAttemptService}).
 	 * 로그인은 바깥 트랜잭션을 열지 않으므로 로그인 경로로는 이 경계가 드러나지 않는다 — 그래서 카운터 빈을 예외로 되돌려질
 	 * 트랜잭션 안에서 직접 부른다. 부른 쪽이 되돌려져도 센 것과 0 으로 한 것이 남고, 판정의 읽기는 부른 쪽 트랜잭션의 연결이
-	 * 아니라 읽기 전용 새 트랜잭션의 연결에서 돈다.
-	 *
-	 * <p>세는 키에는 행을 심어 둔다 — 세기가 조건부 UPDATE 로 끝나 그 키의 행을 읽는 것은 판정뿐이다.
+	 * 아니라 읽기 전용 새 트랜잭션의 연결에서 돈다. 세기의 행 읽기도 부른 쪽이 아니라 세기의 트랜잭션에서 돈다.
 	 */
 	@Test
 	@DisplayName("부른 쪽 트랜잭션 안에서 불려도 판정·세기·0 으로 하기는 저마다 새 트랜잭션으로 커밋되고, 부른 쪽이 되돌려져도 남는다")
@@ -313,12 +313,12 @@ class LoginAttemptServiceTest {
 		String reset = "au18-caller-reset@example.com";
 		카운터를_심는다(counted, new Counter(1, null, LOCK_NOW.minusMinutes(1)));
 		카운터를_심는다(reset, new Counter(3, null, LOCK_NOW.minusMinutes(1)));
-		List<Object> 판정의_연결 = new ArrayList<>();
-		List<Boolean> 판정의_읽기_전용 = new ArrayList<>();
+		List<Object> 읽기의_연결 = new ArrayList<>();
+		List<Boolean> 읽기의_읽기_전용 = new ArrayList<>();
 		Answer<?> attempts = 실제_빈에_위임한다(this.spyLoginAttemptRepository);
 		willAnswer(invocation -> {
-			판정의_연결.add(묶인_연결());
-			판정의_읽기_전용.add(TransactionSynchronizationManager.isCurrentTransactionReadOnly());
+			읽기의_연결.add(묶인_연결());
+			읽기의_읽기_전용.add(TransactionSynchronizationManager.isCurrentTransactionReadOnly());
 			return attempts.answer(invocation);
 		}).given(this.spyLoginAttemptRepository).findByEmailKey(anyString());
 		TransactionTemplate caller = new TransactionTemplate(this.spyTransactionManager);
@@ -339,9 +339,9 @@ class LoginAttemptServiceTest {
 		assertThat(카운터(counted)).as("세기").isEqualTo(new Counter(2, null, LOCK_NOW));
 		assertThat(카운터(reset)).as("0 으로 하기").isEqualTo(new Counter(0, null, LOCK_NOW));
 		assertThat(부른_쪽의_연결).hasSize(1).doesNotContainNull();
-		assertThat(판정의_연결).hasSize(1).doesNotContainNull();
-		assertThat(판정의_연결.get(0)).as("부른 쪽 트랜잭션의 연결이 아니다").isNotSameAs(부른_쪽의_연결.get(0));
-		assertThat(판정의_읽기_전용).containsExactly(true);
+		assertThat(읽기의_연결).as("판정의 읽기, 세기의 행 읽기").hasSize(2).doesNotContainNull();
+		assertThat(읽기의_연결).as("부른 쪽 트랜잭션의 연결이 아니다").doesNotContain(부른_쪽의_연결.get(0));
+		assertThat(읽기의_읽기_전용).as("판정은 읽기 전용, 세기의 행 읽기는 세기의 트랜잭션").containsExactly(true, false);
 	}
 
 	// --- 잠금 판정은 최신 커밋 값을 읽는다 (sp-docs/requirements/member.md §12.2) ---
@@ -419,144 +419,75 @@ class LoginAttemptServiceTest {
 	// --- 세기의 동시성 자리 (sp-docs/domain-model.md §2.5 의 갱신 문장) ---
 
 	/**
-	 * 검증 표 「판정(member.md §12.1 의 3)과 증가 사이에 잠금이 커밋된다(대역)」. 판정은 잠기지 않은 행을 봤고, 증가 직전에
-	 * 같은 키의 다른 시도가 다섯째 실패로 잠갔다 — 증가는 0행이고 다시 읽은 행이 잠겨 있다. 응답은 {@code AU005}, 이번
-	 * 실패는 세지 않고 잠금을 늘리지 않는다.
+	 * AU-23 검증표 「판정과 세기 사이에 다른 연결이 잠금을 커밋한다(대역) — 잠긴 행에 세는 문장이 닿는다」 와 「같은 판정
+	 * 시각에 막 잠긴 행」. 판정은 잠기지 않은 행을 봤고, 세는 문장 직전에 같은 키의 다른 시도가 다섯째 실패로 잠갔다. 세는
+	 * 문장은 잠긴 행을 바꾸지 않고, 같은 트랜잭션의 행 읽기가 잠김을 본다 — 응답은 {@code AU005}, 이번 실패는 세지 않고 잠금을
+	 * 늘리지 않는다. 다시 하지 않는다.
+	 *
+	 * <p>끼어든 잠금은 잠그는 문장이 만든 모양이다({@code failed_count} 0, {@code updated_at = locked_until - 15m}). 앞선 초에
+	 * 잠긴 행은 {@code updated_at} 이 판정 시각이 아니라 잠긴 행에 {@code :now} 를 쓰면 드러난다.
 	 */
-	@Test
-	@DisplayName("판정과 증가 사이에 다른 연결이 잠금을 커밋하면 401 AU005 이고 카운터·locked_until 이 그대로다")
-	void 판정과_증가_사이의_잠금() {
-		String email = "au18-lock-before-increment@example.com";
+	@ParameterizedTest(name = "{0}")
+	@ValueSource(strings = {"앞선 초에 잠긴 행", "같은 판정 시각에 막 잠긴 행"})
+	@DisplayName("판정과 세기 사이에 다른 연결이 잠금을 커밋하면 401 AU005 이고 행의 모든 컬럼이 그대로다 — 다시 하지 않는다")
+	void 판정과_세기_사이의_잠금(String 모양) {
+		String email = "au23-lock-before-count@example.com";
 		계정을_만든다(email);
 		카운터를_심는다(email, new Counter(4, null, LOCK_NOW.minusMinutes(1)));
-		Counter 끼어든_잠금 = new Counter(0, LOCK_NOW.plusMinutes(15), LOCK_NOW);
+		LocalDateTime lockedAt = "같은 판정 시각에 막 잠긴 행".equals(모양) ? LOCK_NOW : LOCK_NOW.minusSeconds(1);
+		Counter 끼어든_잠금 = new Counter(0, lockedAt.plusMinutes(15), lockedAt);
 		Answer<?> attempts = 실제_빈에_위임한다(this.spyLoginAttemptRepository);
-		AtomicInteger increments = new AtomicInteger();
+		AtomicInteger counts = new AtomicInteger();
 		willAnswer(invocation -> {
-			if (increments.incrementAndGet() == 1) {
+			if (counts.incrementAndGet() == 1) {
 				assertThat(다른_연결에서_커밋한다(
 						"update login_attempt set locked_until = ?, failed_count = 0, updated_at = ? where email_key = ?",
 						끼어든_잠금.lockedUntil(), 끼어든_잠금.updatedAt(), LoginAttempt.emailKeyOf(email)))
 						.as("끼어든 잠금").isOne();
 			}
 			return attempts.answer(invocation);
-		}).given(this.spyLoginAttemptRepository).incrementFailure(anyString(), any(), any());
+		}).given(this.spyLoginAttemptRepository).countFailure(anyString(), any(), any(), anyInt(), any());
+		List<End> ends = 트랜잭션의_끝을_센다();
 
 		assertThat(로그인에_실패한다(email, WRONG_PASSWORD)).isEqualTo(ErrorCode.LOGIN_LOCKED);
 
-		assertThat(increments).as("다시 하지 않는다").hasValue(1);
+		assertThat(counts).as("다시 하지 않는다").hasValue(1);
+		assertThat(ends).containsExactly(판정의_커밋, 쓰기의_커밋);
 		assertThat(카운터(email)).isEqualTo(끼어든_잠금);
 		assertThat(경고들()).isEmpty();
 	}
 
 	/**
-	 * 검증 표 「증가 UPDATE 가 0행이고 잠기지 않은 행이 있다(대역 — domain-model §2.5 의 갱신 문장)」. 행이 없어 증가가
-	 * 0행인 직후 같은 키의 동시 첫 실패가 INSERT 를 커밋한다 — 다시 읽은 행은 잠기지 않았다. 그 행을 잠금으로 읽으면 거짓
-	 * 잠금이 나고 이번 실패가 사라진다. 새 트랜잭션에서 처음부터 한 번 더 해 끼어든 실패에 이어 센다.
+	 * AU-23 검증표 「세는 문장이 제약 위반을 낸다(대역)」. 세는 문장은 그 키의 UNIQUE 충돌을 갱신으로 바꾸므로 제약 위반은 락
+	 * 경합이 아닌 DB 실패다(sp-docs/domain-model.md §2.5 의 「다시 하는 자리가 없다」). 다시 하지 않고 {@code AU003} 으로
+	 * 삼키지도 않는다 — 마지막 그물이 500 {@code C005} 로 낸다(sp-docs/conventions.md §6.1). AU-18 검증표의 다시 하는 자리
+	 * 두 줄(0행인데 잠기지 않은 행, UNIQUE 충돌)은 그 경로가 없어져 이 줄로 바뀌었다.
 	 */
 	@Test
-	@DisplayName("증가가 0행인데 잠기지 않은 행이 있으면 새 트랜잭션에서 한 번 더 센다 — 끼어든 실패에 이어 2 다")
-	void 영행인데_잠기지_않은_행이면_다시_센다() {
-		String email = "au18-retry-unlocked-row@example.com";
+	@DisplayName("세는 문장이 제약 위반을 내면 다시 하지 않고 500 C005 이며 카운터가 그대로다 — WARN 이 없다")
+	void 세는_문장의_제약_위반은_다시_하지_않고_500_이다() throws Exception {
+		String email = "au23-count-constraint-violation@example.com";
 		계정을_만든다(email);
-		Answer<?> attempts = 실제_빈에_위임한다(this.spyLoginAttemptRepository);
-		List<Object> 증가의_트랜잭션 = new ArrayList<>();
-		willAnswer(invocation -> {
-			증가의_트랜잭션.add(TransactionSynchronizationManager.getResource(this.dataSource));
-			Object updated = attempts.answer(invocation);
-			if (증가의_트랜잭션.size() == 1) {
-				assertThat(updated).as("픽스처 — 행이 없어 0행").isEqualTo(0);
-				assertThat(다른_연결에서_커밋한다(INSERT_COUNTER, LoginAttempt.emailKeyOf(email), 1, null, LOCK_NOW))
-						.as("끼어든 첫 실패").isOne();
-			}
-			return updated;
-		}).given(this.spyLoginAttemptRepository).incrementFailure(anyString(), any(), any());
+		Counter 쌓인_카운터 = new Counter(2, null, LOCK_NOW.minusMinutes(1));
+		카운터를_심는다(email, 쌓인_카운터);
+		willThrow(new DataIntegrityViolationException("픽스처 — 세는 문장의 제약 위반"))
+				.given(this.spyLoginAttemptRepository).countFailure(anyString(), any(), any(), anyInt(), any());
 		List<End> ends = 트랜잭션의_끝을_센다();
 
-		assertThat(로그인에_실패한다(email, WRONG_PASSWORD)).isEqualTo(ErrorCode.LOGIN_FAILED);
+		로그인_요청(email, WRONG_PASSWORD)
+				.andExpect(status().isInternalServerError())
+				.andExpect(jsonPath("$.error.code").value("C005"));
 
-		assertThat(카운터(email)).isEqualTo(new Counter(2, null, LOCK_NOW));
-		assertThat(증가의_트랜잭션).hasSize(2).doesNotContainNull();
-		assertThat(증가의_트랜잭션.get(1)).as("다시 하기는 다른 트랜잭션이다").isNotSameAs(증가의_트랜잭션.get(0));
-		assertThat(ends).containsExactly(판정의_커밋, 쓰기의_커밋, 쓰기의_커밋);
+		verify(this.spyLoginAttemptRepository, times(1)).countFailure(anyString(), any(), any(), anyInt(), any());
+		assertThat(ends).containsExactly(판정의_커밋, 쓰기의_롤백);
+		assertThat(카운터(email)).isEqualTo(쌓인_카운터);
 		assertThat(경고들()).isEmpty();
 	}
 
 	/**
-	 * 검증 표 「다시 하기 — UNIQUE 충돌을 만든다(예: 대역)」 의 기대 「한 번 더 한다」. 이 트랜잭션이 행이 없음을 본 뒤 INSERT
-	 * 직전에 같은 키의 동시 첫 실패가 INSERT 를 커밋한다 — 이 INSERT 는 {@code uk_login_attempt_email_key} 에 걸리고 그
-	 * 트랜잭션은 되돌려진다. 새 트랜잭션에서 한 번 더 해 끼어든 실패에 이어 센다.
-	 */
-	@Test
-	@DisplayName("INSERT 가 UNIQUE 에 걸리면 그 트랜잭션은 되돌려지고 새 트랜잭션에서 한 번 더 센다 — WARN 이 없다")
-	void UNIQUE_충돌이면_다시_센다() {
-		String email = "au18-retry-unique@example.com";
-		계정을_만든다(email);
-		Answer<?> attempts = 실제_빈에_위임한다(this.spyLoginAttemptRepository);
-		AtomicInteger inserts = new AtomicInteger();
-		willAnswer(invocation -> {
-			inserts.incrementAndGet();
-			assertThat(다른_연결에서_커밋한다(INSERT_COUNTER, LoginAttempt.emailKeyOf(email), 1, null, LOCK_NOW))
-					.as("먼저 커밋된 첫 실패").isOne();
-			return attempts.answer(invocation);
-		}).given(this.spyLoginAttemptRepository).saveAndFlush(any(LoginAttempt.class));
-		List<End> ends = 트랜잭션의_끝을_센다();
-
-		assertThat(로그인에_실패한다(email, WRONG_PASSWORD)).isEqualTo(ErrorCode.LOGIN_FAILED);
-
-		assertThat(inserts).as("다시 하기의 증가는 1행이라 INSERT 하지 않는다").hasValue(1);
-		assertThat(카운터(email)).isEqualTo(new Counter(2, null, LOCK_NOW));
-		assertThat(ends).containsExactly(판정의_커밋, 쓰기의_롤백, 쓰기의_커밋);
-		assertThat(경고들()).isEmpty();
-	}
-
-	/**
-	 * 검증 표 「다시 하기 — UNIQUE 충돌을 만든다(예: 대역)」 의 기대 「또 실패하면 {@code AU003} 과 WARN 한 줄」 — 응답은
-	 * {@code AU003} 그대로이고 세지 못한 실패를 WARN 한 줄로 남긴다 (sp-docs/domain-model.md §2.5). 두 번 다 UNIQUE 에
-	 * 걸리게 만든다 — INSERT 직전마다 다른 연결이 그 키를 먼저 넣고, 다시 하기의 증가 직전에는 다른 연결이 그 행을 지운다.
-	 * 지우기는 이 상태를 만들려는 대역이다.
-	 */
-	@Test
-	@DisplayName("다시 해도 UNIQUE 에 걸리면 401 AU003 이고 세지 못한 실패를 WARN 한 줄로 남긴다 — 이메일·키가 없다")
-	void 다시_해도_UNIQUE_면_WARN_한_줄이다() {
-		String email = "au18-retry-unique-twice@example.com";
-		String key = LoginAttempt.emailKeyOf(email);
-		계정을_만든다(email);
-		Answer<?> attempts = 실제_빈에_위임한다(this.spyLoginAttemptRepository);
-		AtomicInteger increments = new AtomicInteger();
-		willAnswer(invocation -> {
-			if (increments.incrementAndGet() == 2) {
-				assertThat(다른_연결에서_커밋한다("delete from login_attempt where email_key = ?", key))
-						.as("지운 행").isOne();
-			}
-			return attempts.answer(invocation);
-		}).given(this.spyLoginAttemptRepository).incrementFailure(anyString(), any(), any());
-		AtomicInteger inserts = new AtomicInteger();
-		willAnswer(invocation -> {
-			inserts.incrementAndGet();
-			assertThat(다른_연결에서_커밋한다(INSERT_COUNTER, key, 1, null, LOCK_NOW)).as("먼저 커밋된 첫 실패").isOne();
-			return attempts.answer(invocation);
-		}).given(this.spyLoginAttemptRepository).saveAndFlush(any(LoginAttempt.class));
-		List<End> ends = 트랜잭션의_끝을_센다();
-
-		assertThat(로그인에_실패한다(email, WRONG_PASSWORD)).isEqualTo(ErrorCode.LOGIN_FAILED);
-
-		assertThat(increments).as("한 번만 다시 한다").hasValue(2);
-		assertThat(inserts).hasValue(2);
-		assertThat(ends).containsExactly(판정의_커밋, 쓰기의_롤백, 쓰기의_롤백);
-		assertThat(카운터(email)).as("다른 연결이 넣은 행뿐이다 — 이번 실패는 세지 못했다")
-				.isEqualTo(new Counter(1, null, LOCK_NOW));
-		ILoggingEvent warning = 경고_한_줄();
-		assertThat(warning.getFormattedMessage()).contains("login failure not counted").doesNotContain(email, key);
-		assertThat(warning.getThrowableProxy()).as("예외를 붙이면 메시지와 스택이 함께 남는다").isNull();
-	}
-
-	/**
-	 * 세기가 락 경합으로 실패하면(예: 교착) 다시 하지 않고, 응답은 {@code AU003} 이며 세지 못한 실패를 WARN 한 줄로 남긴다.
-	 * 정본(sp-docs/domain-model.md §2.5)이 다시 하는 자리로 꼽은 것은 「다시 하는 자리(UNIQUE 충돌, 잠기지 않은 행)는 새
-	 * 트랜잭션이다」 의 괄호 안이고, 교착은 「한 번 더 해도 실패하면(예: 교착) 로그인 응답은 {@code AU003} 그대로이고 세지 못한
-	 * 실패를 WARN 으로 남긴다」 에 있다. WARN 줄에는 예외의 클래스만 있다 — 예외의 메시지에는 키가 실릴 수 있다. 대역의 예외는
-	 * 메시지에 키를 싣는다.
+	 * 세기가 락 경합으로 실패하면(예: 교착) 다시 하지 않고, 응답은 {@code AU003} 이며 세지 못한 실패를 WARN 한 줄로 남긴다 —
+	 * 정본(sp-docs/domain-model.md §2.5)의 「락 경합은 다시 하지 않는다」. AU-23 의 검증표가 이 줄을 AU-18 그대로 둔다. WARN
+	 * 줄에는 예외의 클래스만 있다 — 예외의 메시지에는 키가 실릴 수 있다. 대역의 예외는 메시지에 키를 싣는다.
 	 *
 	 * <p>MySQL 의 교착(1213)과 잠금 대기 시간 초과(1205)는 다른 스프링 예외로 온다 — 2026-11-17 AU-18 리뷰가 애플리케이션의
 	 * jar 로 확인했다(애플리케이션의 {@code HibernateJpaDialect} 가 Hibernate {@code MySQLDialect} 의 변환을 쓴다). 1213 은
@@ -576,12 +507,13 @@ class LoginAttemptServiceTest {
 		Counter 쌓인_카운터 = new Counter(2, null, LOCK_NOW.minusMinutes(1));
 		카운터를_심는다(email, 쌓인_카운터);
 		PessimisticLockingFailureException 락_경합 = 락_경합(mysqlErrorCode, key);
-		willThrow(락_경합).given(this.spyLoginAttemptRepository).incrementFailure(anyString(), any(), any());
+		willThrow(락_경합).given(this.spyLoginAttemptRepository)
+				.countFailure(anyString(), any(), any(), anyInt(), any());
 		List<End> ends = 트랜잭션의_끝을_센다();
 
 		assertThat(로그인에_실패한다(email, WRONG_PASSWORD)).isEqualTo(ErrorCode.LOGIN_FAILED);
 
-		verify(this.spyLoginAttemptRepository, times(1)).incrementFailure(anyString(), any(), any());
+		verify(this.spyLoginAttemptRepository, times(1)).countFailure(anyString(), any(), any(), anyInt(), any());
 		assertThat(ends).containsExactly(판정의_커밋, 쓰기의_롤백);
 		assertThat(카운터(email)).isEqualTo(쌓인_카운터);
 		ILoggingEvent warning = 경고_한_줄();
@@ -630,13 +562,13 @@ class LoginAttemptServiceTest {
 		Counter 쌓인_카운터 = new Counter(2, null, LOCK_NOW.minusMinutes(1));
 		카운터를_심는다(email, 쌓인_카운터);
 		willThrow(new DataAccessResourceFailureException("픽스처 — 세기의 문장이 실패했다"))
-				.given(this.spyLoginAttemptRepository).incrementFailure(anyString(), any(), any());
+				.given(this.spyLoginAttemptRepository).countFailure(anyString(), any(), any(), anyInt(), any());
 
 		로그인_요청(email, WRONG_PASSWORD)
 				.andExpect(status().isInternalServerError())
 				.andExpect(jsonPath("$.error.code").value("C005"));
 
-		verify(this.spyLoginAttemptRepository, times(1)).incrementFailure(anyString(), any(), any());
+		verify(this.spyLoginAttemptRepository, times(1)).countFailure(anyString(), any(), any(), anyInt(), any());
 		assertThat(카운터(email)).isEqualTo(쌓인_카운터);
 		assertThat(경고들()).isEmpty();
 	}
@@ -685,32 +617,34 @@ class LoginAttemptServiceTest {
 	// --- 세기의 문장과 시각 (sp-docs/domain-model.md §2.5 「실패를 센다」) ---
 
 	/**
-	 * 완료 기준 「증가가 잡은 행 락 아래·같은 트랜잭션의 5회 판정, 읽고 비교한 뒤 쓰지 않는다」. 다섯째 실패가
-	 * {@code login_attempt} 에 내는 문장은 판정의 읽기, 조건부 증가, 조건부 잠금 차례다 — 세기는 그 행을 읽지 않고 두
-	 * 조건부 UPDATE 로 끝난다. 증가와 잠금은 한 트랜잭션이고 그 트랜잭션 하나가 커밋된다.
+	 * AU-23 검증표 「세기가 낸 {@code login_attempt} 문장」 과 완료 기준 (b). 다섯째 실패가 {@code login_attempt} 에 내는
+	 * 문장은 판정의 읽기, 한 문장 upsert({@code INSERT … ON DUPLICATE KEY UPDATE}), 그 키의 행 읽기 차례다 — 0행 UPDATE 와
+	 * 따로 낸 INSERT 가 없다. upsert 와 행 읽기는 한 트랜잭션이고 그 트랜잭션 하나가 커밋된다. 판정은 그 행 읽기로 한다 —
+	 * 응답이 {@code AU005} 다. 고치기 전 코드(조건부 증가 → 조건부 잠금)에서는 같은 문장 단언이 깨진다 — 2026-11-23 AU-23
+	 * 구현이 그 코드에서 보았다.
 	 */
 	@Test
-	@DisplayName("다섯째 실패는 판정의 읽기 → 증가 → 잠금 차례로 문장을 내고, 증가와 잠금은 한 트랜잭션이다 — 401 AU005")
-	void 다섯째_실패는_한_트랜잭션에서_증가한_뒤_잠근다() {
-		String email = "au18-increment-then-lock@example.com";
+	@DisplayName("다섯째 실패는 판정의 읽기 → upsert 한 문장 → 같은 트랜잭션의 행 읽기 차례로 문장을 낸다 — 401 AU005")
+	void 세기는_한_트랜잭션의_upsert_와_행_읽기다() {
+		String email = "au23-upsert-then-read@example.com";
 		계정을_만든다(email);
 		카운터를_심는다(email, new Counter(4, null, LOCK_NOW.minusMinutes(1)));
 		Answer<?> attempts = 실제_빈에_위임한다(this.spyLoginAttemptRepository);
-		List<Object> 쓰기의_트랜잭션 = new ArrayList<>();
+		List<Object> 세기의_트랜잭션 = new ArrayList<>();
 		willAnswer(invocation -> {
-			쓰기의_트랜잭션.add(TransactionSynchronizationManager.getResource(this.dataSource));
+			세기의_트랜잭션.add(TransactionSynchronizationManager.getResource(this.dataSource));
 			return attempts.answer(invocation);
-		}).given(this.spyLoginAttemptRepository).incrementFailure(anyString(), any(), any());
+		}).given(this.spyLoginAttemptRepository).countFailure(anyString(), any(), any(), anyInt(), any());
 		willAnswer(invocation -> {
-			쓰기의_트랜잭션.add(TransactionSynchronizationManager.getResource(this.dataSource));
+			if (!TransactionSynchronizationManager.isCurrentTransactionReadOnly()) {
+				세기의_트랜잭션.add(TransactionSynchronizationManager.getResource(this.dataSource));
+			}
 			return attempts.answer(invocation);
-		}).given(this.spyLoginAttemptRepository).lockIfReached(anyString(), anyInt(), any(), any());
+		}).given(this.spyLoginAttemptRepository).findByEmailKey(anyString());
 		Pattern table = Pattern.compile("(?is)\\blogin_attempt\\b");
 		Pattern read = Pattern.compile("(?is)^\\s*select\\b.*\\bfrom\\s+login_attempt\\b");
-		Pattern increment = Pattern.compile(
-				"(?is)^\\s*update\\s+login_attempt\\b.*\\bset\\s+(\\w+\\.)?failed_count\\s*=\\s*case\\b");
-		Pattern lock = Pattern.compile(
-				"(?is)^\\s*update\\s+login_attempt\\b.*\\bset\\s+(\\w+\\.)?locked_until\\s*=\\s*\\?");
+		Pattern upsert = Pattern.compile(
+				"(?is)^\\s*insert\\s+into\\s+login_attempt\\b.*\\bon\\s+duplicate\\s+key\\s+update\\b");
 		List<End> ends = 트랜잭션의_끝을_센다();
 		RecordingStatementInspector.clear();
 
@@ -721,43 +655,70 @@ class LoginAttemptServiceTest {
 				.as("login_attempt 의 문장")
 				.satisfiesExactly(
 						sql -> assertThat(sql).as("판정의 읽기").containsPattern(read),
-						sql -> assertThat(sql).as("증가").containsPattern(increment),
-						sql -> assertThat(sql).as("잠금").containsPattern(lock));
-		assertThat(쓰기의_트랜잭션).hasSize(2).doesNotContainNull();
-		assertThat(쓰기의_트랜잭션.get(1)).as("증가와 잠금은 한 트랜잭션이다").isSameAs(쓰기의_트랜잭션.get(0));
+						sql -> assertThat(sql).as("세는 문장").containsPattern(upsert),
+						sql -> assertThat(sql).as("세기의 행 읽기").containsPattern(read));
+		assertThat(세기의_트랜잭션).as("세는 문장, 세기의 행 읽기").hasSize(2).doesNotContainNull();
+		assertThat(세기의_트랜잭션.get(1)).as("upsert 와 행 읽기는 한 트랜잭션이다").isSameAs(세기의_트랜잭션.get(0));
 		assertThat(ends).containsExactly(판정의_커밋, 쓰기의_커밋);
 		assertThat(카운터(email)).isEqualTo(new Counter(0, LOCK_NOW.plusMinutes(15), LOCK_NOW));
 	}
 
 	/**
-	 * 첫 실패의 INSERT 도 판정 시각을 넣는다 — 정본의 INSERT 는 {@code (:key, 1, NULL, :now)} 다. 증가가 0행을 낸 뒤
-	 * INSERT 전에 시계를 다음 초로 넘긴다. INSERT 가 시계를 다시 읽으면 {@code updated_at} 이 1초 늦어 24시간 경계가 그만큼
-	 * 판정 시각과 어긋난다.
+	 * AU-23 검증표 「새 키 — 문장과 행 읽기 사이에 시계가 다음 초로 넘어간다」. 새 키의 행은 판정 시각으로 들어간다 — 정본의
+	 * {@code (:key, 1, NULL, :now)} 라 {@code updated_at} 이 판정 시각이고 응답은 {@code AU003} 이다. 시계는 문장이 끝난 뒤에
+	 * 넘어가므로 이 테스트는 문장이 넣은 값과 응답만 본다. 새 키의 행은 {@code locked_until} 이 NULL 이라 행 읽기의 판정이
+	 * 시계를 다시 읽어도 결과가 같다 — 그 판정의 시각은 {@link #행_읽기의_판정은_판정_시각으로_한다} 가 본다.
 	 */
 	@Test
-	@DisplayName("첫 실패의 INSERT 는 판정 시각을 넣는다 — 증가와 INSERT 사이에 시계가 다음 초로 넘어가도")
-	void 첫_실패의_INSERT_는_판정_시각이다() {
-		String email = "au18-insert-decision-time@example.com";
+	@DisplayName("새 키는 (1, NULL, 판정 시각) 이고 401 AU003 이다 — 문장과 행 읽기 사이에 시계가 다음 초로 넘어가도")
+	void 새_키는_판정_시각으로_넣는다() {
+		String email = "au23-new-key-decision-time@example.com";
 		계정을_만든다(email);
 		Answer<?> attempts = 실제_빈에_위임한다(this.spyLoginAttemptRepository);
 		willAnswer(invocation -> {
-			Object updated = attempts.answer(invocation);
-			assertThat(updated).as("픽스처 — 행이 없어 0행").isEqualTo(0);
+			Object result = attempts.answer(invocation);
 			CLOCK.set(LOCK_NOW.plusSeconds(1));
-			return updated;
-		}).given(this.spyLoginAttemptRepository).incrementFailure(anyString(), any(), any());
+			return result;
+		}).given(this.spyLoginAttemptRepository).countFailure(anyString(), any(), any(), anyInt(), any());
 
 		assertThat(로그인에_실패한다(email, WRONG_PASSWORD)).isEqualTo(ErrorCode.LOGIN_FAILED);
 
 		assertThat(카운터(email)).isEqualTo(new Counter(1, null, LOCK_NOW));
 	}
 
+	/**
+	 * 세기의 행 읽기는 잠김을 판정 시각으로 가른다 — 시계를 다시 읽지 않는다. 판정은 행이 없는 것을 봤고, 세는 문장 직전에 다른
+	 * 연결이 판정 시각 1초 뒤에 풀리는 잠긴 행을 커밋한다. 모양은 잠그는 문장이 만든 대로다({@code failed_count} 0,
+	 * {@code updated_at = locked_until - 15m}). 세는 문장은 잠긴 행을 바꾸지 않고, 문장 뒤에 시계가 다음 초로 넘어간다. 판정
+	 * 시각으로 가르면 아직 잠겼으니 {@code AU005} 다. 시계를 다시 읽어 가르면 잠금이 막 풀린 것으로 보여 {@code AU003} 이 된다.
+	 */
+	@Test
+	@DisplayName("세기의 행 읽기는 판정 시각으로 가른다 — 문장 뒤에 시계가 잠금이 풀리는 초로 넘어가도 401 AU005 이고 행이 그대로다")
+	void 행_읽기의_판정은_판정_시각으로_한다() {
+		String email = "au23-row-read-decision-time@example.com";
+		계정을_만든다(email);
+		LocalDateTime unlocksAt = LOCK_NOW.plusSeconds(1);
+		Counter 끼어든_잠금 = new Counter(0, unlocksAt, unlocksAt.minusMinutes(15));
+		Answer<?> attempts = 실제_빈에_위임한다(this.spyLoginAttemptRepository);
+		willAnswer(invocation -> {
+			assertThat(다른_연결에서_커밋한다(INSERT_COUNTER, LoginAttempt.emailKeyOf(email), 끼어든_잠금.failedCount(),
+					끼어든_잠금.lockedUntil(), 끼어든_잠금.updatedAt())).as("끼어든 잠금").isOne();
+			Object result = attempts.answer(invocation);
+			CLOCK.set(unlocksAt);
+			return result;
+		}).given(this.spyLoginAttemptRepository).countFailure(anyString(), any(), any(), anyInt(), any());
+
+		assertThat(로그인에_실패한다(email, WRONG_PASSWORD)).isEqualTo(ErrorCode.LOGIN_LOCKED);
+
+		assertThat(카운터(email)).isEqualTo(끼어든_잠금);
+	}
+
 	// --- 세지 않는 경로가 내는 문장 ---
 
 	/**
 	 * 잠긴 동안의 시도는 세지 않는다 — 판정(sp-docs/requirements/member.md §12.1 의 3)이 세기(4)보다 앞이다. 세기를 판정
-	 * 앞으로 옮겨도 응답과 행은 같다 — 잠긴 행에 증가는 0행이고 다시 읽은 행이 잠겨 있어 {@code AU005} 다(AU-18 실측).
-	 * 그래서 낸 문장을 본다. 판정의 읽기가 이 필터에 걸리는지도 본다 — 걸리지 않으면 쓰는 문장이 없다는 단언은 아무것도
+	 * 앞으로 옮겨도 응답과 행은 같다 — 세는 문장은 잠긴 행을 바꾸지 않고 행 읽기가 잠김을 봐 {@code AU005} 다. 그래서 낸
+	 * 문장을 본다. 판정의 읽기가 이 필터에 걸리는지도 본다 — 걸리지 않으면 쓰는 문장이 없다는 단언은 아무것도
 	 * 보지 않는다.
 	 */
 	@Test
@@ -822,7 +783,7 @@ class LoginAttemptServiceTest {
 	 *
 	 * <p>저장이 해시가 검증 때와 다른 것을 보고 401 {@code AU003} 으로 끝난다. 앞선 세션의 행은 변경이 지웠고 새 행이 없다.
 	 * <b>세지 않는다</b>(2026-11-17 오케스트레이터 결정, 정본 미정) — 검증이 맞는 비밀번호로 0 으로 한 카운터가 그대로이고
-	 * 증가 문장이 없다.
+	 * 세는 문장이 없다.
 	 */
 	@Test
 	@DisplayName("BCrypt 비교 뒤에 비밀번호 변경이 커밋되면 옛 비밀번호의 로그인은 401 AU003 이고 refresh_token 행이 없다 — 세지 않는다")
@@ -1062,12 +1023,12 @@ class LoginAttemptServiceTest {
 
 	/**
 	 * 저장이 어긋남을 보고 끝났다 — 그 계정의 {@code refresh_token} 행이 없고, 검증이 맞는 비밀번호로 0 으로 한 카운터가
-	 * 그대로이며 증가 문장을 내지 않았다.
+	 * 그대로이며 세는 문장을 내지 않았다.
 	 */
 	private void 저장하지_않았고_세지_않았다(String email, Account account) {
 		assertThat(토큰_행_수(account)).as("refresh_token 행").isZero();
 		assertThat(카운터(email)).as("카운터").isEqualTo(new Counter(0, null, LOCK_NOW));
-		verify(this.spyLoginAttemptRepository, never()).incrementFailure(anyString(), any(), any());
+		verify(this.spyLoginAttemptRepository, never()).countFailure(anyString(), any(), any(), anyInt(), any());
 	}
 
 	/**

@@ -6,9 +6,7 @@ import jakarta.persistence.GeneratedValue;
 import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
 import jakarta.persistence.Table;
-import java.time.Clock;
 import java.time.LocalDateTime;
-import java.time.temporal.ChronoUnit;
 import java.util.Objects;
 import lombok.AccessLevel;
 import lombok.Getter;
@@ -23,9 +21,12 @@ import lombok.NoArgsConstructor;
  * <p>{@code BaseTimeEntity} 를 상속하지 않는다. {@code updated_at} 은 감사가 아니라 판정하는 코드가
  * 앱 시계의 값을 <b>초로 잘라</b> 넣는다 — 24시간 판정과 오래된 행의 정리가 그 값을 쓴다.
  *
- * <p><b>카운터는 이 엔터티를 갱신해서 바꾸지 않는다.</b> 정본 §2.5 의 갱신 문장(조건부 UPDATE)이
- * 바꾼다 — 읽고 비교한 뒤 쓰면 동시 실패가 증가를 잃는다 (sp-docs/requirements/member.md §12.2).
- * 그래서 필드를 바꾸는 메서드를 두지 않는다.
+ * <p><b>카운터는 이 엔터티를 저장하거나 갱신해서 바꾸지 않는다.</b> 정본 §2.5 의 갱신 문장이 바꾼다 —
+ * 실패는 한 문장 upsert({@code INSERT … ON DUPLICATE KEY UPDATE}, {@code LoginAttemptRepository#countFailure})가
+ * 행이 없으면 넣고 있으면 세고 한도에 닿으면 잠그며, 성공과 재설정 확인은 조건 없는 UPDATE
+ * ({@code LoginAttemptRepository#reset})가 0 으로 한다. 읽고 비교한 뒤 쓰면 동시 실패가 증가를 잃는다
+ * (sp-docs/requirements/member.md §12.2). 그래서 행을 만들거나 필드를 바꾸는 메서드를 두지 않는다 — 이 엔터티는
+ * 판정이 행을 읽는 데만 쓴다.
  */
 @Getter
 @Entity
@@ -55,25 +56,6 @@ public class LoginAttempt {
 	/** 마지막으로 바뀐 시각. */
 	@Column(name = "updated_at", nullable = false)
 	private LocalDateTime updatedAt;
-
-	private LoginAttempt(String emailKey, int failedCount, LocalDateTime updatedAt) {
-		this.emailKey = emailKey;
-		this.failedCount = failedCount;
-		this.updatedAt = updatedAt;
-	}
-
-	/**
-	 * 그 키의 첫 실패 행을 만든다. 정본 §2.5 의 INSERT 가 넣는 값이다 —
-	 * {@code (email_key, failed_count, locked_until, updated_at) = (:key, 1, NULL, :now)}. 저장은
-	 * 호출자가 한다. 같은 키의 행이 이미 있으면 저장이 {@code uk_login_attempt_email_key} 에 걸린다.
-	 *
-	 * <p>{@code updated_at} 은 앱 시계의 값을 초로 자른 것이다 (sp-docs/domain-model.md §1.1·§2.5).
-	 *
-	 * @param emailKey {@link #emailKeyOf(String)} 로 만든 키
-	 */
-	public static LoginAttempt firstFailure(String emailKey, Clock clock) {
-		return new LoginAttempt(emailKey, 1, LocalDateTime.now(clock).truncatedTo(ChronoUnit.SECONDS));
-	}
 
 	/**
 	 * 로그인 이메일을 잠금 키로 바꾼다. <b>ASCII 대문자({@code A}~{@code Z})만 소문자로 바꾸고 나머지
