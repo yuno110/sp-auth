@@ -132,7 +132,7 @@ public class AccountService {
 			throw new BusinessException(ErrorCode.EMAIL_DUPLICATED);
 		}
 
-		// 이 트랜잭션에 거는 것이다 — 커밋되면 그때 발급 작업이 발송 실행기로 넘어가고, 되돌려지면 넘어가지 않는다.
+		// 이 트랜잭션에 거는 것이다 — 커밋되면 그때 발급 작업이 발급 실행기로 넘어가고, 되돌려지면 넘어가지 않는다.
 		// 바깥 트랜잭션에 참여한 호출이면 그 바깥의 커밋을 기다린다
 		this.accountTokenIssuer.requestAfterCommit(TokenPurpose.EMAIL_VERIFICATION, saved.getId());
 		return AccountResponse.from(saved);
@@ -141,7 +141,7 @@ public class AccountService {
 	/**
 	 * MR-14 — 인증 메일 재발송 (sp-docs/requirements/member.md §11.2, sp-docs/api-contract.md §2.4).
 	 *
-	 * <p><b>이 메서드는 DB 일을 하지 않는다.</b> 발급 작업을 발송 실행기에 넘기기만 하고, 계정 찾기·보낼 조건(활성이고
+	 * <p><b>이 메서드는 DB 일을 하지 않는다.</b> 발급 작업을 발급 실행기에 넘기기만 하고, 계정 찾기·보낼 조건(활성이고
 	 * 미인증)·토큰·메일은 그 작업이 한다 — 응답 시간이 계정의 유무로 갈리지 않는다 (sp-docs/security.md §12). 할 DB 일이
 	 * 없으므로 {@code @Transactional} 을 두지 않는다.
 	 *
@@ -210,7 +210,7 @@ public class AccountService {
 	/**
 	 * MR-15 — 비밀번호 재설정 요청 (sp-docs/requirements/member.md §11.3, sp-docs/api-contract.md §2.4).
 	 *
-	 * <p><b>이 메서드는 DB 일을 하지 않는다.</b> {@link #resendVerification} 과 같은 모양이다 — 발급 작업을 발송 실행기에
+	 * <p><b>이 메서드는 DB 일을 하지 않는다.</b> {@link #resendVerification} 과 같은 모양이다 — 발급 작업을 발급 실행기에
 	 * 넘기기만 하고, 계정 찾기·보낼 조건(활성)·토큰·메일은 그 작업이 한다. 응답 시간이 계정의 유무로 갈리지 않는다
 	 * (sp-docs/security.md §12). 할 DB 일이 없으므로 {@code @Transactional} 을 두지 않는다.
 	 *

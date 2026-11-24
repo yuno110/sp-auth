@@ -2149,7 +2149,7 @@ class AccountControllerTest {
 	}
 
 	/**
-	 * 재설정을 요청하고 그 메일의 토큰을 꺼낸다. 계정은 활성이어야 한다. 앞서 발송 실행기에 넘어간 일이 끝나기를 기다린 뒤 남은
+	 * 재설정을 요청하고 그 메일의 토큰을 꺼낸다. 계정은 활성이어야 한다. 앞서 발급·발송 실행기에 넘어간 일이 끝나기를 기다린 뒤 남은
 	 * 메일을 버린다 — 가입이 넘긴 인증 메일이 섞이지 않는다.
 	 */
 	private String 재설정을_요청하고_토큰을_꺼낸다(String email) throws Exception {
@@ -2164,7 +2164,7 @@ class AccountControllerTest {
 	}
 
 	/**
-	 * {@link #계정과_세션을_만든다(String)} 뒤에 가입이 발송 실행기에 넘긴 일이 끝나기를 기다린다 — 그 인증 메일의 발급이
+	 * {@link #계정과_세션을_만든다(String)} 뒤에 가입이 발급 실행기에 넘긴 일(과 그 뒤의 발송)이 끝나기를 기다린다 — 그 인증 메일의 발급이
 	 * 테스트의 확인과 겹치지 않는다.
 	 */
 	private IssuedTokens 재설정할_계정과_세션을_만든다(String email) throws Exception {
