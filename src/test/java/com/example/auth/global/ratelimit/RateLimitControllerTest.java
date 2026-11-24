@@ -181,8 +181,12 @@ class RateLimitControllerTest {
 	private InMemoryMailer inMemoryMailer;
 
 	@Autowired
-	@Qualifier(MailExecutorConfig.MAIL_EXECUTOR)
-	private ThreadPoolTaskExecutor mailExecutor;
+	@Qualifier(MailExecutorConfig.ISSUE_EXECUTOR)
+	private ThreadPoolTaskExecutor issueExecutor;
+
+	@Autowired
+	@Qualifier(MailExecutorConfig.SEND_EXECUTOR)
+	private ThreadPoolTaskExecutor sendExecutor;
 
 	/** 이 테스트가 쓰는 날. 창은 이 날의 시각으로 정한다. */
 	private LocalDate today;
@@ -200,7 +204,7 @@ class RateLimitControllerTest {
 	@AfterEach
 	void 정리() {
 		CLOCK.reset();
-		MailExecutorDrain.drain(this.mailExecutor);
+		MailExecutorDrain.drain(this.issueExecutor, this.sendExecutor);
 		this.inMemoryMailer.clear();
 		this.jdbcTemplate.update("delete from account_token");
 		this.jdbcTemplate.update("delete from login_attempt");

@@ -38,6 +38,7 @@ import com.example.auth.global.error.BusinessException;
 import com.example.auth.global.error.ErrorCode;
 import com.example.auth.global.config.MailExecutorConfig;
 import com.example.auth.global.security.JwtTokenProvider;
+import com.example.auth.support.InMemoryMailer;
 import com.example.auth.support.MailExecutorDrain;
 import com.example.auth.support.RecordingStatementInspector;
 import com.example.auth.support.TestRsaKeys;
@@ -157,10 +158,14 @@ class AccountServiceTest {
 	@Autowired
 	private JdbcTemplate jdbcTemplate;
 
-	/** AU-16 — 가입이 커밋 뒤에 넘긴 발급 작업이 도는 곳. 정리가 그 작업이 끝나기를 기다린다. */
+	/** AU-16 — 가입이 커밋 뒤에 넘긴 발급 작업과 그 발송 작업이 도는 곳(AU-24 부터 둘). 정리가 둘이 끝나기를 기다린다. */
 	@Autowired
-	@Qualifier(MailExecutorConfig.MAIL_EXECUTOR)
-	private ThreadPoolTaskExecutor mailExecutor;
+	@Qualifier(MailExecutorConfig.ISSUE_EXECUTOR)
+	private ThreadPoolTaskExecutor issueExecutor;
+
+	@Autowired
+	@Qualifier(MailExecutorConfig.SEND_EXECUTOR)
+	private ThreadPoolTaskExecutor sendExecutor;
 
 	/**
 	 * <b>seed 행은 남긴다.</b> H2 는 테스트 클래스 사이에 공유되므로
@@ -178,7 +183,7 @@ class AccountServiceTest {
 	 */
 	@AfterEach
 	void 정리() {
-		MailExecutorDrain.drain(this.mailExecutor);
+		MailExecutorDrain.drain(this.issueExecutor, this.sendExecutor);
 		this.accountTokenRepository.deleteAllInBatch();
 		this.refreshTokenRepository.deleteAll();
 		this.refreshTokenRepository.flush();
@@ -948,7 +953,7 @@ class AccountServiceTest {
 	 * 확인의 트랜잭션 경계(sp-docs/process/review-policy.md §4.1)와 가입이 발급을 넘기는 때
 	 * (sp-docs/plan/phase2-auth-member.md AU-16 의 검증 표).
 	 *
-	 * <p>발송 실행기를 대역으로 바꾼다 — 받은 작업을 돌리지 않고 Mockito 가 받은 횟수와 작업을 남긴다. 그래서
+	 * <p>발급·발송 실행기를 대역으로 바꾼다 — 받은 작업을 돌리지 않고 Mockito 가 받은 횟수와 작업을 남긴다. 그래서
 	 * 「트랜잭션이 열린 동안 받은 작업」을 기다림 없이 셀 수 있고, 받은 발급 작업은 테스트가 이 스레드에서 돌린다.
 	 *
 	 * <p>Hibernate 가 준비한 SQL 을 적는 기록기({@link RecordingStatementInspector})도 이 컨텍스트에 단다 — 확인이 계정을
@@ -969,9 +974,17 @@ class AccountServiceTest {
 		@MockitoSpyBean
 		private PlatformTransactionManager spyTransactionManager;
 
+		/** 발급 실행기의 대역. 받은 작업을 돌리지 않는다. */
+		@MockitoBean(name = MailExecutorConfig.ISSUE_EXECUTOR)
+		private ThreadPoolTaskExecutor issueExecutorDouble;
+
 		/** 발송 실행기의 대역. 받은 작업을 돌리지 않는다. */
-		@MockitoBean(name = MailExecutorConfig.MAIL_EXECUTOR)
-		private ThreadPoolTaskExecutor mailExecutorDouble;
+		@MockitoBean(name = MailExecutorConfig.SEND_EXECUTOR)
+		private ThreadPoolTaskExecutor sendExecutorDouble;
+
+		/** 이 컨텍스트의 시험용 발송기. 넘겨받은 발송 작업이 이것으로 보낸다. */
+		@Autowired
+		private InMemoryMailer inMemoryMailer;
 
 		/** 재발송을 부른 스레드가 계정을 찾지 않는지 본다. 나머지는 실제 빈에 위임된다. */
 		@MockitoSpyBean
@@ -991,11 +1004,11 @@ class AccountServiceTest {
 
 			outer.executeWithoutResult(status -> {
 				this.accountService.create(new AccountCreateRequest("au16-signup-rollback@example.com", RAW_PASSWORD));
-				verify(this.mailExecutorDouble, never()).execute(any(Runnable.class));
+				verify(this.issueExecutorDouble, never()).execute(any(Runnable.class));
 				status.setRollbackOnly();
 			});
 
-			verify(this.mailExecutorDouble, never()).execute(any(Runnable.class));
+			verify(this.issueExecutorDouble, never()).execute(any(Runnable.class));
 			assertThat(this.accountRepository.existsByEmail("au16-signup-rollback@example.com")).isFalse();
 		}
 
@@ -1006,10 +1019,10 @@ class AccountServiceTest {
 
 			outer.executeWithoutResult(status -> {
 				this.accountService.create(new AccountCreateRequest("au16-signup-commit@example.com", RAW_PASSWORD));
-				verify(this.mailExecutorDouble, never()).execute(any(Runnable.class));
+				verify(this.issueExecutorDouble, never()).execute(any(Runnable.class));
 			});
 
-			verify(this.mailExecutorDouble, times(1)).execute(any(Runnable.class));
+			verify(this.issueExecutorDouble, times(1)).execute(any(Runnable.class));
 		}
 
 		/**
@@ -1030,7 +1043,7 @@ class AccountServiceTest {
 			verifyNoInteractions(this.accountRepository);
 			verify(this.spyTransactionManager, never()).getTransaction(any());
 			ArgumentCaptor<Runnable> handedOver = ArgumentCaptor.forClass(Runnable.class);
-			verify(this.mailExecutorDouble).execute(handedOver.capture());
+			verify(this.issueExecutorDouble).execute(handedOver.capture());
 
 			handedOver.getValue().run();
 			verify(this.accountRepository).findByEmail("au16-resend-handover@example.com");
@@ -1084,31 +1097,43 @@ class AccountServiceTest {
 		}
 
 		/**
-		 * 가입이 넘긴 발급 작업 한 번 — 앞 토큰 지우기와 새 토큰 넣기가 한 트랜잭션이다 (AU-15 의 작업 순서,
-		 * sp-docs/requirements/member.md §11.5 마지막 문단). AU-15 리뷰가 그 경계를 못박는 테스트가 없다고 지적했다 — 같은
-		 * 관측으로 덮는다.
+		 * 가입이 넘긴 발급 작업 한 번 — 새 토큰 넣기가 한 트랜잭션이고, <b>앞 토큰은 그 트랜잭션이 지우지 않는다</b>(AU-24,
+		 * sp-docs/requirements/member.md §11.5 마지막 문단). 앞 토큰은 발송 작업이 메일을 넘긴 뒤 자기 트랜잭션에서 지운다 —
+		 * 넘겨받은 발송 작업을 돌리면 그때 커밋이 하나 더 있고 새 토큰만 남는다. AU-15 리뷰가 경계를 못박는 테스트가 없다고
+		 * 지적했던 자리를 같은 관측으로 덮는다.
 		 */
 		@Test
-		@DisplayName("가입이 넘긴 발급 작업 한 번에 물리 트랜잭션이 정확히 하나 커밋된다 — 앞 토큰을 지우고 새 토큰을 넣는다")
-		void 발급_작업의_커밋이_정확히_한_번이다() {
+		@DisplayName("가입이 넘긴 발급 작업 한 번에 커밋이 하나이고 앞 토큰이 남는다 — 발송 작업이 보낸 뒤 자기 커밋 하나로 앞 토큰을 지운다")
+		void 발급_작업의_커밋이_정확히_한_번이다() throws InterruptedException {
 			Long id = this.accountService.create(
 					new AccountCreateRequest("au16-issue-boundary@example.com", RAW_PASSWORD)).accountId();
 			String 앞_토큰의_해시 = AccountTokens.hash(인증_토큰을_심는다(id));
-			ArgumentCaptor<Runnable> handedOver = ArgumentCaptor.forClass(Runnable.class);
-			verify(this.mailExecutorDouble).execute(handedOver.capture());
+			ArgumentCaptor<Runnable> issueTask = ArgumentCaptor.forClass(Runnable.class);
+			verify(this.issueExecutorDouble).execute(issueTask.capture());
 
 			List<TransactionStatus> 커밋된_물리_트랜잭션 = 커밋을_센다();
-			handedOver.getValue().run();
+			issueTask.getValue().run();
 
-			assertThat(커밋된_물리_트랜잭션)
-					.as("앞 토큰 지우기와 새 토큰 넣기가 한 트랜잭션이다")
-					.hasSize(1);
-			List<String> 남은_해시 = this.accountTokenRepository.findAll().stream()
-					.filter(row -> row.getAccountId().equals(id))
+			assertThat(커밋된_물리_트랜잭션).as("새 토큰 넣기가 한 트랜잭션이다").hasSize(1);
+			assertThat(남은_해시(id)).as("발급 트랜잭션은 앞 토큰을 지우지 않는다").hasSize(2).contains(앞_토큰의_해시);
+			verify(this.issueExecutorDouble, times(1)).execute(any(Runnable.class));
+			ArgumentCaptor<Runnable> sendTask = ArgumentCaptor.forClass(Runnable.class);
+			verify(this.sendExecutorDouble, times(1)).execute(sendTask.capture());
+
+			this.inMemoryMailer.clear();
+			int 보내기_전 = 커밋된_물리_트랜잭션.size();
+			sendTask.getValue().run();
+
+			assertThat(this.inMemoryMailer.next(Duration.ZERO).mail().accountId()).isEqualTo(id);
+			assertThat(커밋된_물리_트랜잭션.size() - 보내기_전).as("발송 뒤의 지우기가 자기 트랜잭션 하나다").isOne();
+			assertThat(남은_해시(id)).as("보낸 뒤에는 새 토큰 하나만 남는다").hasSize(1).doesNotContain(앞_토큰의_해시);
+		}
+
+		private List<String> 남은_해시(Long accountId) {
+			return this.accountTokenRepository.findAll().stream()
+					.filter(row -> row.getAccountId().equals(accountId))
 					.map(AccountToken::getTokenHash)
 					.toList();
-			assertThat(남은_해시).as("새 토큰 하나만 남는다").hasSize(1).doesNotContain(앞_토큰의_해시);
-			verify(this.mailExecutorDouble, times(2)).execute(any(Runnable.class));
 		}
 
 		/** 지금부터 커밋되는 물리 트랜잭션을 모은다. 준비가 끝난 뒤에 부른다. */
@@ -1148,7 +1173,7 @@ class AccountServiceTest {
 	 * (sp-docs/plan/phase2-auth-member.md AU-17 의 완료 기준·검증 표). 확인의 단계 번호는 sp-docs/requirements/member.md
 	 * §11.4 의 것이다 — 1 사용 처리, 2 탈퇴 검사, 3 비밀번호, 4 {@code refresh_token} 삭제, 5 잠금 해제, 6 인증.
 	 *
-	 * <p>대역은 {@link 인증_트랜잭션_경계} 와 같은 이유로 둔다 — 발송 실행기의 대역은 받은 작업을 돌리지 않고, SQL 기록기가
+	 * <p>대역은 {@link 인증_트랜잭션_경계} 와 같은 이유로 둔다 — 발급·발송 실행기의 대역은 받은 작업을 돌리지 않고, SQL 기록기가
 	 * 확인이 낸 문장을 보게 한다. 두 리포지터리 스파이는 확인 도중에 끼어들 자리다.
 	 *
 	 * <p>계정·토큰·Refresh Token 의 준비는 바깥 클래스의 헬퍼가 바깥 컨텍스트의 빈으로 한다 — 두 컨텍스트가 같은 H2 DB 를
@@ -1171,9 +1196,13 @@ class AccountServiceTest {
 		@MockitoSpyBean
 		private PlatformTransactionManager spyTransactionManager;
 
+		/** 발급 실행기의 대역. 받은 작업을 돌리지 않는다. */
+		@MockitoBean(name = MailExecutorConfig.ISSUE_EXECUTOR)
+		private ThreadPoolTaskExecutor issueExecutorDouble;
+
 		/** 발송 실행기의 대역. 받은 작업을 돌리지 않는다. */
-		@MockitoBean(name = MailExecutorConfig.MAIL_EXECUTOR)
-		private ThreadPoolTaskExecutor mailExecutorDouble;
+		@MockitoBean(name = MailExecutorConfig.SEND_EXECUTOR)
+		private ThreadPoolTaskExecutor sendExecutorDouble;
 
 		/** 요청한 스레드가 계정을 찾지 않는지 보고, 확인의 6 이 계정을 다시 읽는 자리에 실패를 넣는다. 나머지는 실제 빈에 위임된다. */
 		@MockitoSpyBean
@@ -1210,7 +1239,7 @@ class AccountServiceTest {
 			verifyNoInteractions(this.spyAccountRepository);
 			verify(this.spyTransactionManager, never()).getTransaction(any());
 			ArgumentCaptor<Runnable> handedOver = ArgumentCaptor.forClass(Runnable.class);
-			verify(this.mailExecutorDouble).execute(handedOver.capture());
+			verify(this.issueExecutorDouble).execute(handedOver.capture());
 
 			handedOver.getValue().run();
 			verify(this.spyAccountRepository).findByEmail("au17-request-handover@example.com");

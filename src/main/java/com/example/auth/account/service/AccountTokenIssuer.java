@@ -7,6 +7,7 @@ import com.example.auth.account.repository.AccountRepository;
 import com.example.auth.account.repository.AccountTokenRepository;
 import com.example.auth.account.support.AccountTokens;
 import com.example.auth.global.config.MailExecutorConfig;
+import com.example.auth.global.config.MailExecutorTask;
 import com.example.auth.mail.MailDispatcher;
 import com.example.auth.mail.MailSettings;
 import com.example.auth.mail.OutgoingMail;
@@ -30,8 +31,10 @@ import org.springframework.transaction.support.TransactionTemplate;
 /**
  * 링크 토큰 발급 작업 — 이메일 인증과 비밀번호 재설정의 메일 (sp-docs/requirements/member.md §11.5).
  *
- * <p><b>작업은 부른 스레드가 아니라 발송 실행기({@link MailExecutorConfig})에서 돈다.</b> 부르는 쪽은 작업을 넘기기만
- * 하고 DB 일을 하지 않는다 — 재발송·재설정 요청의 응답 시간이 계정 유무로 갈리지 않게 하려는 것이다
+ * <p><b>작업은 부른 스레드가 아니라 발급 실행기({@link MailExecutorConfig#ISSUE_EXECUTOR})에서 돈다.</b> 메일은 그 작업이
+ * 커밋한 뒤 발송 실행기로 넘어간다 — 발급이 SMTP 를 기다리는 발송 뒤에 줄을 서지 않는다(2026-11-23 {@code D-28}).
+ * 작업은 {@link MailExecutorTask} 로 감싸 종류·계정 id·목적만 드러낸다 — 대기열이 버리면 그 셋이 WARN 에 남는다.
+ * 부르는 쪽은 작업을 넘기기만 하고 DB 일을 하지 않는다 — 재발송·재설정 요청의 응답 시간이 계정 유무로 갈리지 않게 하려는 것이다
  * (sp-docs/requirements/member.md §11.3, sp-docs/security.md §12).
  *
  * <p>작업은 자기 트랜잭션에서 아래 순서로 돈다 (sp-docs/plan/phase2-auth-member.md AU-15).
@@ -39,10 +42,15 @@ import org.springframework.transaction.support.TransactionTemplate;
  *   <li>계정을 찾는다</li>
  *   <li>그 목적의 보낼 조건을 본다 — 안 되면 토큰도 메일도 없다 (sp-docs/requirements/member.md §11.2·§11.3)</li>
  *   <li>계정 id·목적의 발송 상한을 본다 — 넘으면 발급·발송하지 않고 WARN ({@link AccountTokenSendLimit})</li>
- *   <li>같은 계정·목적의 앞 토큰을 지운다 — 마지막 메일의 링크만 산다 (sp-docs/requirements/member.md §11.1)</li>
- *   <li>새 토큰을 넣는다. 저장은 해시뿐이다 ({@link AccountTokens})</li>
- *   <li><b>그 트랜잭션이 커밋된 뒤</b> 메일을 보낸다 ({@link MailDispatcher#sendAfterCommit})</li>
+ *   <li>새 토큰을 넣는다. 저장은 해시뿐이다 ({@link AccountTokens}). <b>앞 토큰을 지우지 않는다</b> — 이 메일이 나가지
+ *   못하면 이미 받은 링크가 살아야 한다 (sp-docs/requirements/member.md §11.1, 2026-11-23 {@code D-28})</li>
+ *   <li><b>그 트랜잭션이 커밋된 뒤</b> 메일을 발송 실행기로 넘긴다 ({@link MailDispatcher#sendAfterCommit})</li>
  * </ol>
+ *
+ * <p><b>앞 토큰은 메일이 SMTP 에 넘겨진 뒤 지운다.</b> 발송 작업이 넘기는 데 성공하면 자기 트랜잭션에서 같은 계정·목적의
+ * id 가 새 토큰보다 작은 행을 지운다 ({@link AccountTokenRepository#deletePreceding}) — 「새 토큰 말고 전부」 가 아니다. 겹친
+ * 두 발급에서 먼저 끝난 발송이 나중 토큰을 지우지 않는다. 발송이 실패하거나 발송 작업이 버려지면 지우지 않는다. 지우기가
+ * 실패하면 발송기가 WARN 한 줄을 남기고 둘 다 둔다 — 다시 지우지 않는다 (sp-docs/domain-model.md §2.4).
  *
  * <p><b>메일은 계정에 저장된 주소로 보낸다.</b> 요청에 실린 표기로 보내지 않는다 — 계정 조회는 콜레이션으로
  * 비교하므로 다른 표기로도 같은 계정을 찾는다 (sp-docs/requirements/member.md §11.3).
@@ -80,7 +88,7 @@ public class AccountTokenIssuer {
 
 	private final MailSettings mailSettings;
 
-	private final Executor mailExecutor;
+	private final Executor issueExecutor;
 
 	private final TransactionTemplate transaction;
 
@@ -92,7 +100,7 @@ public class AccountTokenIssuer {
 			AccountTokenSendLimit sendLimit,
 			MailDispatcher mailDispatcher,
 			MailSettings mailSettings,
-			@Qualifier(MailExecutorConfig.MAIL_EXECUTOR) Executor mailExecutor,
+			@Qualifier(MailExecutorConfig.ISSUE_EXECUTOR) Executor issueExecutor,
 			PlatformTransactionManager transactionManager,
 			Clock clock) {
 
@@ -101,7 +109,7 @@ public class AccountTokenIssuer {
 		this.sendLimit = sendLimit;
 		this.mailDispatcher = mailDispatcher;
 		this.mailSettings = mailSettings;
-		this.mailExecutor = mailExecutor;
+		this.issueExecutor = issueExecutor;
 		this.transaction = new TransactionTemplate(transactionManager);
 		this.clock = clock;
 	}
@@ -110,10 +118,12 @@ public class AccountTokenIssuer {
 	 * 재발송·재설정 요청의 발급. 요청 스레드에서 부른다 — 작업을 실행기에 넘기기만 하고 DB 일을 하지 않는다.
 	 * 계정은 작업이 이 이메일로 찾는다.
 	 *
-	 * <p>실행기의 대기열이 차 있으면 작업이 버려지고 실행기가 WARN 을 남긴다 ({@link MailExecutorConfig}).
+	 * <p>발급 실행기의 대기열이 차 있으면 작업이 버려지고 실행기가 WARN 을 남긴다 ({@link MailExecutorConfig}). 넣는 순간
+	 * 계정을 모르므로 그 줄의 계정 id 는 {@code null} 이다 — 이메일을 대신 싣지 않는다.
 	 */
 	public void request(TokenPurpose purpose, String email) {
-		this.mailExecutor.execute(() -> run(purpose, () -> this.accountRepository.findByEmail(email)));
+		this.issueExecutor.execute(MailExecutorTask.issue(null, purpose.name(),
+				() -> run(purpose, () -> this.accountRepository.findByEmail(email))));
 	}
 
 	/**
@@ -131,13 +141,13 @@ public class AccountTokenIssuer {
 		TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
 			@Override
 			public void afterCommit() {
-				AccountTokenIssuer.this.mailExecutor.execute(
-						() -> run(purpose, () -> AccountTokenIssuer.this.accountRepository.findById(accountId)));
+				AccountTokenIssuer.this.issueExecutor.execute(MailExecutorTask.issue(accountId, purpose.name(),
+						() -> run(purpose, () -> AccountTokenIssuer.this.accountRepository.findById(accountId))));
 			}
 		});
 	}
 
-	/** 실행기에서 도는 작업. 실패를 WARN 으로 남기고 삼킨다 — 실행기 밖으로 던지면 로그 규칙 밖에서 스택이 남는다. */
+	/** 발급 실행기에서 도는 작업. 실패를 WARN 으로 남기고 삼킨다 — 실행기 밖으로 던지면 로그 규칙 밖에서 스택이 남는다. */
 	private void run(TokenPurpose purpose, Supplier<Optional<Account>> findAccount) {
 		AtomicReference<Long> accountId = new AtomicReference<>();
 		try {
@@ -166,7 +176,7 @@ public class AccountTokenIssuer {
 			return;
 		}
 
-		// 상한은 앞 토큰을 지우기 전에 본다 — 넘친 요청이 마지막으로 보낸 링크를 죽이지 않는다
+		// 상한은 새 토큰을 넣기 전에 본다 — 넘친 요청은 행도 메일도 만들지 않아 마지막으로 보낸 링크가 그대로 산다
 		Optional<Instant> acquired = this.sendLimit.tryAcquire(accountId, purpose);
 		if (acquired.isEmpty()) {
 			log.warn("account token not issued: send limit reached (accountId={}, purpose={}, limit={} per {})",
@@ -183,13 +193,22 @@ public class AccountTokenIssuer {
 			}
 		});
 
-		// 이 삭제는 영속성 컨텍스트를 비운다. account 는 그 뒤 읽기만 한다
-		this.accountTokenRepository.deleteByAccountIdAndPurpose(accountId, purpose);
 		String token = AccountTokens.generate();
-		this.accountTokenRepository.save(
-				AccountToken.issue(accountId, purpose, AccountTokens.hash(token), lifetime(purpose), this.clock));
+		// id 는 IDENTITY 라 넣는 순간 정해진다 — 발송 뒤의 지우기가 이것보다 작은 id 만 지운다
+		Long newId = this.accountTokenRepository.save(
+				AccountToken.issue(accountId, purpose, AccountTokens.hash(token), lifetime(purpose), this.clock)).getId();
 
-		this.mailDispatcher.sendAfterCommit(mail(account, purpose, token));
+		this.mailDispatcher.sendAfterCommit(mail(account, purpose, token),
+				() -> deletePreceding(accountId, purpose, newId));
+	}
+
+	/**
+	 * 발송 뒤의 지우기. 발송 작업의 스레드에서, 메일이 SMTP 에 넘겨진 뒤에만 돈다. 자기 트랜잭션이다 — 발급의 트랜잭션은 이미
+	 * 커밋됐다. 실패는 던진다 — 발송기가 WARN 한 줄로 남기고 다시 하지 않는다 ({@link MailDispatcher#sendAfterCommit}).
+	 */
+	private void deletePreceding(Long accountId, TokenPurpose purpose, Long newId) {
+		this.transaction.executeWithoutResult(
+				status -> this.accountTokenRepository.deletePreceding(accountId, purpose, newId));
 	}
 
 	/**

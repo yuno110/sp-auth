@@ -140,31 +140,56 @@ class AccountTokenRepositoryTest {
 	}
 
 	/**
-	 * 같은 계정·같은 목적의 행이 둘인 것은 겹친 발급이 남길 수 있는 상태다
-	 * (sp-docs/requirements/member.md §11.1). 둘 다 지워지는지 본다.
+	 * 발송 뒤의 지우기 (AU-24, sp-docs/domain-model.md §2.4). 같은 계정·목적에서 새 토큰보다 id 가 작은 행만 지운다 — 새 토큰과
+	 * 그보다 나중 행(겹친 발급), 다른 목적, 다른 계정은 남는다.
 	 */
 	@Test
-	@DisplayName("같은 계정·목적의 행 지우기 — 그 계정·목적의 행만 지워진다")
-	void 같은_계정_목적의_행만_지운다() {
+	@DisplayName("발송 뒤의 지우기 — 같은 계정·목적에서 id 가 새 토큰보다 작은 행만 지운다")
+	void 발송_뒤의_지우기는_앞_행만_지운다() {
 		Long accountId = 계정("delete-target@example.com");
 		Long otherAccountId = 계정("delete-other@example.com");
-		String target1 = 발급(accountId, TokenPurpose.EMAIL_VERIFICATION);
-		String target2 = 발급(accountId, TokenPurpose.EMAIL_VERIFICATION);
+		String older1 = 발급(accountId, TokenPurpose.EMAIL_VERIFICATION);
+		String older2 = 발급(accountId, TokenPurpose.EMAIL_VERIFICATION);
+		String newer = 발급(accountId, TokenPurpose.EMAIL_VERIFICATION);
+		String later = 발급(accountId, TokenPurpose.EMAIL_VERIFICATION);
 		String otherPurpose = 발급(accountId, TokenPurpose.PASSWORD_RESET);
 		String otherAccount = 발급(otherAccountId, TokenPurpose.EMAIL_VERIFICATION);
 
-		int deleted = this.accountTokenRepository.deleteByAccountIdAndPurpose(
-				accountId, TokenPurpose.EMAIL_VERIFICATION);
+		int deleted = this.accountTokenRepository.deletePreceding(accountId, TokenPurpose.EMAIL_VERIFICATION, id(newer));
 
 		assertThat(deleted).isEqualTo(2);
-		assertThat(this.accountTokenRepository.findByTokenHash(target1)).isEmpty();
-		assertThat(this.accountTokenRepository.findByTokenHash(target2)).isEmpty();
-		assertThat(this.accountTokenRepository.findByTokenHash(otherPurpose))
-				.as("같은 계정의 다른 목적")
-				.isPresent();
-		assertThat(this.accountTokenRepository.findByTokenHash(otherAccount))
-				.as("다른 계정의 같은 목적")
-				.isPresent();
+		assertThat(this.accountTokenRepository.findByTokenHash(older1)).isEmpty();
+		assertThat(this.accountTokenRepository.findByTokenHash(older2)).isEmpty();
+		assertThat(this.accountTokenRepository.findByTokenHash(newer)).as("새 토큰").isPresent();
+		assertThat(this.accountTokenRepository.findByTokenHash(later)).as("나중 토큰 — 겹친 발급").isPresent();
+		assertThat(this.accountTokenRepository.findByTokenHash(otherPurpose)).as("같은 계정의 다른 목적").isPresent();
+		assertThat(this.accountTokenRepository.findByTokenHash(otherAccount)).as("다른 계정의 같은 목적").isPresent();
+	}
+
+	/** 확인 뒤의 지우기 (AU-24, sp-docs/domain-model.md §2.4). 같은 계정·목적에서 쓴 토큰 말고 전부 지운다. */
+	@Test
+	@DisplayName("확인 뒤의 지우기 — 같은 계정·목적에서 쓴 토큰 말고 지운다. 다른 목적·다른 계정은 남는다")
+	void 확인_뒤의_지우기는_나머지를_지운다() {
+		Long accountId = 계정("delete-others@example.com");
+		Long otherAccountId = 계정("delete-others-other@example.com");
+		String before = 발급(accountId, TokenPurpose.PASSWORD_RESET);
+		String used = 발급(accountId, TokenPurpose.PASSWORD_RESET);
+		String after = 발급(accountId, TokenPurpose.PASSWORD_RESET);
+		String otherPurpose = 발급(accountId, TokenPurpose.EMAIL_VERIFICATION);
+		String otherAccount = 발급(otherAccountId, TokenPurpose.PASSWORD_RESET);
+
+		int deleted = this.accountTokenRepository.deleteOthers(accountId, TokenPurpose.PASSWORD_RESET, id(used));
+
+		assertThat(deleted).isEqualTo(2);
+		assertThat(this.accountTokenRepository.findByTokenHash(before)).isEmpty();
+		assertThat(this.accountTokenRepository.findByTokenHash(after)).isEmpty();
+		assertThat(this.accountTokenRepository.findByTokenHash(used)).as("쓴 토큰").isPresent();
+		assertThat(this.accountTokenRepository.findByTokenHash(otherPurpose)).as("같은 계정의 다른 목적").isPresent();
+		assertThat(this.accountTokenRepository.findByTokenHash(otherAccount)).as("다른 계정의 같은 목적").isPresent();
+	}
+
+	private Long id(String tokenHash) {
+		return this.accountTokenRepository.findByTokenHash(tokenHash).orElseThrow().getId();
 	}
 
 	/**

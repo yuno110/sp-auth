@@ -162,6 +162,7 @@ public class AccountService {
 	 *   <li>그 계정이 탈퇴했으면 되돌린다 — 400 {@code AU007}. 예외가 이 트랜잭션을 되돌려 1의 사용 처리도 없던 일이
 	 *   된다</li>
 	 *   <li>{@code email_verified_at} 이 NULL 이면 지금 시각으로 채운다. 이미 인증됐으면 그대로 둔다</li>
+	 *   <li>같은 계정·목적의 나머지 토큰(쓴 토큰 말고)을 지운다 — 같은 트랜잭션이다. 락 예외를 삼키지 않는다 (§11.1)</li>
 	 * </ol>
 	 *
 	 * <p>없음·만료·사용됨·목적 다름·탈퇴 계정을 가르지 않는다 — 모두 같은 {@code AU007} 이다 (§11.1). 토큰의 길이·문자가
@@ -182,9 +183,9 @@ public class AccountService {
 		}
 
 		// 방금 이 트랜잭션이 사용 처리한 행이다. 없다면 판정이 아니라 불변식이 깨진 것이므로 숨기지 않는다
-		Long accountId = this.accountTokenRepository.findByTokenHash(tokenHash)
-				.map(AccountToken::getAccountId)
+		AccountToken used = this.accountTokenRepository.findByTokenHash(tokenHash)
 				.orElseThrow(() -> new IllegalStateException("사용 처리한 토큰의 행이 없다"));
+		Long accountId = used.getAccountId();
 
 		// 잠금 읽기다 — 인증 시각의 쓰기가 탈퇴 검사가 본 값 위에 놓인다. 이유는 AccountRepository#findByIdForUpdate 에 있다.
 		// 행은 있어야 한다 — fk_account_token_account(ON DELETE 절 없음, V7)가 토큰이 남은 계정의 삭제를 막는다
@@ -198,6 +199,12 @@ public class AccountService {
 
 		// 3) 처음 인증한 시각이 남는다 — 이미 채워져 있으면 덮지 않는다 (Account#markEmailVerified)
 		account.markEmailVerified(this.clock);
+
+		// 4) 같은 계정·목적의 나머지 토큰을 지운다 — 발송이 실패해 남은 앞 링크와 메일로 나가지 않은 토큰이다 (§11.1, D-28).
+		// 이 문장은 3 을 flush 한 뒤 지운다. 락 예외를 잡지 않는다 — 던지면 확인 전체가 되돌려져 토큰 사용도 없던 일이
+		// 된다 (500 C005). 삼켜도 응답이 상태를 말하지 않는다: Hibernate 를 거친 락 예외는 트랜잭션을 rollback-only 로 표시해
+		// 커밋이 UnexpectedRollbackException 이 된다 (2026-11-24 AU-24 리뷰가 H2 의 행 락으로 확인)
+		this.accountTokenRepository.deleteOthers(accountId, TokenPurpose.EMAIL_VERIFICATION, used.getId());
 	}
 
 	/**
@@ -231,11 +238,12 @@ public class AccountService {
 	 *   <li>그 계정의 {@code refresh_token} 행을 지운다 — 비밀번호 변경(§3 규칙 4)과 같다</li>
 	 *   <li>그 계정 이메일의 로그인 잠금을 푼다 (§12.2). 키는 계정에 저장된 이메일에서 만든다</li>
 	 *   <li>{@code email_verified_at} 이 NULL 이면 지금 시각으로 채운다. 이미 인증됐으면 그대로 둔다</li>
+	 *   <li>같은 계정·목적의 나머지 토큰(쓴 토큰 말고)을 지운다 — 같은 트랜잭션이다. 락 예외를 삼키지 않는다 (§11.1)</li>
 	 * </ol>
 	 * 일부만 커밋되면 비밀번호는 바뀌었는데 옛 Refresh Token 이 살거나, 토큰은 쓰였는데 비밀번호가 그대로인 상태가 남는다
 	 * (§11.4).
 	 *
-	 * <p><b>잠금은 1 의 토큰 행 → 계정 → 4 의 {@code refresh_token} → 5 의 {@code login_attempt} 차례로 잡는다.</b> 계정은 2 의
+	 * <p><b>잠금은 1 의 토큰 행 → 계정 → 4 의 {@code refresh_token} → 5 의 {@code login_attempt} → 7 의 같은 계정·목적 토큰 범위 차례로 잡는다.</b> 계정은 2 의
 	 * 검사 전에 잠금 읽기로 읽는다. 계정을 잡은 뒤 {@code refresh_token} 을 잡는 것은 로그인의 저장({@code AuthService})과 같은
 	 * 순서이고, 그 저장은 이 트랜잭션이 계정을 잡은 동안 오면 이 트랜잭션이 끝나기를 기다렸다가 커밋된 값과 견준다
 	 * (sp-docs/plan/phase2-auth-member.md AU-22).
@@ -260,9 +268,9 @@ public class AccountService {
 		}
 
 		// 방금 이 트랜잭션이 사용 처리한 행이다. 없다면 판정이 아니라 불변식이 깨진 것이므로 숨기지 않는다
-		Long accountId = this.accountTokenRepository.findByTokenHash(tokenHash)
-				.map(AccountToken::getAccountId)
+		AccountToken used = this.accountTokenRepository.findByTokenHash(tokenHash)
 				.orElseThrow(() -> new IllegalStateException("사용 처리한 토큰의 행이 없다"));
+		Long accountId = used.getAccountId();
 
 		// 잠금 읽기다 — 3·6 의 쓰기가 탈퇴 검사가 본 값 위에 놓인다. 이유는 AccountRepository#findByIdForUpdate 에 있다.
 		// 행은 있어야 한다 — fk_account_token_account(ON DELETE 절 없음, V7)가 토큰이 남은 계정의 삭제를 막는다
@@ -290,6 +298,10 @@ public class AccountService {
 		this.accountRepository.findByIdForUpdate(accountId)
 				.orElseThrow(() -> new IllegalStateException("토큰이 가리키는 계정의 행이 없다"))
 				.markEmailVerified(this.clock);
+
+		// 7) 같은 계정·목적의 나머지 토큰을 지운다 — 이유는 인증 확인의 4 와 같다 (§11.4, D-28). 계정·refresh_token·login_attempt
+		// 뒤, 마지막에 이 범위를 잡는다 — AU-22 의 잠금 차례는 그대로다. 락 예외를 잡지 않는다 — 확인 전체가 되돌려진다
+		this.accountTokenRepository.deleteOthers(accountId, TokenPurpose.PASSWORD_RESET, used.getId());
 	}
 
 	/**

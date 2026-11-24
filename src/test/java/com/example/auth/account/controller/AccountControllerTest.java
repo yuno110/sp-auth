@@ -12,17 +12,23 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import com.example.auth.account.entity.Account;
 import com.example.auth.account.entity.AccountToken;
 import com.example.auth.account.entity.Role;
 import com.example.auth.account.entity.TokenPurpose;
 import com.example.auth.account.repository.AccountRepository;
 import com.example.auth.account.repository.AccountTokenRepository;
+import com.example.auth.account.service.AccountTokenIssuer;
 import com.example.auth.account.support.AccountTokens;
 import com.example.auth.auth.entity.RefreshToken;
 import com.example.auth.auth.repository.RefreshTokenRepository;
 import com.example.auth.global.config.MailExecutorConfig;
 import com.example.auth.global.security.JwtTokenProvider;
+import com.example.auth.support.BlockedExecutor;
 import com.example.auth.support.InMemoryMailer;
 import com.example.auth.support.MailExecutorDrain;
 import com.example.auth.support.MutableClock;
@@ -42,6 +48,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
@@ -175,10 +182,14 @@ class AccountControllerTest {
 	@Autowired
 	private InMemoryMailer inMemoryMailer;
 
-	/** AU-16 — 발급 작업과 발송이 도는 실행기. 정리와 「더 보낸 메일이 없다」 가 이것이 비기를 기다린다. */
+	/** AU-16 — 발급 작업과 발송 작업이 도는 실행기(AU-24 부터 둘). 정리와 「더 보낸 메일이 없다」 가 둘이 비기를 기다린다. */
 	@Autowired
-	@Qualifier(MailExecutorConfig.MAIL_EXECUTOR)
-	private ThreadPoolTaskExecutor mailExecutor;
+	@Qualifier(MailExecutorConfig.ISSUE_EXECUTOR)
+	private ThreadPoolTaskExecutor issueExecutor;
+
+	@Autowired
+	@Qualifier(MailExecutorConfig.SEND_EXECUTOR)
+	private ThreadPoolTaskExecutor sendExecutor;
 
 	/**
 	 * <b>seed 행은 남긴다.</b> H2 는 테스트 클래스 사이에 공유되므로
@@ -197,7 +208,7 @@ class AccountControllerTest {
 	@AfterEach
 	void 정리() {
 		CLOCK.reset();
-		MailExecutorDrain.drain(this.mailExecutor);
+		MailExecutorDrain.drain(this.issueExecutor, this.sendExecutor);
 		this.inMemoryMailer.clear();
 		this.accountTokenRepository.deleteAllInBatch();
 		this.refreshTokenRepository.deleteAll();
@@ -1500,7 +1511,7 @@ class AccountControllerTest {
 
 	/** 발송 실행기가 빈 뒤에 남은 메일이 없다. 빈 뒤에는 새 메일이 올 곳이 없으므로 기다리지 않고 본다. */
 	private void 더_보낸_메일이_없다() {
-		MailExecutorDrain.drain(this.mailExecutor);
+		MailExecutorDrain.drain(this.issueExecutor, this.sendExecutor);
 		assertThatThrownBy(() -> this.inMemoryMailer.next(Duration.ZERO))
 				.as("더 보낸 메일이 없다")
 				.isInstanceOf(AssertionError.class);
@@ -1969,6 +1980,147 @@ class AccountControllerTest {
 		assertThat(사용_시각(token)).as("사용 처리가 확인의 트랜잭션과 함께 되돌려진다").isNull();
 	}
 
+	// --- AU-24 발급 실행기와 발송 실행기 (sp-docs/plan/phase2-auth-member.md AU-24 의 검증 표) ---
+
+	/**
+	 * 시험용 발송기가 첫 발송을 붙잡은 동안 — SMTP 가 응답하지 않아 발송 스레드가 묶인 상황 — 가입이 들어온다. 발급 작업은
+	 * 발송 실행기 뒤에 줄을 서지 않으므로 발급 대기열이 비고 가입마다 토큰 행이 생기며, 그 메일은 발송 대기열에 쌓인다
+	 * (sp-docs/requirements/member.md §11.5, 2026-11-23 {@code D-28}).
+	 */
+	@Test
+	@DisplayName("발송이 붙잡힌 동안의 가입 N건 — 발급 대기열이 비고 N개 계정의 토큰 행이 생기며 발송 대기열에 메일이 쌓인다")
+	void 붙잡힌_발송_동안의_가입에_토큰이_생긴다() throws Exception {
+		int signups = 3;
+		List<Long> ids = new ArrayList<>();
+		try (InMemoryMailer.Hold hold = this.inMemoryMailer.hold()) {
+			가입한다("au24-held-first@example.com");
+			assertThat(hold.awaitHeld(Duration.ofSeconds(5))).as("첫 발송이 붙잡혔다").isTrue();
+
+			for (int i = 0; i < signups; i++) {
+				ids.add(가입한다("au24-held-" + i + "@example.com"));
+			}
+			// 발급 실행기만 비운다 — 발송 실행기는 붙잡혀 있다
+			MailExecutorDrain.drainOnly(this.issueExecutor);
+
+			assertThat(this.issueExecutor.getThreadPoolExecutor().getQueue()).as("발급 대기열이 비었다").isEmpty();
+			assertThat(this.accountTokenRepository.findAll()).extracting(AccountToken::getAccountId)
+					.as("붙잡힌 발송 동안의 가입마다 토큰 행이 생긴다").containsAll(ids);
+			assertThat(this.sendExecutor.getThreadPoolExecutor().getQueue()).as("그 메일은 발송 대기열에 쌓인다")
+					.hasSize(signups);
+		}
+	}
+
+	/**
+	 * 발급 실행기를 막고 대기열을 채운 뒤 가입과 재설정을 요청한다. 두 발급 작업이 버려지고, WARN 이 종류 발급·계정
+	 * id(가입은 그 id, 재설정은 넣는 순간 모르므로 null)·목적을 적는다. 그 줄에 요청의 이메일·토큰·{@code #token=}·링크의
+	 * 기준 주소가 없다. 처리기가 던지지 않으므로 두 요청은 201·202 로 끝난다 (sp-docs/requirements/member.md §11.5,
+	 * sp-docs/security.md §12).
+	 */
+	@Test
+	@DisplayName("발급 실행기가 버리면 WARN 에 종류 발급·계정 id(재설정은 null)·목적만 있고 요청은 201·202 다")
+	void 발급_실행기가_버리면_WARN_에_종류_계정_목적이_있다() throws Exception {
+		String signupEmail = "au24-issue-discard@example.com";
+		String resetEmail = "au24-issue-discard-reset@example.com";
+		가입한다(resetEmail);
+		MailExecutorDrain.drain(this.issueExecutor, this.sendExecutor);
+		this.inMemoryMailer.clear();
+
+		Long signedUp;
+		List<String> warnings;
+		ListAppender<ILoggingEvent> appender = 실행기_로그를_모은다();
+		try (BlockedExecutor blocked = BlockedExecutor.block(this.issueExecutor).fill()) {
+			signedUp = 가입한다(signupEmail);
+			this.mockMvc.perform(resetRequest("{\"email\": \"" + resetEmail + "\"}"))
+					.andExpect(status().isAccepted());
+			warnings = 경고들(appender);
+		} finally {
+			실행기_로그를_뗀다(appender);
+		}
+
+		assertThat(warnings).hasSize(2);
+		assertThat(warnings.get(0)).contains("kind=ISSUE", "accountId=" + signedUp, "purpose=EMAIL_VERIFICATION");
+		assertThat(warnings.get(1)).contains("kind=ISSUE", "accountId=null", "purpose=PASSWORD_RESET");
+		assertThat(warnings).allSatisfy(line -> assertThat(line)
+				.doesNotContain(signupEmail, resetEmail, "#token=", FRONTEND_BASE_URL));
+		MailExecutorDrain.drain(this.issueExecutor, this.sendExecutor);
+		assertThat(this.accountTokenRepository.findAll()).as("버린 발급 작업은 다시 돌지 않는다")
+				.noneMatch(row -> row.getAccountId().equals(signedUp))
+				.noneMatch(row -> row.getPurpose() == TokenPurpose.PASSWORD_RESET);
+	}
+
+	/**
+	 * 발송 실행기를 막고 대기열을 채운 뒤 가입한다. 발급 작업은 돌아 토큰 행을 넣고, 커밋 뒤 넘긴 발송 작업이 버려진다. WARN 이
+	 * 종류 발송·그 계정 id·목적을 적고, 이메일·{@code #token=}·링크의 기준 주소가 없다. 처리기가 던지지 않으므로 발급 작업의
+	 * 실패 줄도 없다 — 던지면 발급 작업의 catch 로 간다.
+	 */
+	@Test
+	@DisplayName("발송 실행기가 버리면 WARN 에 종류 발송·계정 id·목적만 있고, 가입은 201 이며 발급 작업의 실패 줄이 없다")
+	void 발송_실행기가_버리면_WARN_에_종류_계정_목적이_있다() throws Exception {
+		String email = "au24-send-discard@example.com";
+		Long signedUp;
+		List<String> warnings;
+		List<String> issuerWarnings;
+		ListAppender<ILoggingEvent> appender = 실행기_로그를_모은다();
+		ListAppender<ILoggingEvent> issuerAppender = 로그를_모은다(AccountTokenIssuer.class);
+		try (BlockedExecutor blocked = BlockedExecutor.block(this.sendExecutor).fill()) {
+			signedUp = 가입한다(email);
+			MailExecutorDrain.drainOnly(this.issueExecutor);
+			warnings = 경고들(appender);
+			issuerWarnings = 경고들(issuerAppender);
+		} finally {
+			실행기_로그를_뗀다(appender);
+			로그를_뗀다(AccountTokenIssuer.class, issuerAppender);
+		}
+
+		assertThat(warnings).singleElement().asString()
+				.contains("kind=SEND", "accountId=" + signedUp, "purpose=EMAIL_VERIFICATION")
+				.doesNotContain(email, "#token=", FRONTEND_BASE_URL);
+		assertThat(issuerWarnings).as("발송 작업의 버림이 발급 작업의 실패가 되지 않는다").isEmpty();
+		assertThat(this.accountTokenRepository.findAll()).extracting(AccountToken::getAccountId)
+				.as("발급 작업은 돌았다").containsExactly(signedUp);
+		MailExecutorDrain.drain(this.issueExecutor, this.sendExecutor);
+		assertThatThrownBy(() -> this.inMemoryMailer.next(Duration.ZERO)).as("버린 메일은 나가지 않는다")
+				.isInstanceOf(AssertionError.class);
+	}
+
+	// --- AU-24 도우미 ---
+
+	/** 가입하고 201 을 본 뒤 그 계정 id 를 돌려준다. */
+	private Long 가입한다(String email) throws Exception {
+		String body = this.mockMvc.perform(createRequest(
+						"{\"email\": \"" + email + "\", \"password\": \"" + RAW_PASSWORD + "\"}"))
+				.andExpect(status().isCreated())
+				.andReturn().getResponse().getContentAsString(StandardCharsets.UTF_8);
+		return ((Number) JsonPath.read(body, "$.data.accountId")).longValue();
+	}
+
+	private static ListAppender<ILoggingEvent> 실행기_로그를_모은다() {
+		return 로그를_모은다(MailExecutorConfig.class);
+	}
+
+	private static void 실행기_로그를_뗀다(ListAppender<ILoggingEvent> appender) {
+		로그를_뗀다(MailExecutorConfig.class, appender);
+	}
+
+	private static ListAppender<ILoggingEvent> 로그를_모은다(Class<?> loggerClass) {
+		ListAppender<ILoggingEvent> appender = new ListAppender<>();
+		appender.start();
+		((Logger) LoggerFactory.getLogger(loggerClass)).addAppender(appender);
+		return appender;
+	}
+
+	private static void 로그를_뗀다(Class<?> loggerClass, ListAppender<ILoggingEvent> appender) {
+		((Logger) LoggerFactory.getLogger(loggerClass)).detachAppender(appender);
+		appender.stop();
+	}
+
+	private static List<String> 경고들(ListAppender<ILoggingEvent> appender) {
+		return appender.list.stream()
+				.filter(event -> event.getLevel().isGreaterOrEqual(Level.WARN))
+				.map(ILoggingEvent::getFormattedMessage)
+				.toList();
+	}
+
 	// --- AU-17 도우미 ---
 
 	private static MockHttpServletRequestBuilder resetRequest(String json) {
@@ -2001,7 +2153,7 @@ class AccountControllerTest {
 	 * 메일을 버린다 — 가입이 넘긴 인증 메일이 섞이지 않는다.
 	 */
 	private String 재설정을_요청하고_토큰을_꺼낸다(String email) throws Exception {
-		MailExecutorDrain.drain(this.mailExecutor);
+		MailExecutorDrain.drain(this.issueExecutor, this.sendExecutor);
 		this.inMemoryMailer.clear();
 		this.mockMvc.perform(resetRequest("{\"email\": \"" + email + "\"}"))
 				.andExpect(status().isAccepted());
@@ -2017,7 +2169,7 @@ class AccountControllerTest {
 	 */
 	private IssuedTokens 재설정할_계정과_세션을_만든다(String email) throws Exception {
 		IssuedTokens tokens = 계정과_세션을_만든다(email);
-		MailExecutorDrain.drain(this.mailExecutor);
+		MailExecutorDrain.drain(this.issueExecutor, this.sendExecutor);
 		this.inMemoryMailer.clear();
 		return tokens;
 	}

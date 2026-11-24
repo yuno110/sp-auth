@@ -18,6 +18,7 @@ import com.example.auth.account.entity.TokenPurpose;
 import com.example.auth.account.repository.AccountRepository;
 import com.example.auth.account.repository.AccountTokenRepository;
 import com.example.auth.global.config.MailExecutorConfig;
+import com.example.auth.global.config.MailExecutorTask;
 import com.example.auth.mail.MailDispatcher;
 import com.example.auth.mail.MailSettings;
 import com.example.auth.mail.OutgoingMail;
@@ -73,7 +74,7 @@ import org.springframework.transaction.support.TransactionTemplate;
  * 차례로 돌려({@link #넘겨받은_작업을_돌린다()}) 메일이 없다는 단언도 기다림 없이 확정한다. 발송기는 받은 메일을
  * 모은다({@link #delivered}). 시계는 {@link MutableClock} 이고 발송 상한도 그 시계로 만든다.
  *
- * <p>애플리케이션의 빈이 발송 실행기에서 도는지는 {@link #빈은_작업을_발송_실행기에서_돌린다()} 가 본다.
+ * <p>애플리케이션의 빈이 발급 실행기에서 돌고 메일이 발송 실행기에서 나가는지는 {@link #빈은_작업을_발급_실행기에서_돌린다()} 가 본다.
  *
  * <p>테스트끼리 같은 DB 를 쓰므로 계정의 이메일은 테스트마다 다르고, 테스트가 끝나면 만든 행을 지운다.
  */
@@ -279,7 +280,7 @@ class AccountTokenIssuerTest {
 	// --- 앞 토큰 (sp-docs/requirements/member.md §11.1) ---
 
 	@Test
-	@DisplayName("같은 계정·목적의 둘째 발급은 앞 토큰을 지운다 — 다른 목적의 토큰은 남는다")
+	@DisplayName("같은 계정·목적의 둘째 발급은 발송이 끝난 뒤 앞 토큰이 지워져 있다 — 다른 목적의 토큰은 남는다")
 	void 둘째_발급은_앞_토큰을_지운다() {
 		Account account = 계정("au15-second@example.com");
 
@@ -328,7 +329,7 @@ class AccountTokenIssuerTest {
 
 	/**
 	 * 모든 단계가 돈 뒤 커밋 자리에서 되돌린다 — 실제 관리자로 되돌리고 커밋 실패를 던진다. 커밋 뒤 발송을 건 다음이므로
-	 * 메일이 커밋을 기다리는지를 본다. 같은 트랜잭션의 앞 토큰 지우기도 되돌려지고, 잡았던 상한의 한 통도 돌아온다 — 앞서
+	 * 메일이 커밋을 기다리는지를 본다. 새 토큰도 되돌려져 앞 토큰 하나만 남고, 잡았던 상한의 한 통도 돌아온다 — 앞서
 	 * 보낸 한 통에 더해 두 통을 더 보낼 수 있고 그다음이 상한이다.
 	 */
 	@Test
@@ -351,7 +352,7 @@ class AccountTokenIssuerTest {
 		verify(rollingBack).commit(any());
 		assertThat(this.delivered).as("앞서 보낸 한 통뿐이다").hasSize(1);
 		assertThat(토큰_행(account.getId())).extracting(row -> row.get("token_hash"))
-				.as("앞 토큰 지우기도 되돌려졌다").containsExactly(sha256Hex(previous));
+				.as("되돌려진 발급은 행을 남기지 않고 앞 토큰은 그대로다").containsExactly(sha256Hex(previous));
 		ILoggingEvent warning = 경고_한_줄();
 		assertThat(warning.getFormattedMessage())
 				.contains("issue failed", "accountId=" + account.getId(), "purpose=" + TokenPurpose.PASSWORD_RESET,
@@ -421,30 +422,57 @@ class AccountTokenIssuerTest {
 		assertThat(this.delivered).isEmpty();
 	}
 
+	/**
+	 * 발급 실행기의 거부 처리기는 작업의 형에서 종류·계정 id·목적만 꺼낸다 (AU-24, sp-docs/requirements/member.md §11.5).
+	 * 재설정·재발송은 넣는 순간 계정을 모르므로 id 가 없다 — 이메일을 대신 싣지 않는다.
+	 */
+	@Test
+	@DisplayName("넘기는 발급 작업은 작업의 형이다 — 가입은 계정 id 를, 재설정은 null 을 싣고 이메일을 싣지 않는다")
+	void 넘기는_발급_작업은_작업의_형이다() {
+		Account account = 계정("au15-task-type@example.com");
+		this.issuer.request(TokenPurpose.PASSWORD_RESET, account.getEmail());
+		new TransactionTemplate(this.transactionManager).executeWithoutResult(
+				status -> this.issuer.requestAfterCommit(TokenPurpose.EMAIL_VERIFICATION, account.getId()));
+
+		assertThat(this.handedOver).hasSize(2).allSatisfy(task -> assertThat(task)
+				.isInstanceOf(MailExecutorTask.class)
+				.asString().doesNotContain(account.getEmail()));
+		MailExecutorTask reset = (MailExecutorTask) this.handedOver.get(0);
+		MailExecutorTask signup = (MailExecutorTask) this.handedOver.get(1);
+		assertThat(reset.kind()).isEqualTo(MailExecutorTask.Kind.ISSUE);
+		assertThat(reset.accountId()).isNull();
+		assertThat(reset.purpose()).isEqualTo("PASSWORD_RESET");
+		assertThat(signup.kind()).isEqualTo(MailExecutorTask.Kind.ISSUE);
+		assertThat(signup.accountId()).isEqualTo(account.getId());
+		assertThat(signup.purpose()).isEqualTo("EMAIL_VERIFICATION");
+		this.handedOver.clear();
+	}
+
 	// --- 애플리케이션의 배선 ---
 
 	@Autowired
 	private AccountTokenIssuer applicationIssuer;
 
 	@Autowired
-	@Qualifier(MailExecutorConfig.MAIL_EXECUTOR)
-	private ThreadPoolTaskExecutor mailExecutor;
+	@Qualifier(MailExecutorConfig.ISSUE_EXECUTOR)
+	private ThreadPoolTaskExecutor issueExecutor;
 
 	@Autowired
 	private InMemoryMailer inMemoryMailer;
 
 	/**
-	 * 발송 실행기의 스레드를 막아 둔 채 요청한다. 그 스레드가 하나라(2026-11-13 MailExecutorConfig 읽기) 발급 작업은 그
-	 * 실행기의 대기열에 머문다 — 대기열에 없거나 막힌 동안 행이 생기면 다른 곳에서 돈 것이다.
+	 * 발급 실행기의 스레드를 막아 둔 채 요청한다. 그 스레드가 하나라({@link MailExecutorConfig}) 발급 작업은 그 실행기의
+	 * 대기열에 머문다 — 대기열에 없거나 막힌 동안 행이 생기면 다른 곳에서 돈 것이다. 메일은 발송 실행기의 스레드에서 나간다
+	 * (AU-24).
 	 */
 	@Test
-	@DisplayName("빈은 작업을 발송 실행기에서 돌린다 — 부른 스레드가 돌려준 뒤에 행과 메일이 생긴다")
-	void 빈은_작업을_발송_실행기에서_돌린다() throws InterruptedException {
+	@DisplayName("빈은 작업을 발급 실행기에서 돌린다 — 부른 스레드가 돌려준 뒤에 행이 생기고 메일은 발송 실행기에서 나간다")
+	void 빈은_작업을_발급_실행기에서_돌린다() throws InterruptedException {
 		Account account = 계정("au15-bean@example.com");
 		this.inMemoryMailer.clear();
 		CountDownLatch blocked = new CountDownLatch(1);
 		CountDownLatch release = new CountDownLatch(1);
-		this.mailExecutor.execute(() -> {
+		this.issueExecutor.execute(() -> {
 			blocked.countDown();
 			try {
 				release.await(10, TimeUnit.SECONDS);
@@ -456,7 +484,7 @@ class AccountTokenIssuerTest {
 
 		try {
 			this.applicationIssuer.request(TokenPurpose.PASSWORD_RESET, account.getEmail());
-			assertThat(this.mailExecutor.getThreadPoolExecutor().getQueue()).as("작업은 발송 실행기의 대기열에 있다")
+			assertThat(this.issueExecutor.getThreadPoolExecutor().getQueue()).as("작업은 발급 실행기의 대기열에 있다")
 					.hasSize(1);
 			assertThat(토큰_행(account.getId())).as("부른 스레드에서 돌지 않았다").isEmpty();
 		} finally {
@@ -465,7 +493,7 @@ class AccountTokenIssuerTest {
 
 		InMemoryMailer.Sent sent = this.inMemoryMailer.next(Duration.ofSeconds(5));
 		assertThat(sent.mail().to()).isEqualTo(account.getEmail());
-		assertThat(sent.threadName()).startsWith(MailExecutorConfig.THREAD_NAME_PREFIX);
+		assertThat(sent.threadName()).startsWith(MailExecutorConfig.SEND_THREAD_NAME_PREFIX);
 		assertThat(토큰_행(account.getId())).hasSize(1);
 	}
 

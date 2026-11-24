@@ -66,9 +66,12 @@ public interface AccountTokenRepository extends JpaRepository<AccountToken, Long
 	Optional<AccountToken> findByTokenHash(String tokenHash);
 
 	/**
-	 * 같은 계정·같은 목적의 행을 지운다. 발급이 새 행을 넣기 전에 부른다 — 마지막 메일의 링크만
-	 * 산다 (sp-docs/requirements/member.md §11.1). {@code idx_account_token_account_purpose} 가 이
-	 * 삭제를 위한 인덱스다 (sp-docs/domain-model.md §2.3).
+	 * 발송 뒤의 지우기 — 같은 계정·같은 목적에서 <b>id 가 새 토큰보다 작은 행</b>을 지운다 (sp-docs/domain-model.md §2.4,
+	 * sp-docs/requirements/member.md §11.1). 새 토큰의 메일이 SMTP 에 넘겨진 뒤 발송 작업이 자기 트랜잭션에서 부른다.
+	 *
+	 * <p>「새 행 말고 전부」 가 아니다 — 겹친 두 발급에서 먼저 끝난 발송이 나중 행, 곧 도착할 메일의 링크를 지우지 않게 한다.
+	 * {@code id} 는 IDENTITY 라 나중에 넣은 행이 크다. {@code idx_account_token_account_purpose} 가 이 지우기의 인덱스다
+	 * (sp-docs/domain-model.md §2.3).
 	 *
 	 * @return 지운 행 수
 	 */
@@ -77,9 +80,32 @@ public interface AccountTokenRepository extends JpaRepository<AccountToken, Long
 			delete from AccountToken t
 			 where t.accountId = :accountId
 			   and t.purpose = :purpose
+			   and t.id < :newId
 			""")
-	int deleteByAccountIdAndPurpose(@Param("accountId") Long accountId,
-			@Param("purpose") TokenPurpose purpose);
+	int deletePreceding(@Param("accountId") Long accountId,
+			@Param("purpose") TokenPurpose purpose,
+			@Param("newId") Long newId);
+
+	/**
+	 * 확인 뒤의 지우기 — 같은 계정·같은 목적에서 <b>방금 쓴 토큰 말고</b> 나머지 행을 지운다 (sp-docs/domain-model.md §2.4,
+	 * sp-docs/requirements/member.md §11.2 의 4·§11.4 의 7). 확인의 트랜잭션 안, 확인의 마지막에 부른다 — 확인이 되돌려지면
+	 * 이 지우기도 없다.
+	 *
+	 * <p>이 문장에서 난 락 예외(교착·대기 시간 초과)를 부르는 쪽이 잡아 삼키지 않는다 — 확인 전체가 되돌려져야 한다
+	 * (sp-docs/plan/phase2-auth-member.md AU-24 의 완료 기준 (b)).
+	 *
+	 * @return 지운 행 수
+	 */
+	@Modifying(flushAutomatically = true, clearAutomatically = true)
+	@Query("""
+			delete from AccountToken t
+			 where t.accountId = :accountId
+			   and t.purpose = :purpose
+			   and t.id <> :usedId
+			""")
+	int deleteOthers(@Param("accountId") Long accountId,
+			@Param("purpose") TokenPurpose purpose,
+			@Param("usedId") Long usedId);
 
 	/**
 	 * 만료된 행을 지운다 — 정리 작업의 문장이다 (sp-docs/domain-model.md §2.4). 만료는 사용 처리({@link #consumeAt})의

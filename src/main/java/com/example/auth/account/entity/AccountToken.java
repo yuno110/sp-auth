@@ -81,8 +81,9 @@ public class AccountToken {
 	 * <p>발급 시각과 만료 시각을 앱 시계의 값으로 정하고 <b>둘 다 초로 자른다</b>. 그래서 수명은
 	 * 발급 순간부터 최대 1초 짧을 수 있고 길어지지 않는다 (sp-docs/domain-model.md §2.4).
 	 *
-	 * <p>같은 계정·같은 목적의 앞 행을 지우는 것은 이 메서드가 아니라 발급하는 쪽의 일이다
-	 * ({@code AccountTokenRepository.deleteByAccountIdAndPurpose(...)}).
+	 * <p>같은 계정·같은 목적의 다른 행을 지우는 것은 이 메서드의 일이 아니다 — 앞 행은 메일이 SMTP 에 넘겨진 뒤 발송 작업이
+	 * ({@code AccountTokenRepository.deletePreceding(...)}), 나머지는 확인이 성공할 때 확인 트랜잭션이
+	 * ({@code AccountTokenRepository.deleteOthers(...)}) 지운다.
 	 *
 	 * @param tokenHash 토큰 문자열(UTF-8)의 SHA-256 소문자 hex
 	 * @param lifetime 목적의 수명 (sp-docs/requirements/member.md §11.1)

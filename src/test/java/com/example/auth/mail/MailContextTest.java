@@ -50,12 +50,12 @@ class MailContextTest {
 		OutgoingMail mail = new OutgoingMail(7L, "EMAIL_VERIFICATION", "member@example.com", "제목", "본문");
 
 		new TransactionTemplate(this.transactionManager)
-				.executeWithoutResult(status -> this.mailDispatcher.sendAfterCommit(mail));
+				.executeWithoutResult(status -> this.mailDispatcher.sendAfterCommit(mail, () -> { }));
 
 		InMemoryMailer.Sent sent = this.inMemoryMailer.next(Duration.ofSeconds(5));
 		assertThat(sent.mail()).isEqualTo(mail);
 		assertThat(sent.threadName())
-				.startsWith(MailExecutorConfig.THREAD_NAME_PREFIX)
+				.startsWith(MailExecutorConfig.SEND_THREAD_NAME_PREFIX)
 				.isNotEqualTo(Thread.currentThread().getName());
 	}
 

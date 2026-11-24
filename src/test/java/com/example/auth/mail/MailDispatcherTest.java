@@ -14,6 +14,7 @@ import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
 import com.example.auth.global.config.MailExecutorConfig;
+import com.example.auth.global.config.MailExecutorTask;
 import com.example.auth.support.InMemoryMailer;
 import java.util.ArrayList;
 import java.util.List;
@@ -56,6 +57,9 @@ class MailDispatcherTest {
 	private static final OutgoingMail MAIL =
 			new OutgoingMail(7L, "EMAIL_VERIFICATION", RECIPIENT, SUBJECT, "아래 링크를 연다\n" + LINK);
 
+	/** 보낸 뒤의 일이 없는 발송. 그 일을 보는 테스트는 따로 넘긴다. */
+	private static final Runnable NOTHING = () -> { };
+
 	private final List<Runnable> handedOver = new ArrayList<>();
 
 	private final List<OutgoingMail> delivered = new ArrayList<>();
@@ -68,7 +72,7 @@ class MailDispatcherTest {
 		MailDispatcher dispatcher = dispatcher(this.delivered::add);
 
 		this.transaction.executeWithoutResult(status -> {
-			dispatcher.sendAfterCommit(MAIL);
+			dispatcher.sendAfterCommit(MAIL, NOTHING);
 			assertThat(this.handedOver).as("커밋 전에는 아무것도 넘기지 않는다").isEmpty();
 		});
 
@@ -79,13 +83,32 @@ class MailDispatcherTest {
 		assertThat(this.delivered).containsExactly(MAIL);
 	}
 
+	/**
+	 * 발송 실행기의 거부 처리기는 작업의 형에서 종류·계정 id·목적만 꺼낸다 (AU-24, sp-docs/security.md §12). 넘긴 작업이 그
+	 * 형이 아니면 버림 WARN 이 「종류를 모른다」 가 된다.
+	 */
+	@Test
+	@DisplayName("넘기는 작업은 발송 작업의 형이고 메일의 계정 id·목적을 싣는다 — toString 에 주소·링크가 없다")
+	void 넘기는_작업은_발송_작업의_형이다() {
+		MailDispatcher dispatcher = dispatcher(this.delivered::add);
+
+		this.transaction.executeWithoutResult(status -> dispatcher.sendAfterCommit(MAIL, NOTHING));
+
+		assertThat(this.handedOver).singleElement().isInstanceOfSatisfying(MailExecutorTask.class, task -> {
+			assertThat(task.kind()).isEqualTo(MailExecutorTask.Kind.SEND);
+			assertThat(task.accountId()).isEqualTo(7L);
+			assertThat(task.purpose()).isEqualTo("EMAIL_VERIFICATION");
+			assertThat(task.toString()).doesNotContain(RECIPIENT, TOKEN, LINK, "#token=");
+		});
+	}
+
 	@Test
 	@DisplayName("트랜잭션 안에서 건 발송이 되돌려지면 보내지 않는다")
 	void 되돌려지면_보내지_않는다() {
 		MailDispatcher dispatcher = dispatcher(this.delivered::add);
 
 		assertThatThrownBy(() -> this.transaction.executeWithoutResult(status -> {
-			dispatcher.sendAfterCommit(MAIL);
+			dispatcher.sendAfterCommit(MAIL, NOTHING);
 			throw new IllegalStateException("가입이 실패해 되돌린다");
 		})).isInstanceOf(IllegalStateException.class);
 
@@ -98,7 +121,7 @@ class MailDispatcherTest {
 	void 트랜잭션_밖에서_부르면_실패한다() {
 		MailDispatcher dispatcher = dispatcher(this.delivered::add);
 
-		assertThatThrownBy(() -> dispatcher.sendAfterCommit(MAIL)).isInstanceOf(IllegalStateException.class);
+		assertThatThrownBy(() -> dispatcher.sendAfterCommit(MAIL, NOTHING)).isInstanceOf(IllegalStateException.class);
 
 		assertThat(this.handedOver).isEmpty();
 		assertThat(this.delivered).isEmpty();
@@ -118,7 +141,7 @@ class MailDispatcherTest {
 				.when(javaMailSender).send(any(SimpleMailMessage.class));
 		MailDispatcher dispatcher = dispatcher(new SmtpMailer(javaMailSender,
 				new MailSettings("no-reply@localhost", "http://localhost:3000")));
-		this.transaction.executeWithoutResult(status -> dispatcher.sendAfterCommit(MAIL));
+		this.transaction.executeWithoutResult(status -> dispatcher.sendAfterCommit(MAIL, NOTHING));
 
 		ListAppender<ILoggingEvent> appender = attachAppender();
 		try {
@@ -144,6 +167,73 @@ class MailDispatcherTest {
 		assertThat(line.getThrowableProxy()).as("예외를 붙이면 메시지와 스택이 함께 남는다").isNull();
 	}
 
+	// --- 보낸 뒤의 일 (AU-24, sp-docs/requirements/member.md §11.5) ---
+
+	@Test
+	@DisplayName("보낸 뒤의 일은 SMTP 에 넘기는 데 성공한 뒤에 한 번 돈다 — 커밋 전·넘기기 전에는 돌지 않는다")
+	void 보낸_뒤의_일은_성공한_뒤에_돈다() {
+		List<String> order = new ArrayList<>();
+		MailDispatcher dispatcher = dispatcher(mail -> order.add("sent"));
+
+		this.transaction.executeWithoutResult(status -> dispatcher.sendAfterCommit(MAIL, () -> order.add("after")));
+		assertThat(order).as("커밋 뒤 넘기기만 했다").isEmpty();
+
+		this.handedOver.get(0).run();
+		assertThat(order).containsExactly("sent", "after");
+	}
+
+	@Test
+	@DisplayName("발송이 실패하면 보낸 뒤의 일을 부르지 않는다")
+	void 발송이_실패하면_보낸_뒤의_일이_없다() {
+		List<String> after = new ArrayList<>();
+		MailDispatcher dispatcher = dispatcher(mail -> {
+			throw new MailSendException("rejected");
+		});
+		this.transaction.executeWithoutResult(status -> dispatcher.sendAfterCommit(MAIL, () -> after.add("after")));
+
+		ListAppender<ILoggingEvent> appender = attachAppender();
+		try {
+			this.handedOver.get(0).run();
+		} finally {
+			detachAppender(appender);
+		}
+
+		assertThat(after).isEmpty();
+		assertThat(appender.list).extracting(ILoggingEvent::getFormattedMessage).singleElement().asString()
+				.startsWith("mail send failed");
+	}
+
+	/**
+	 * 검증표 「발송 뒤의 지우기가 실패한다」 의 발송기 쪽. 그 일이 던지는 예외의 메시지에 토큰·링크·주소를 넣는다 — 로그 줄이
+	 * 예외를 싣거나 메시지를 옮기면 깨진다. 메일은 나갔으므로 「발송 실패」 줄이 없다.
+	 */
+	@Test
+	@DisplayName("보낸 뒤의 일이 던지면 WARN 한 줄(계정 id·목적·예외의 종류)로 끝낸다 — 「발송 실패」 줄이 없고 토큰·링크·주소가 없다")
+	void 보낸_뒤의_일이_던지면_WARN_한_줄이다() {
+		MailDispatcher dispatcher = dispatcher(this.delivered::add);
+		this.transaction.executeWithoutResult(status -> dispatcher.sendAfterCommit(MAIL, () -> {
+			throw new IllegalStateException("delete failed " + RECIPIENT + " " + LINK);
+		}));
+
+		ListAppender<ILoggingEvent> appender = attachAppender();
+		try {
+			assertThatCode(() -> this.handedOver.get(0).run()).doesNotThrowAnyException();
+		} finally {
+			detachAppender(appender);
+		}
+
+		assertThat(this.delivered).containsExactly(MAIL);
+		List<ILoggingEvent> warnings = appender.list.stream()
+				.filter(event -> event.getLevel().isGreaterOrEqual(Level.WARN))
+				.toList();
+		assertThat(warnings).hasSize(1);
+		assertThat(warnings.get(0).getFormattedMessage())
+				.contains("after-send work failed", "accountId=7", "purpose=EMAIL_VERIFICATION",
+						IllegalStateException.class.getName())
+				.doesNotContain("mail send failed", TOKEN, LINK, RECIPIENT);
+		assertThat(warnings.get(0).getThrowableProxy()).isNull();
+	}
+
 	@Test
 	@DisplayName("메일의 toString 은 받는 주소·제목·본문을 내지 않는다")
 	void 메일의_toString_은_본문을_내지_않는다() {
@@ -160,7 +250,7 @@ class MailDispatcherTest {
 	 */
 	private final ApplicationContextRunner selection = new ApplicationContextRunner()
 			.withUserConfiguration(MailDispatcher.class, SmtpMailer.class)
-			.withBean(MailExecutorConfig.MAIL_EXECUTOR, Executor.class, () -> Runnable::run)
+			.withBean(MailExecutorConfig.SEND_EXECUTOR, Executor.class, () -> Runnable::run)
 			.withBean(JavaMailSender.class, JavaMailSenderImpl::new)
 			.withBean(MailSettings.class, () -> new MailSettings("no-reply@localhost", "http://localhost:3000"));
 

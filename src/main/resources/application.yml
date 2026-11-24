@@ -84,12 +84,20 @@ cors:
 #   from               보내는 주소. 정책값이라 기본값이 없다
 #   frontend-base-url  메일 링크의 기준 주소(화면의 오리진). 정책값이라 기본값이 없고 http·https 의
 #                      절대 URL 이어야 한다. 요청의 Host 로 대신하지 않는다 (sp-docs/security.md §12)
-#   executor.queue-capacity  발송 대기열의 상한. 편의값이다. 차면 그 작업을 버리고 WARN
+#   executor.issue.queue-capacity  발급 작업(계정 찾기·발송 상한·토큰 넣기 — DB 일만)의 대기열 상한. 편의값이다.
+#                                  보내지 않을 요청(없는 이메일의 재설정·재발송 등)도 한 칸을 쓴다
+#   executor.send.queue-capacity   발송 작업(SMTP 에 넘기기)의 대기열 상한. 편의값이다. 실제로 나갈 메일만 한 칸을 쓴다
+#   둘 다 차면 그 작업을 버리고 WARN(작업의 종류·계정 id·목적)을 남긴다. 100 은 둘 다 앞 판의 한 대기열 값을 그대로 둔 것이다.
+#   앞 판의 키 mail.executor.queue-capacity 는 2026-11-23 D-28 부터 읽히지 않는다 — 로컬 설정이나 기동 인자에 남아 있으면
+#   새 두 키로 옮긴다 (sp-docs/tech-stack.md §4.7)
 mail:
   from: ${MAIL_FROM}
   frontend-base-url: ${FRONTEND_BASE_URL}
   executor:
-    queue-capacity: 100
+    issue:
+      queue-capacity: 100
+    send:
+      queue-capacity: 100
 
 # 만료된 account_token·오래된 login_attempt 의 정리 주기 (sp-docs/tech-stack.md §4.7, sp-docs/domain-model.md §2.4·§2.5).
 # 편의값이다 — 판정에 영향이 없고, 정리가 늦은 만큼 행이 더 머문다. 첫 실행도 기동 뒤 이만큼 늦춘다 (AccountCleanup)

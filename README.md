@@ -166,7 +166,7 @@ rate-limit:
 
 **비밀값과 정책값에는 기본값을 두지 않는다.** 임의 기본값을 두면 그 값이 정해진 정책인지 임시값인지 구분할 수 없고 운영에 그대로 나간다. 없으면 기동이 실패하는 것이 의도된 동작이다.
 
-메일 값은 `MailStartupGuard`가 기동 시점에 본다. `MAIL_HOST`·`MAIL_PORT`·`MAIL_FROM`·`FRONTEND_BASE_URL`은 해석되지 않은 `${…}`도 빈 값도 통과하지 않고, `MAIL_USERNAME`·`MAIL_PASSWORD`는 해석되지 않은 `${…}`가 통과하지 않는다. `prod`는 SMTP에 STARTTLS를 필수로 요구한다(`application-prod.yml`). SMTP 타임아웃(연결 5초·읽기 10초·쓰기 10초)과 발송 대기열 상한(`mail.executor.queue-capacity`, 100)은 `application.yml`에 값으로 적혀 있다 (`sp-docs/tech-stack.md` §4.7).
+메일 값은 `MailStartupGuard`가 기동 시점에 본다. `MAIL_HOST`·`MAIL_PORT`·`MAIL_FROM`·`FRONTEND_BASE_URL`은 해석되지 않은 `${…}`도 빈 값도 통과하지 않고, `MAIL_USERNAME`·`MAIL_PASSWORD`는 해석되지 않은 `${…}`가 통과하지 않는다. `prod`는 SMTP에 STARTTLS를 필수로 요구한다(`application-prod.yml`). SMTP 타임아웃(연결 5초·읽기 10초·쓰기 10초)과 발급·발송 대기열 상한(`mail.executor.issue.queue-capacity`·`mail.executor.send.queue-capacity`, 둘 다 100)은 `application.yml`에 값으로 적혀 있다 (`sp-docs/tech-stack.md` §4.7). 옛 키 `mail.executor.queue-capacity` 는 AU-24 부터 읽히지 않으므로, 로컬 설정이나 기동 인자에 있으면 두 키로 옮긴다.
 
 시간대는 실행 환경이 정한다. 환경변수로 넘길 것은 없고, JVM이 KST가 아니어도 DB 경계는 고정된다 (`sp-docs/tech-stack.md` §6.2).
 
