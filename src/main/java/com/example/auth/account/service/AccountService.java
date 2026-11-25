@@ -27,6 +27,7 @@ import com.example.auth.global.error.ErrorCode;
 import com.example.auth.global.security.LoginAccount;
 import java.time.Clock;
 import lombok.RequiredArgsConstructor;
+import org.hibernate.exception.ConstraintViolationException;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.Page;
 import org.springframework.security.crypto.password.PasswordEncoder;
@@ -49,6 +50,14 @@ import org.springframework.transaction.support.TransactionTemplate;
 @Service
 @RequiredArgsConstructor
 public class AccountService {
+
+	/**
+	 * {@code V1__create_account.sql} 이 선언한 이메일 UNIQUE 제약이다 (sp-docs/domain-model.md §2.3).
+	 *
+	 * <p><b>{@code contains} 로 본다. {@code equals} 는 깨진다</b> — 방언이 이름을 변형한다. 프로젝트의 테스트 H2 에서 Hibernate 가
+	 * 꺼낸 실측값은 {@code public.uk_account_email_INDEX_4} 다 (2026-11-25 AU-25).
+	 */
+	private static final String UK_ACCOUNT_EMAIL = "uk_account_email";
 
 	private final AccountRepository accountRepository;
 
@@ -127,15 +136,40 @@ public class AccountService {
 			// DataIntegrityViolationException 이 500 C005 로 새어 나간다
 			saved = this.accountRepository.saveAndFlush(account);
 		} catch (DataIntegrityViolationException e) {
-			// 위 검사와 INSERT 사이에 다른 요청이 같은 이메일을 선점한 경우다.
-			// uk_account_email 이 최종 방어선이고, 사용자에게는 중복과 같은 상황이므로 AU002 다
-			throw new BusinessException(ErrorCode.EMAIL_DUPLICATED);
+			// uk_account_email 의 위반만 AU002 다 — 위 검사와 INSERT 사이에 다른 요청이 같은 이메일을 선점한 경우다.
+			// 그 제약이 최종 방어선이고, 사용자에게는 중복과 같은 상황이다 (sp-docs/api-contract.md §2.3)
+			if (constraintNameOf(e).contains(UK_ACCOUNT_EMAIL)) {
+				// 이 충돌에 Hibernate 가 남기는 ERROR 는 logback-spring.xml 의 필터가 버린다 (sp-docs/conventions.md §8.1).
+				// 흔적은 그 로거의 WARN 이 남기므로 여기서 로그를 더하지 않는다
+				throw new BusinessException(ErrorCode.EMAIL_DUPLICATED);
+			}
+			// 그 밖의 위반(예: created_at 의 NOT NULL 위반 같은 서버 설정 오류)은 다시 던진다. AU002 로 바꾸면 서버의 결함이
+			// 「이미 사용 중인 이메일」 로 위장되고 ERROR 도 남지 않는다 — 마지막 그물이 500 C005 와 ERROR 로 드러낸다
+			// (sp-docs/conventions.md §6.1·§8.1 의 가입 블록인용, AGENTS.md 불변식 9)
+			throw e;
 		}
 
 		// 이 트랜잭션에 거는 것이다 — 커밋되면 그때 발급 작업이 발급 실행기로 넘어가고, 되돌려지면 넘어가지 않는다.
 		// 바깥 트랜잭션에 참여한 호출이면 그 바깥의 커밋을 기다린다
 		this.accountTokenIssuer.requestAfterCommit(TokenPurpose.EMAIL_VERIFICATION, saved.getId());
 		return AccountResponse.from(saved);
+	}
+
+	/**
+	 * 깨진 제약의 이름. 없으면 빈 문자열이다 — NOT NULL 위반처럼 이름이 없는 경우가 있다. 방법은 sp-member {@code MemberService} 의
+	 * 같은 이름의 메서드와 같다 (sp-docs/plan/phase2-auth-member.md AU-25).
+	 *
+	 * <p>{@link DataIntegrityViolationException} 자체는 제약 이름을 노출하지 않으므로 Hibernate 의
+	 * {@link ConstraintViolationException} 까지 원인 사슬을 내려간다. <b>바깥 예외의 메시지로 맞추지 않는다</b> — 그 메시지에는
+	 * 드라이버의 위반 문면과 함께 사용자가 고른 이메일이 실린다.
+	 */
+	private static String constraintNameOf(DataIntegrityViolationException e) {
+		for (Throwable cause = e.getCause(); cause != null; cause = cause.getCause()) {
+			if (cause instanceof ConstraintViolationException violation && violation.getConstraintName() != null) {
+				return violation.getConstraintName();
+			}
+		}
+		return "";
 	}
 
 	/**

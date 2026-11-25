@@ -42,6 +42,7 @@ import com.example.auth.support.InMemoryMailer;
 import com.example.auth.support.MailExecutorDrain;
 import com.example.auth.support.RecordingStatementInspector;
 import com.example.auth.support.TestRsaKeys;
+import java.sql.SQLException;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.LocalDateTime;
@@ -55,13 +56,18 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Pattern;
+import java.util.stream.Stream;
 import org.assertj.core.api.SoftAssertions;
+import org.hibernate.exception.ConstraintViolationException;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.mockito.AdditionalAnswers;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mockito;
 import org.mockito.stubbing.Answer;
@@ -281,26 +287,124 @@ class AccountServiceTest {
 	/**
 	 * 사전 검사와 INSERT 사이의 경합. {@code uk_account_email} 위반이 그대로 올라가면
 	 * {@code GlobalExceptionHandler} 의 마지막 그물에 걸려 <b>500 {@code C005}</b> 가 된다.
-	 * 경합은 실제로 재현할 수 없으므로 리포지터리를 스텁으로 두고 그 경로만 좁게 본다.
+	 *
+	 * <p><b>위반은 H2 의 실제 위반이다</b> (sp-docs/plan/phase2-auth-member.md AU-25 의 (b)). 사전 검사의 대역이 「없다」 고 답하기
+	 * 전에 같은 이메일의 행을 실제 리포지터리로 넣는다 — 그 저장은 자기 트랜잭션에서 커밋되어, 다른 요청이 먼저 선점한 것과 같다.
+	 * 그 뒤의 계정 INSERT 는 실제 리포지터리가 하고 Hibernate 가 H2 의 오류에서 만든 위반이 그대로 올라온다. 대역은 사전 검사와,
+	 * 저장이 던진 위반을 적어 두는 자리뿐이다 — 나머지는 실제 리포지터리에 넘긴다.
+	 *
+	 * <p>잡는 코드는 위반이 원인 사슬에 실은 제약 이름으로 가른다(AU-25). H2 는 그 이름에 접두어와 접미사를 붙이므로
+	 * ({@code public.uk_account_email_INDEX_4}, 2026-11-25 AU-25 실측) 이름을 같음으로 맞추면 이 테스트가 깨진다. AU-25 전의
+	 * 대역은 원인 사슬이 없는 {@code DataIntegrityViolationException("uk_account_email")} 을 던졌다 — 이름이 없어 좁힌 잡는
+	 * 코드에서는 그 밖의 위반이다({@link #그_밖의_무결성_위반은_같은_예외로_다시_던진다}).
+	 *
+	 * <p>스텁 생성자로 만든 서비스라 트랜잭션 프록시를 지나지 않는다 — 두 저장은 실제 리포지터리의 트랜잭션에서 돌고, 이 경로는
+	 * 발급까지 가지 않는다.
 	 */
 	@Test
-	@DisplayName("UNIQUE 제약 위반이 500 으로 새지 않고 AU002 가 된다")
+	@DisplayName("uk_account_email 의 실제 위반이 500 으로 새지 않고 AU002 가 된다")
 	void uk_제약_위반도_AU002() {
-		AccountRepository stub = mock(AccountRepository.class);
-		given(stub.existsByEmail(anyString())).willReturn(false);
-		given(stub.saveAndFlush(any(Account.class)))
-				.willThrow(new DataIntegrityViolationException("uk_account_email"));
-		// 나머지 협력자는 실제 빈이다. create 경로가 쓰지 않으므로 스텁할 것이 없다
-		AccountService service = new AccountService(
-				stub, this.passwordEncoder, this.accountReader, this.refreshTokenRepository,
-				this.accountTokenIssuer, this.accountTokenRepository, this.loginAttemptRepository, this.clock,
-				this.accountQueryRepository, this.loginAttemptService, this.transactionManager);
+		String email = "race@example.com";
+		AccountRepository raced = mock(AccountRepository.class, AdditionalAnswers.delegatesTo(this.accountRepository));
+		willAnswer(invocation -> {
+			// 검사가 끝난 뒤 다른 요청이 같은 이메일을 넣고 커밋한 것과 같다
+			this.accountRepository.saveAndFlush(Account.builder()
+					.email(email)
+					// 해시가 아니다. 이 행으로 로그인하지 않는다 (sp-docs/requirements/member.md §10.2)
+					.password("test-not-a-hash-au25")
+					.build());
+			return false;
+		}).given(raced).existsByEmail(email);
+		List<DataIntegrityViolationException> 실제_위반 = new ArrayList<>();
+		willAnswer(invocation -> {
+			try {
+				return this.accountRepository.saveAndFlush(invocation.<Account>getArgument(0));
+			} catch (DataIntegrityViolationException e) {
+				실제_위반.add(e);
+				throw e;
+			}
+		}).given(raced).saveAndFlush(any(Account.class));
+		AccountService service = 스텁_서비스(raced);
 
-		assertThatThrownBy(() ->
-				service.create(new AccountCreateRequest("race@example.com", RAW_PASSWORD)))
+		assertThatThrownBy(() -> service.create(new AccountCreateRequest(email, RAW_PASSWORD)))
 				.isInstanceOf(BusinessException.class)
 				.extracting(e -> ((BusinessException) e).getErrorCode())
 				.isEqualTo(ErrorCode.EMAIL_DUPLICATED);
+
+		assertThat(실제_위반).as("계정 INSERT 가 실제 위반에 걸렸다").hasSize(1);
+		assertThat(실은_제약_이름(실제_위반.get(0)))
+				.as("H2 의 실제 위반이 원인 사슬에 제약 이름을 싣는다 — 싣지 않으면 잡는 코드가 H2 에서 맞추지 못한다 (AU-25 의 (b))")
+				.contains("uk_account_email");
+		assertThat(테스트가_만든_계정_수()).as("먼저 넣은 행 하나만 남는다").isEqualTo(1);
+	}
+
+	/**
+	 * sp-docs/plan/phase2-auth-member.md AU-25 의 (a) — 가입의 잡는 코드는 {@code uk_account_email} 의 위반만 {@code AU002} 로
+	 * 바꾼다. 그 밖의 {@code DataIntegrityViolationException} 은 같은 예외를 다시 던진다 — 요청이면 마지막 그물의 500
+	 * {@code C005} 와 ERROR 다({@code LogbackSpringConfigTest}). AU-25 전에는 모두 {@code AU002} 였다.
+	 *
+	 * <p>위반은 대역이다 — 다른 제약의 이름을 싣는 계정 INSERT 의 실제 위반은 H2 로 만들 수 없다. 길이 초과는 이 서비스를 직접
+	 * 부르면 실제 위반(Hibernate {@code DataException} — 제약 이름이 없다)이 되지만, 요청 경로에서는 DTO 검증이 먼저 막는다
+	 * (이메일의 최대 길이가 열 폭과 같다). 원인 사슬은 Hibernate 를 거친 위반의
+	 * 모양({@code DataIntegrityViolationException} → Hibernate {@code ConstraintViolationException} → 드라이버의
+	 * {@code SQLException})이고 문면은 MySQL 의 것을 본떴다.
+	 * <ul>
+	 * <li>다른 제약의 이름 — PK 의 중복
+	 * <li>이름이 없는 위반 — 서버 설정 오류의 NOT NULL 위반. 방언이 이름을 꺼내지 못한다
+	 * <li>원인 사슬에 Hibernate 의 예외가 없고 바깥 메시지에만 그 이름이 있다 — AU-25 전의 경합 대역이다. 바깥 메시지로 맞추지 않는
+	 * 것을 본다. 실제 위반의 바깥 메시지에는 드라이버의 위반 문면과 사용자가 고른 이메일이 실린다
+	 * </ul>
+	 */
+	@ParameterizedTest(name = "{0}")
+	@MethodSource("그_밖의_무결성_위반")
+	@DisplayName("가입의 그 밖의 무결성 위반은 AU002 가 아니라 같은 예외로 다시 던져진다")
+	void 그_밖의_무결성_위반은_같은_예외로_다시_던진다(String 모양, DataIntegrityViolationException violation) {
+		AccountRepository stub = mock(AccountRepository.class);
+		given(stub.existsByEmail(anyString())).willReturn(false);
+		given(stub.saveAndFlush(any(Account.class))).willThrow(violation);
+		AccountService service = 스텁_서비스(stub);
+
+		assertThatThrownBy(() -> service.create(new AccountCreateRequest("other-violation@example.com", RAW_PASSWORD)))
+				.as("다른 예외로 바꾸지 않는다 — 마지막 그물이 원인을 남긴다")
+				.isSameAs(violation);
+	}
+
+	static Stream<Arguments> 그_밖의_무결성_위반() {
+		return Stream.of(
+				Arguments.of("다른 제약의 이름(PK)",
+						위반_대역("Duplicate entry '7' for key 'account.PRIMARY'", 1062, "account.PRIMARY")),
+				Arguments.of("이름이 없는 위반(NOT NULL)",
+						위반_대역("Column 'created_at' cannot be null", 1048, null)),
+				Arguments.of("원인 사슬 없이 바깥 메시지에만 그 이름",
+						new DataIntegrityViolationException("uk_account_email")));
+	}
+
+	/** Hibernate 를 거친 위반의 원인 사슬을 만든다. 드라이버의 문면·오류 코드는 MySQL 의 것을 본뜬 대역이다. */
+	private static DataIntegrityViolationException 위반_대역(String driverMessage, int errorCode, String constraintName) {
+		SQLException driver = new SQLException(driverMessage, "23000", errorCode);
+		return new DataIntegrityViolationException("could not execute statement",
+				new ConstraintViolationException("could not execute statement", driver,
+						"insert into account (created_at,deleted,email,email_verified_at,password,role,updated_at) "
+								+ "values (?,?,?,?,?,?,?)",
+						constraintName));
+	}
+
+	/** 원인 사슬의 Hibernate {@code ConstraintViolationException} 이 실은 이름. 그 예외가 없으면 실패한다. */
+	private static String 실은_제약_이름(Throwable violation) {
+		for (Throwable cause = violation; cause != null; cause = cause.getCause()) {
+			if (cause instanceof ConstraintViolationException hibernate) {
+				return hibernate.getConstraintName();
+			}
+		}
+		throw new AssertionError("원인 사슬에 Hibernate 의 ConstraintViolationException 이 없다", violation);
+	}
+
+	/** 계정 리포지터리만 바꾼 서비스. 나머지 협력자는 실제 빈이다 — create 경로가 쓰지 않거나 실제로 써도 된다. */
+	private AccountService 스텁_서비스(AccountRepository accountRepository) {
+		return new AccountService(
+				accountRepository, this.passwordEncoder, this.accountReader, this.refreshTokenRepository,
+				this.accountTokenIssuer, this.accountTokenRepository, this.loginAttemptRepository, this.clock,
+				this.accountQueryRepository, this.loginAttemptService, this.transactionManager);
 	}
 
 	/**

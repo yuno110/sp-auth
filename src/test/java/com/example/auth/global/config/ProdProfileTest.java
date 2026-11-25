@@ -5,11 +5,14 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.LoggerContext;
 import com.example.auth.support.TestRsaKeys;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -99,6 +102,23 @@ class ProdProfileTest {
 		assertThat(this.environment.getProperty("logging.level.org.hibernate.orm.jdbc.bind"))
 				.as("바인드 파라미터는 TRACE 로 남는다. 비밀번호가 그대로 실린다")
 				.isEqualTo("warn");
+	}
+
+	/**
+	 * 위 두 값이 <b>로거에 실제로 걸린다</b> — auth 가 {@code logback-spring.xml} 을 가진 뒤에도 {@code logging.level.*} 는
+	 * Boot 가 그 파일 뒤에 적용한다 (sp-docs/tech-stack.md §4.8, sp-docs/plan/phase2-auth-member.md AU-25 의 완료 기준).
+	 * 속성값만 보는 위 테스트는 파일이 속성을 덮어도 녹색이다.
+	 *
+	 * <p>로거에 직접 걸린 수준({@code getLevel()})을 본다 — 걸리지 않았으면 {@code null} 이다. 물려받은 유효 수준은 루트의
+	 * INFO 라 블록이 사라져도 SQL·바인드 줄이 나가지 않아 효과로는 갈리지 않는다.
+	 */
+	@Test
+	@DisplayName("prod 프로파일의 SQL·바인드 로거 수준이 logback-spring.xml 뒤에도 로거에 걸린다")
+	void prod_의_로거_수준이_설정_파일_뒤에도_걸린다() {
+		LoggerContext context = (LoggerContext) LoggerFactory.getILoggerFactory();
+
+		assertThat(context.getLogger("org.hibernate.SQL").getLevel()).isEqualTo(Level.WARN);
+		assertThat(context.getLogger("org.hibernate.orm.jdbc.bind").getLevel()).isEqualTo(Level.WARN);
 	}
 
 	/**

@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  auth 의 logback 설정이다 (sp-docs/tech-stack.md §4.8). 이 파일은 AU-25 가 아래 TurboFilter 를 걸려고 두었다.
+
+  Boot 의 기본 출력을 바꾸지 않는다 - 설정 파일이 없을 때처럼 Boot 의 defaults.xml·console-appender.xml
+  을 포함하고 루트(INFO)에 콘솔만 단다. base.xml 을 포함하지 않는다 - 그 파일은 파일 appender 를 함께
+  단다. logging.level.* 속성은 Boot 가 이 파일 뒤에 적용한다. logging.file.name·logging.file.path·
+  logging.structured.format.console 은 이 파일이 있으면 적용되지 않으므로, 쓰려면 이 파일을 함께 고친다.
+
+  springProfile 로 가르지 않는다 - 필터는 모든 프로파일에 같다. 테스트 프로파일도 이 파일을 읽는다.
+-->
+<configuration>
+	<include resource="org/springframework/boot/logging/logback/defaults.xml"/>
+	<include resource="org/springframework/boot/logging/logback/console-appender.xml"/>
+
+	<!--
+	  가입의 UNIQUE 충돌(uk_account_email)에 Hibernate 의 SqlExceptionHelper 가 남기는 ERROR 줄만 버린다
+	  (sp-docs/conventions.md §8.1). WARN 줄과 로거의 수준, 그 밖의 ERROR 는 그대로다.
+	-->
+	<turboFilter class="com.example.auth.global.config.ExpectedUniqueConflictLogFilter"/>
+
+	<root level="INFO">
+		<appender-ref ref="CONSOLE"/>
+	</root>
+</configuration>
